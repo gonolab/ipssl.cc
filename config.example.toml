@@ -1,0 +1,58 @@
+# Example config for ipssl-dns. Copy to config.toml and adjust.
+# All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
+# replace them before going live.
+
+# The zone this server is authoritative for
+domain = "ipssl.cc"
+
+# Addresses to listen on, for both UDP and TCP.
+# On Ubuntu, systemd-resolved holds 127.0.0.53:53, which can make binding
+# 0.0.0.0:53 fail: either disable its stub listener or list the server's
+# public IP here instead.
+listen = ["0.0.0.0:53", "[::]:53"]
+
+# Idle timeout for TCP connections, in seconds
+tcp_timeout_secs = 10
+
+# Only these CAs may issue certificates for the zone (CAA at the apex)
+caa_issuers = ["letsencrypt.org"]
+
+# Names embedding an address in these networks get NXDOMAIN
+# (for handling abuse reports)
+blocklist = []
+
+# Authoritative name servers. Create glue records with the same names at
+# the registrar. In production use at least two, with different providers
+# in different regions.
+[[nameservers]]
+name = "ns1.ipssl.cc"
+ipv4 = ["198.51.100.1"]
+ipv6 = ["2001:db8::1"]
+
+[[nameservers]]
+name = "ns2.ipssl.cc"
+ipv4 = ["198.51.100.2"]
+ipv6 = ["2001:db8::2"]
+
+[soa]
+email = "hostmaster@ipssl.cc"
+# Bump on config changes; any scheme works, e.g. YYYYMMDDnn
+serial = 2026110501
+# How long resolvers cache negative answers (NXDOMAIN / NODATA), in seconds
+minimum = 300
+
+[ttl]
+# A/AAAA computed from the name. The result never changes, so this can be long.
+ip = 86400
+# Fixed records: SOA, NS, CAA and the hosts below
+records = 3600
+
+# Fixed records. Keys are relative to `domain`; "@" is the apex.
+# Note: "ip" is reserved. A TXT query for ip.ipssl.cc returns the address
+# of whoever asked.
+
+[hosts."@"]
+a = ["198.51.100.10"]
+
+[hosts.www]
+a = ["198.51.100.10"]

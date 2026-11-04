@@ -1,0 +1,37 @@
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local config with real server IPs; only config.example.toml is tracked
+/config.toml
+
+# Local AI assistant instructions and settings, kept private
+AGENTS.md
+CLAUDE.md
+/.claude/
+
+# Secrets and environment files. This repo is public: ACME account keys
+# and certificate private keys must never be committed.
+.env
+.env.*
+*.pem
+*.key
+
+# cargo-fuzz build output and crash artifacts (fuzz/corpus stays tracked)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Profiling and coverage data
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

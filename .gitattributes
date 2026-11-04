@@ -1,0 +1,24 @@
+# Store and check out every text file with LF line endings.
+# The server is built and deployed on Linux.
+* text=auto eol=lf
+
+# Rust sources: git's built-in Rust diff driver shows the enclosing
+# function in hunk headers
+*.rs            text diff=rust
+
+# Cargo manifest and config files
+*.toml          text
+
+# Docs
+*.md            text diff=markdown
+
+# systemd units must use LF, or systemd fails to parse them
+*.service       text eol=lf
+
+# Cargo.lock is committed (binary crate, reproducible builds). Marked as
+# generated so GitHub collapses it in pull requests, but kept diffable so
+# dependency changes can still be reviewed.
+Cargo.lock      text linguist-generated=true
+
+# Add entries here when new file types show up (scripts, images,
+# fuzz corpus, ...).
