@@ -14,8 +14,10 @@ listen = ["0.0.0.0:53", "[::]:53"]
 # Idle timeout for TCP connections, in seconds
 tcp_timeout_secs = 10
 
-# Only these CAs may issue certificates for the zone (CAA at the apex)
-caa_issuers = ["letsencrypt.org"]
+# CAs allowed to issue certificates for every name in the zone (CAA at the
+# apex). Leave empty so users can get certificates from any ACME CA
+# (Let's Encrypt, ZeroSSL, Google Trust Services, ...).
+caa_issuers = []
 
 # Names embedding an address in these networks get NXDOMAIN
 # (for handling abuse reports)

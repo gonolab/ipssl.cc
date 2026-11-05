@@ -37,6 +37,8 @@ Get certificates on your own server, the same way as with nip.io and sslip.io. `
 certbot certonly --standalone -d 203-0-113-10.ipssl.cc
 ```
 
+Any ACME CA works: the zone publishes no CAA record that would limit the choice.
+
 This only works for public addresses the CA can reach. Private addresses such as `192-168-1-10.ipssl.cc` cannot be validated this way.
 
 Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for certificates per registered domain. The service asks Let's Encrypt to raise that limit for `ipssl.cc`.
