@@ -1,6 +1,6 @@
 [package]
 name = "ipssl"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Wildcard DNS for any IP address: 10-0-0-1.ipssl.cc -> 10.0.0.1"

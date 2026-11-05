@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -33,6 +34,8 @@ async fn main() -> Result<()> {
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info,hickory_server=warn")),
         )
+        // No color codes in journald or log files.
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let args = Args::parse();
