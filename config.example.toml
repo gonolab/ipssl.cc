@@ -1,4 +1,6 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
+# SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`
+# and `tcp_timeout_secs`, which need a restart.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live.
 

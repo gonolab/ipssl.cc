@@ -17,24 +17,23 @@ use ipssl::zone::Zone;
 struct TestServer {
     udp: SocketAddr,
     tcp: SocketAddr,
+    handler: Handler,
     // Dropping the server stops it.
     _server: Server<Handler>,
 }
 
+const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
+
 fn start() -> TestServer {
-    let config = Config::parse(include_str!("../config.example.toml")).unwrap();
-    let zone = Zone::from_config(&config).unwrap();
+    let config = Config::parse(EXAMPLE_CONFIG).unwrap();
+    let handler = Handler::new(Zone::from_config(&config).unwrap());
     let udp = ipssl::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let tcp = ipssl::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
     TestServer {
         udp: udp.local_addr().unwrap(),
         tcp: tcp.local_addr().unwrap(),
-        _server: ipssl::serve(
-            Handler::new(zone),
-            vec![udp],
-            vec![tcp],
-            Duration::from_secs(5),
-        ),
+        handler: handler.clone(),
+        _server: ipssl::serve(handler, vec![udp], vec![tcp], Duration::from_secs(5)),
     }
 }
 
@@ -180,4 +179,21 @@ async fn non_query_opcode_is_notimp() {
     ));
     let resp = over_udp(server.udp, &req).await;
     assert_eq!(resp.metadata.response_code, ResponseCode::NotImp);
+}
+
+#[tokio::test]
+async fn set_zone_takes_effect_immediately() {
+    let server = start();
+    let www = query("www.ipssl.cc.", RecordType::A);
+    assert_eq!(rdata(&over_udp(server.udp, &www).await), ["198.51.100.10"]);
+
+    let changed = EXAMPLE_CONFIG.replace(
+        "[hosts.www]\na = [\"198.51.100.10\"]",
+        "[hosts.www]\na = [\"198.51.100.20\"]",
+    );
+    assert_ne!(changed, EXAMPLE_CONFIG, "example config layout changed");
+    let config = Config::parse(&changed).unwrap();
+    server.handler.set_zone(Zone::from_config(&config).unwrap());
+
+    assert_eq!(rdata(&over_udp(server.udp, &www).await), ["198.51.100.20"]);
 }

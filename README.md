@@ -131,6 +131,20 @@ On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make bin
 dig +trace 10-0-0-1.ipssl.cc
 ```
 
+### 5. Updating the config
+
+Edit `/etc/ipssl/config.toml` (bump `soa.serial` too), check it, then reload:
+
+```bash
+sudo ipssl-dns -c /etc/ipssl/config.toml --check
+```
+
+```bash
+sudo systemctl reload ipssl-dns
+```
+
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen` and `tcp_timeout_secs` only take effect after a restart.
+
 ## FAQ
 
 **Private IPs don't resolve?** Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers pointing to private addresses. Allowlist this domain there, or use a public resolver.

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use ipssl::config::Config;
@@ -50,8 +50,16 @@ async fn main() -> Result<()> {
         info!(%addr, "listening (udp + tcp)");
     }
 
+    let handler = Handler::new(zone);
+    #[cfg(unix)]
+    tokio::spawn(reload_on_sighup(
+        args.config,
+        config.clone(),
+        handler.clone(),
+    ));
+
     let mut server = ipssl::serve(
-        Handler::new(zone),
+        handler,
         udp,
         tcp,
         Duration::from_secs(config.tcp_timeout_secs),
@@ -66,6 +74,36 @@ async fn main() -> Result<()> {
 
     server.block_until_done().await?;
     Ok(())
+}
+
+/// Reloads the config on every SIGHUP (`systemctl reload ipssl-dns`).
+/// A config that fails to load is logged and the running zone kept.
+#[cfg(unix)]
+async fn reload_on_sighup(path: PathBuf, running: Config, handler: Handler) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut hangup = signal(SignalKind::hangup()).expect("installing SIGHUP handler");
+    while hangup.recv().await.is_some() {
+        match reload(&path, &running, &handler) {
+            Ok(serial) => info!(serial, "config reloaded"),
+            Err(e) => error!("reload failed, keeping the running config: {e:#}"),
+        }
+    }
+}
+
+/// Loads the config at `path` into `handler` and returns the new SOA serial.
+/// `running` is the config the process started with: settings that need a
+/// restart are compared against it, so the warning repeats on every reload
+/// until the process is restarted.
+#[cfg(unix)]
+fn reload(path: &std::path::Path, running: &Config, handler: &Handler) -> Result<u32> {
+    let config = Config::load(path)?;
+    let zone = Zone::from_config(&config)?;
+    for setting in config.restart_only_changes(running) {
+        warn!(setting, "changed, but only takes effect after a restart");
+    }
+    handler.set_zone(zone);
+    Ok(config.soa.serial)
 }
 
 async fn shutdown_signal() {

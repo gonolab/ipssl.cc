@@ -115,6 +115,19 @@ impl Config {
     pub fn parse(text: &str) -> Result<Self> {
         Ok(toml::from_str(text)?)
     }
+
+    /// Names of the settings that differ from `running` but only take
+    /// effect after a restart. Everything else is applied on reload.
+    pub fn restart_only_changes(&self, running: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.listen != running.listen {
+            changed.push("listen");
+        }
+        if self.tcp_timeout_secs != running.tcp_timeout_secs {
+            changed.push("tcp_timeout_secs");
+        }
+        changed
+    }
 }
 
 fn default_listen() -> Vec<SocketAddr> {
@@ -154,4 +167,46 @@ fn default_ip_ttl() -> u32 {
 
 fn default_records_ttl() -> u32 {
     3600
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+        domain = "ipssl.cc"
+
+        [[nameservers]]
+        name = "ns1.ipssl.cc"
+
+        [soa]
+        email = "hostmaster@ipssl.cc"
+    "#;
+
+    #[test]
+    fn example_config_parses() {
+        Config::parse(include_str!("../config.example.toml")).unwrap();
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let text = format!("typo = 1\n{MINIMAL}");
+        assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn restart_only_changes() {
+        let running = Config::parse(MINIMAL).unwrap();
+        let mut next = running.clone();
+        next.soa.serial += 1;
+        next.blocklist.push("203.0.113.0/24".parse().unwrap());
+        assert!(next.restart_only_changes(&running).is_empty());
+
+        next.listen = vec!["127.0.0.1:5353".parse().unwrap()];
+        next.tcp_timeout_secs = 30;
+        assert_eq!(
+            next.restart_only_changes(&running),
+            ["listen", "tcp_timeout_secs"]
+        );
+    }
 }

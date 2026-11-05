@@ -3,6 +3,7 @@
 use std::iter;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use hickory_server::net::runtime::Time;
 use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -15,16 +16,24 @@ use crate::zone::{Answer, Zone};
 /// Keeps responses below common MTUs, so they are not fragmented.
 const MAX_UDP_PAYLOAD: u16 = 1232;
 
+/// Answers DNS requests from the current [`Zone`]. Clones share the same
+/// zone, so a clone kept outside the server can swap it at run time.
 #[derive(Clone)]
 pub struct Handler {
-    zone: Arc<Zone>,
+    zone: Arc<ArcSwap<Zone>>,
 }
 
 impl Handler {
     pub fn new(zone: Zone) -> Self {
         Self {
-            zone: Arc::new(zone),
+            zone: Arc::new(ArcSwap::from_pointee(zone)),
         }
+    }
+
+    /// Replaces the zone. Requests already being answered finish with the
+    /// old one; every later request sees the new one.
+    pub fn set_zone(&self, zone: Zone) {
+        self.zone.store(Arc::new(zone));
     }
 }
 
@@ -54,7 +63,7 @@ impl RequestHandler for Handler {
                 Ok(info) => {
                     let q = info.query;
                     debug!(name = %q.name(), qtype = %q.query_type(), "query");
-                    self.zone.resolve(
+                    self.zone.load().resolve(
                         q.original().name(),
                         q.query_type(),
                         q.query_class(),

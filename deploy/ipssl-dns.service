@@ -6,6 +6,8 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml
+# `systemctl reload ipssl-dns` re-reads the config without a restart
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
