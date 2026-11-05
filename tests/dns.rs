@@ -12,6 +12,7 @@ use tokio::time::timeout;
 
 use ipssl::config::Config;
 use ipssl::handler::Handler;
+use ipssl::ratelimit::RateLimiter;
 use ipssl::zone::Zone;
 
 struct TestServer {
@@ -25,8 +26,12 @@ struct TestServer {
 const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
 
 fn start() -> TestServer {
-    let config = Config::parse(EXAMPLE_CONFIG).unwrap();
-    let handler = Handler::new(Zone::from_config(&config).unwrap());
+    start_with(Config::parse(EXAMPLE_CONFIG).unwrap())
+}
+
+fn start_with(config: Config) -> TestServer {
+    let handler = Handler::new(Zone::from_config(&config).unwrap())
+        .with_rate_limiter(RateLimiter::from_config(&config.rate_limit).unwrap());
     let udp = ipssl::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let tcp = ipssl::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
     TestServer {
@@ -44,14 +49,21 @@ fn query(name: &str, qtype: RecordType) -> Message {
 }
 
 async fn over_udp(addr: SocketAddr, msg: &Message) -> Message {
+    try_udp(addr, msg, Duration::from_secs(2))
+        .await
+        .expect("no UDP response")
+}
+
+/// Sends `msg` over UDP; `None` if no response arrives within `wait`.
+async fn try_udp(addr: SocketAddr, msg: &Message, wait: Duration) -> Option<Message> {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     socket.send_to(&msg.to_vec().unwrap(), addr).await.unwrap();
     let mut buf = [0u8; 4096];
-    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+    let (n, _) = timeout(wait, socket.recv_from(&mut buf))
         .await
-        .expect("no UDP response")
+        .ok()?
         .unwrap();
-    Message::from_vec(&buf[..n]).unwrap()
+    Some(Message::from_vec(&buf[..n]).unwrap())
 }
 
 async fn over_tcp(addr: SocketAddr, msg: &Message) -> Message {
@@ -196,4 +208,33 @@ async fn set_zone_takes_effect_immediately() {
     server.handler.set_zone(Zone::from_config(&config).unwrap());
 
     assert_eq!(rdata(&over_udp(server.udp, &www).await), ["198.51.100.20"]);
+}
+
+#[tokio::test]
+async fn udp_is_rate_limited_but_tcp_is_not() {
+    let mut config = Config::parse(EXAMPLE_CONFIG).unwrap();
+    config.rate_limit.responses_per_second = 1;
+    config.rate_limit.burst = 2;
+    config.rate_limit.slip = 2;
+    let server = start_with(config);
+    let req = query("10-0-0-1.ipssl.cc.", RecordType::A);
+    let wait = Duration::from_millis(300);
+
+    // The burst is answered as usual.
+    for _ in 0..2 {
+        let resp = try_udp(server.udp, &req, wait).await.unwrap();
+        assert_eq!(rdata(&resp), ["10.0.0.1"]);
+    }
+    // Then responses alternate between dropped and truncated (slip = 2).
+    assert!(try_udp(server.udp, &req, wait).await.is_none());
+    let slipped = try_udp(server.udp, &req, wait).await.unwrap();
+    assert!(slipped.metadata.truncation);
+    assert!(slipped.answers.is_empty());
+    assert_eq!(slipped.metadata.id, req.metadata.id);
+    assert_eq!(slipped.queries, req.queries);
+
+    // TCP is never limited.
+    for _ in 0..5 {
+        assert_eq!(rdata(&over_tcp(server.tcp, &req).await), ["10.0.0.1"]);
+    }
 }

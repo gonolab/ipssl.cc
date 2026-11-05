@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use ipssl::config::Config;
 use ipssl::handler::Handler;
+use ipssl::ratelimit::RateLimiter;
 use ipssl::zone::Zone;
 
 /// Authoritative DNS server that answers 10-0-0-1.<domain> with 10.0.0.1.
@@ -37,6 +38,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     let zone = Zone::from_config(&config)?;
+    let limiter = RateLimiter::from_config(&config.rate_limit)?;
     if args.check {
         info!("config OK");
         return Ok(());
@@ -50,7 +52,10 @@ async fn main() -> Result<()> {
         info!(%addr, "listening (udp + tcp)");
     }
 
-    let handler = Handler::new(zone);
+    if limiter.is_none() {
+        warn!("UDP rate limiting is off");
+    }
+    let handler = Handler::new(zone).with_rate_limiter(limiter);
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(
         args.config,

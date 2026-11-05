@@ -41,6 +41,9 @@ pub struct Config {
     /// Embedded addresses in these networks get NXDOMAIN.
     #[serde(default)]
     pub blocklist: Vec<IpNet>,
+
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +97,49 @@ impl Default for TtlConfig {
     }
 }
 
+/// UDP response rate limiting, see [`crate::ratelimit`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// UDP responses per second for each client network; 0 turns limiting off.
+    #[serde(default = "default_responses_per_second")]
+    pub responses_per_second: u32,
+    /// How many responses a client network may get at once before the rate applies.
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+    /// Every `slip`-th limited response is sent truncated, so real resolvers
+    /// retry over TCP; the others are dropped. 0 drops them all.
+    #[serde(default = "default_slip")]
+    pub slip: u32,
+    /// Clients in the same IPv4 network of this size share one limit.
+    #[serde(default = "default_ipv4_prefix")]
+    pub ipv4_prefix: u8,
+    /// Clients in the same IPv6 network of this size share one limit.
+    #[serde(default = "default_ipv6_prefix")]
+    pub ipv6_prefix: u8,
+    /// Clients that are never limited, e.g. monitoring.
+    #[serde(default)]
+    pub exempt: Vec<IpNet>,
+    /// Most client networks tracked at once. Bounds memory; when the table
+    /// is full, new networks share a single limit.
+    #[serde(default = "default_max_tracked")]
+    pub max_tracked: usize,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            responses_per_second: default_responses_per_second(),
+            burst: default_burst(),
+            slip: default_slip(),
+            ipv4_prefix: default_ipv4_prefix(),
+            ipv6_prefix: default_ipv6_prefix(),
+            exempt: Vec::new(),
+            max_tracked: default_max_tracked(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
@@ -125,6 +171,9 @@ impl Config {
         }
         if self.tcp_timeout_secs != running.tcp_timeout_secs {
             changed.push("tcp_timeout_secs");
+        }
+        if self.rate_limit != running.rate_limit {
+            changed.push("rate_limit");
         }
         changed
     }
@@ -169,6 +218,30 @@ fn default_records_ttl() -> u32 {
     3600
 }
 
+fn default_responses_per_second() -> u32 {
+    50
+}
+
+fn default_burst() -> u32 {
+    100
+}
+
+fn default_slip() -> u32 {
+    2
+}
+
+fn default_ipv4_prefix() -> u8 {
+    24
+}
+
+fn default_ipv6_prefix() -> u8 {
+    56
+}
+
+fn default_max_tracked() -> usize {
+    100_000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,9 +277,10 @@ mod tests {
 
         next.listen = vec!["127.0.0.1:5353".parse().unwrap()];
         next.tcp_timeout_secs = 30;
+        next.rate_limit.burst += 1;
         assert_eq!(
             next.restart_only_changes(&running),
-            ["listen", "tcp_timeout_secs"]
+            ["listen", "tcp_timeout_secs", "rate_limit"]
         );
     }
 }

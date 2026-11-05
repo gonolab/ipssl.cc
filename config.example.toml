@@ -1,6 +1,6 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
-# SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`
-# and `tcp_timeout_secs`, which need a restart.
+# SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`,
+# `tcp_timeout_secs` and `[rate_limit]`, which need a restart.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live.
 
@@ -37,6 +37,24 @@ ipv6 = ["2001:db8::1"]
 name = "ns2.ipssl.cc"
 ipv4 = ["198.51.100.2"]
 ipv6 = ["2001:db8::2"]
+
+# UDP response rate limiting, so the server cannot be used to flood
+# someone with forged queries. Each client network gets its own limit.
+# Over the limit, every `slip`-th response is sent truncated, which makes
+# real resolvers retry over TCP (never limited); the rest are dropped.
+[rate_limit]
+# Responses per second per client network; 0 turns limiting off
+responses_per_second = 50
+# Responses a client network may get at once before the rate applies
+burst = 100
+slip = 2
+# Size of a client network, in prefix bits
+ipv4_prefix = 24
+ipv6_prefix = 56
+# Never limited, e.g. your monitoring
+exempt = []
+# Most client networks tracked at once (bounds memory)
+max_tracked = 100000
 
 [soa]
 email = "hostmaster@ipssl.cc"

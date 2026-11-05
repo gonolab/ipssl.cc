@@ -5,11 +5,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hickory_server::net::runtime::Time;
+use hickory_server::net::xfer::Protocol;
 use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
+use hickory_server::proto::rr::Record;
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
-use hickory_server::zone_handler::MessageResponseBuilder;
+use hickory_server::zone_handler::{MessageResponse, MessageResponseBuilder};
 use tracing::{debug, warn};
 
+use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{Answer, Zone};
 
 /// Largest UDP response we send, per the DNS Flag Day 2020 recommendation.
@@ -21,13 +24,21 @@ const MAX_UDP_PAYLOAD: u16 = 1232;
 #[derive(Clone)]
 pub struct Handler {
     zone: Arc<ArcSwap<Zone>>,
+    /// Limits UDP responses per client network; `None` when turned off.
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Handler {
     pub fn new(zone: Zone) -> Self {
         Self {
             zone: Arc::new(ArcSwap::from_pointee(zone)),
+            limiter: None,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, limiter: Option<RateLimiter>) -> Self {
+        self.limiter = limiter.map(Arc::new);
+        self
     }
 
     /// Replaces the zone. Requests already being answered finish with the
@@ -42,7 +53,7 @@ impl RequestHandler for Handler {
     async fn handle_request<R: ResponseHandler, T: Time>(
         &self,
         request: &Request,
-        mut response_handle: R,
+        response_handle: R,
     ) -> ResponseInfo {
         let mut metadata = Metadata::response_from_request(&request.metadata);
 
@@ -53,6 +64,30 @@ impl RequestHandler for Handler {
             edns
         });
         let bad_version = request.edns.as_ref().is_some_and(|e| e.version() > 0);
+
+        // Only UDP sources can be forged, so only UDP is limited.
+        let verdict = match &self.limiter {
+            Some(limiter) if request.protocol() == Protocol::Udp => {
+                limiter.check(request.src().ip())
+            }
+            _ => Verdict::Allow,
+        };
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Slip => {
+                metadata.truncation = true;
+                let response =
+                    MessageResponseBuilder::new(&request.queries, response_edns.as_ref())
+                        .build_no_records(metadata);
+                return send(response_handle, response, metadata).await;
+            }
+            Verdict::Drop => {
+                return ResponseInfo::from(Header {
+                    metadata,
+                    counts: HeaderCounts::default(),
+                });
+            }
+        }
 
         let answer = if bad_version {
             Answer::error(ResponseCode::BADVERS)
@@ -86,16 +121,32 @@ impl RequestHandler for Handler {
             iter::empty(),
         );
 
-        match response_handle.send_response(response).await {
-            Ok(info) => info,
-            Err(error) => {
-                warn!(%error, "failed to send response");
-                metadata.response_code = ResponseCode::ServFail;
-                ResponseInfo::from(Header {
-                    metadata,
-                    counts: HeaderCounts::default(),
-                })
-            }
+        send(response_handle, response, metadata).await
+    }
+}
+
+/// Sends `response`. If that fails, the returned info carries SERVFAIL.
+async fn send<'a, R: ResponseHandler>(
+    mut response_handle: R,
+    response: MessageResponse<
+        '_,
+        'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+        impl Iterator<Item = &'a Record> + Send + 'a,
+    >,
+    mut metadata: Metadata,
+) -> ResponseInfo {
+    match response_handle.send_response(response).await {
+        Ok(info) => info,
+        Err(error) => {
+            warn!(%error, "failed to send response");
+            metadata.response_code = ResponseCode::ServFail;
+            ResponseInfo::from(Header {
+                metadata,
+                counts: HeaderCounts::default(),
+            })
         }
     }
 }

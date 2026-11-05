@@ -73,6 +73,8 @@ cargo test
 
 - `src/parse.rs`: parsing rules for every supported name form
 - `src/zone.rs`: answer logic (NXDOMAIN, NODATA, REFUSED, apex records, blocklist and more)
+- `src/ratelimit.rs`: token buckets, client network grouping, the bounded table
+- `src/config.rs`: config parsing and which changes need a restart
 - `tests/dns.rs`: starts the server on a local port and sends real queries over UDP and TCP
 
 ## Deployment
@@ -143,7 +145,13 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen` and `tcp_timeout_secs` only take effect after a restart.
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs` and `[rate_limit]` only take effect after a restart.
+
+## Rate limiting
+
+UDP source addresses are easy to forge, so an open authoritative server can be used to send floods of answers to someone else. The server limits UDP responses per client network (`/24` for IPv4, `/56` for IPv6), by default to 50 a second with bursts of up to 100. Over the limit, every second response is sent truncated and the rest are dropped. A real resolver that gets a truncated response retries over TCP, which cannot be forged and is never limited, so it still gets its answer.
+
+Tune or turn it off in the `[rate_limit]` section of the config.
 
 ## FAQ
 

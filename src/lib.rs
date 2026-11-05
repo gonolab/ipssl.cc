@@ -3,6 +3,7 @@
 pub mod config;
 pub mod handler;
 pub mod parse;
+pub mod ratelimit;
 pub mod zone;
 
 use std::io;
