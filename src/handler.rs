@@ -12,6 +12,7 @@ use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseI
 use hickory_server::zone_handler::{MessageResponse, MessageResponseBuilder};
 use tracing::{debug, warn};
 
+use crate::metrics::{Gauges, Limited, Metrics};
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{Answer, Zone};
 
@@ -26,6 +27,7 @@ pub struct Handler {
     zone: Arc<ArcSwap<Zone>>,
     /// Limits UDP responses per client network; `None` when turned off.
     limiter: Option<Arc<RateLimiter>>,
+    metrics: Arc<Metrics>,
 }
 
 impl Handler {
@@ -33,6 +35,7 @@ impl Handler {
         Self {
             zone: Arc::new(ArcSwap::from_pointee(zone)),
             limiter: None,
+            metrics: Arc::new(Metrics::new()),
         }
     }
 
@@ -45,6 +48,18 @@ impl Handler {
     /// old one; every later request sees the new one.
     pub fn set_zone(&self, zone: Zone) {
         self.zone.store(Arc::new(zone));
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// All metrics in the Prometheus text format.
+    pub fn render_metrics(&self) -> String {
+        self.metrics.render(&Gauges {
+            zone_serial: self.zone.load().serial(),
+            rate_limit_tracked: self.limiter.as_ref().map(|l| l.tracked()),
+        })
     }
 }
 
@@ -64,6 +79,8 @@ impl RequestHandler for Handler {
             edns
         });
         let bad_version = request.edns.as_ref().is_some_and(|e| e.version() > 0);
+        let qtype = request.queries.queries().first().map(|q| q.query_type());
+        self.metrics.query(request.protocol(), qtype);
 
         // Only UDP sources can be forged, so only UDP is limited.
         let verdict = match &self.limiter {
@@ -75,13 +92,15 @@ impl RequestHandler for Handler {
         match verdict {
             Verdict::Allow => {}
             Verdict::Slip => {
+                self.metrics.rate_limited(Limited::Slipped);
                 metadata.truncation = true;
                 let response =
                     MessageResponseBuilder::new(&request.queries, response_edns.as_ref())
                         .build_no_records(metadata);
-                return send(response_handle, response, metadata).await;
+                return send(response_handle, response, metadata, &self.metrics).await;
             }
             Verdict::Drop => {
+                self.metrics.rate_limited(Limited::Dropped);
                 return ResponseInfo::from(Header {
                     metadata,
                     counts: HeaderCounts::default(),
@@ -121,11 +140,12 @@ impl RequestHandler for Handler {
             iter::empty(),
         );
 
-        send(response_handle, response, metadata).await
+        send(response_handle, response, metadata, &self.metrics).await
     }
 }
 
-/// Sends `response`. If that fails, the returned info carries SERVFAIL.
+/// Sends `response` and counts it. If sending fails, the returned info
+/// carries SERVFAIL.
 async fn send<'a, R: ResponseHandler>(
     mut response_handle: R,
     response: MessageResponse<
@@ -137,10 +157,15 @@ async fn send<'a, R: ResponseHandler>(
         impl Iterator<Item = &'a Record> + Send + 'a,
     >,
     mut metadata: Metadata,
+    metrics: &Metrics,
 ) -> ResponseInfo {
     match response_handle.send_response(response).await {
-        Ok(info) => info,
+        Ok(info) => {
+            metrics.response(info.response_code);
+            info
+        }
         Err(error) => {
+            metrics.send_error();
             warn!(%error, "failed to send response");
             metadata.response_code = ResponseCode::ServFail;
             ResponseInfo::from(Header {

@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod handler;
+pub mod http;
+pub mod metrics;
 pub mod parse;
 pub mod ratelimit;
 pub mod zone;

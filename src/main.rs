@@ -56,6 +56,18 @@ async fn main() -> Result<()> {
         warn!("UDP rate limiting is off");
     }
     let handler = Handler::new(zone).with_rate_limiter(limiter);
+
+    if let Some(metrics) = &config.metrics {
+        let addr = metrics.listen;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding metrics {addr}"))?;
+        info!(%addr, "serving metrics at /metrics");
+        let handler = handler.clone();
+        tokio::spawn(ipssl::http::serve(listener, move || {
+            handler.render_metrics()
+        }));
+    }
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(
         args.config,
@@ -89,7 +101,9 @@ async fn reload_on_sighup(path: PathBuf, running: Config, handler: Handler) {
 
     let mut hangup = signal(SignalKind::hangup()).expect("installing SIGHUP handler");
     while hangup.recv().await.is_some() {
-        match reload(&path, &running, &handler) {
+        let result = reload(&path, &running, &handler);
+        handler.metrics().reload(result.is_ok());
+        match result {
             Ok(serial) => info!(serial, "config reloaded"),
             Err(e) => error!("reload failed, keeping the running config: {e:#}"),
         }

@@ -1,6 +1,6 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
 # SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`,
-# `tcp_timeout_secs` and `[rate_limit]`, which need a restart.
+# `tcp_timeout_secs`, `[rate_limit]` and `[metrics]`, which need a restart.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live.
 
@@ -55,6 +55,11 @@ ipv6_prefix = 56
 exempt = []
 # Most client networks tracked at once (bounds memory)
 max_tracked = 100000
+
+# Prometheus metrics at http://<listen>/metrics. Remove the section to turn
+# them off. Keep the address private: loopback or an internal network.
+[metrics]
+listen = "127.0.0.1:9153"
 
 [soa]
 email = "hostmaster@ipssl.cc"

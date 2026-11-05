@@ -35,6 +35,7 @@ pub struct Zone {
     whoami: LowerName,
     ip_ttl: u32,
     blocklist: Vec<IpNet>,
+    serial: u32,
 }
 
 impl Zone {
@@ -138,7 +139,13 @@ impl Zone {
             whoami: LowerName::new(&whoami),
             ip_ttl: cfg.ttl.ip,
             blocklist: cfg.blocklist.clone(),
+            serial: cfg.soa.serial,
         })
+    }
+
+    /// The SOA serial.
+    pub fn serial(&self) -> u32 {
+        self.serial
     }
 
     /// Looks up `qname`. `client` is the address the query came from.

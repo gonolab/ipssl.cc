@@ -75,6 +75,7 @@ cargo test
 - `src/zone.rs`: answer logic (NXDOMAIN, NODATA, REFUSED, apex records, blocklist and more)
 - `src/ratelimit.rs`: token buckets, client network grouping, the bounded table
 - `src/config.rs`: config parsing and which changes need a restart
+- `src/metrics.rs`, `src/http.rs`: metric counting, rendering and the `/metrics` endpoint
 - `tests/dns.rs`: starts the server on a local port and sends real queries over UDP and TCP
 
 ## Deployment
@@ -145,13 +146,33 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs` and `[rate_limit]` only take effect after a restart.
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]` and `[metrics]` only take effect after a restart.
 
 ## Rate limiting
 
 UDP source addresses are easy to forge, so an open authoritative server can be used to send floods of answers to someone else. The server limits UDP responses per client network (`/24` for IPv4, `/56` for IPv6), by default to 50 a second with bursts of up to 100. Over the limit, every second response is sent truncated and the rest are dropped. A real resolver that gets a truncated response retries over TCP, which cannot be forged and is never limited, so it still gets its answer.
 
 Tune or turn it off in the `[rate_limit]` section of the config.
+
+## Monitoring
+
+With a `[metrics]` section in the config, the server serves Prometheus metrics over plain HTTP, by default at `127.0.0.1:9153`. Keep that address private.
+
+```bash
+curl -s http://127.0.0.1:9153/metrics
+```
+
+| Metric | Meaning |
+|---|---|
+| `ipssl_dns_queries_total{protocol, qtype}` | Requests received |
+| `ipssl_dns_responses_total{rcode}` | Responses sent |
+| `ipssl_dns_send_errors_total` | Responses that could not be sent |
+| `ipssl_dns_rate_limited_total{action}` | UDP responses dropped (`drop`) or sent truncated (`slip`) by rate limiting |
+| `ipssl_rate_limit_tracked_networks` | Client networks the rate limiter is tracking |
+| `ipssl_config_reloads_total{result}` | Config reloads that succeeded or failed |
+| `ipssl_zone_serial` | SOA serial being served; compare across servers to check they run the same config |
+| `ipssl_build_info{version}` | Version of the running binary |
+| `process_start_time_seconds` | When the process started |
 
 ## FAQ
 
@@ -164,7 +185,7 @@ Tune or turn it off in the `[rate_limit]` section of the config.
 ## Roadmap
 
 - [x] v0.1: DNS core (A/AAAA/SOA/NS/CAA/TXT, UDP + TCP, EDNS)
-- [ ] v0.2: Response rate limiting (RRL), blocklist hot reload, Prometheus metrics
+- [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
 - [ ] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
 - [ ] Landing page
 

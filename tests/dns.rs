@@ -237,4 +237,21 @@ async fn udp_is_rate_limited_but_tcp_is_not() {
     for _ in 0..5 {
         assert_eq!(rdata(&over_tcp(server.tcp, &req).await), ["10.0.0.1"]);
     }
+
+    let metrics = server.handler.render_metrics();
+    for line in [
+        r#"ipssl_dns_queries_total{protocol="udp",qtype="A"} 4"#,
+        r#"ipssl_dns_queries_total{protocol="tcp",qtype="A"} 5"#,
+        // 2 + 5 answers and 1 truncated response.
+        r#"ipssl_dns_responses_total{rcode="NOERROR"} 8"#,
+        r#"ipssl_dns_rate_limited_total{action="drop"} 1"#,
+        r#"ipssl_dns_rate_limited_total{action="slip"} 1"#,
+        "ipssl_rate_limit_tracked_networks 1",
+        "ipssl_zone_serial 2026110501",
+    ] {
+        assert!(
+            metrics.lines().any(|l| l == line),
+            "missing {line:?} in\n{metrics}"
+        );
+    }
 }

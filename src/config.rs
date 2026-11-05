@@ -44,6 +44,17 @@ pub struct Config {
 
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// Prometheus metrics over HTTP; off when the section is missing.
+    pub metrics: Option<MetricsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// Address to serve `/metrics` on. Keep it private: loopback or an
+    /// internal network.
+    pub listen: SocketAddr,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +186,9 @@ impl Config {
         if self.rate_limit != running.rate_limit {
             changed.push("rate_limit");
         }
+        if self.metrics != running.metrics {
+            changed.push("metrics");
+        }
         changed
     }
 }
@@ -278,9 +292,12 @@ mod tests {
         next.listen = vec!["127.0.0.1:5353".parse().unwrap()];
         next.tcp_timeout_secs = 30;
         next.rate_limit.burst += 1;
+        next.metrics = Some(MetricsConfig {
+            listen: "127.0.0.1:9153".parse().unwrap(),
+        });
         assert_eq!(
             next.restart_only_changes(&running),
-            ["listen", "tcp_timeout_secs", "rate_limit"]
+            ["listen", "tcp_timeout_secs", "rate_limit", "metrics"]
         );
     }
 }
