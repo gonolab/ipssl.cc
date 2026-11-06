@@ -1,5 +1,7 @@
 # ipssl.cc
 
+[![CI](https://github.com/gonolab/ipssl.cc/actions/workflows/ci.yml/badge.svg)](https://github.com/gonolab/ipssl.cc/actions/workflows/ci.yml)
+
 Wildcard DNS for any IP address, like nip.io and sslip.io: put an IP address in a hostname and it resolves to that address. No hosts file edits, no DNS server of your own.
 
 ```
@@ -78,6 +80,8 @@ cargo test
 - `src/metrics.rs`, `src/http.rs`: metric counting, rendering and the `/metrics` endpoint
 - `tests/dns.rs`: starts the server on a local port and sends real queries over UDP and TCP
 
+CI runs `cargo fmt --check`, clippy and the tests on every push and pull request, and checks that the code still builds with the minimum Rust version (`rust-version` in `Cargo.toml`).
+
 ## Deployment
 
 ### 1. Servers
@@ -86,9 +90,24 @@ Use at least two VPSes, with different providers in different regions. Each need
 
 Open **UDP 53 and TCP 53** on every server.
 
-### 2. Build
+### 2. Get the binary
 
-Building on the server itself is simplest:
+Download a static Linux build (x86_64 or aarch64) from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
+
+```bash
+VERSION=v0.2.0
+TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
+BASE=https://github.com/gonolab/ipssl.cc/releases/download/$VERSION
+curl -fLO "$BASE/ipssl-dns-$VERSION-$TARGET.tar.gz"
+curl -fLO "$BASE/SHA256SUMS"
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf "ipssl-dns-$VERSION-$TARGET.tar.gz"
+cd "ipssl-dns-$VERSION-$TARGET"
+```
+
+The archive holds the binary, `config.example.toml`, `ipssl-dns.service`, the README and the license.
+
+Or build it yourself with Rust 1.88 or newer. On the server:
 
 ```bash
 cargo build --release
@@ -110,14 +129,18 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 
 ### 3. Install
 
+Copy `config.example.toml` to `config.toml` and fill in your servers' addresses. Then, from the release directory:
+
 ```bash
-sudo install -m 755 target/release/ipssl-dns /usr/local/bin/
+sudo install -m 755 ipssl-dns /usr/local/bin/
 sudo install -d /etc/ipssl
 sudo install -m 644 config.toml /etc/ipssl/config.toml
-sudo install -m 644 deploy/ipssl-dns.service /etc/systemd/system/
+sudo install -m 644 ipssl-dns.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ipssl-dns
 ```
+
+From a source checkout, the binary is `target/release/ipssl-dns` (or `target/x86_64-unknown-linux-musl/release/ipssl-dns`) and the unit file is `deploy/ipssl-dns.service`.
 
 On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make binding `0.0.0.0:53` fail. Two ways around it:
 
@@ -181,6 +204,18 @@ curl -s http://127.0.0.1:9153/metrics
 **Why not hand out a wildcard certificate?** Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key can revoke the certificate. Get a certificate on your own server instead (see [HTTPS certificates](#https-certificates)).
 
 **Why isn't ipssl.cc on the Public Suffix List?** The PSL explicitly excludes services that resolve an IP address encoded in a hostname to that address: the same IP can be assigned to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the PSL.
+
+## Releasing
+
+1. Bump `version` in `Cargo.toml` and commit.
+2. Tag the commit with the same version and push the tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The [release workflow](.github/workflows/release.yml) checks that the tag matches `Cargo.toml`, runs the tests on x86_64 and aarch64, builds static musl binaries and publishes them with a `SHA256SUMS` file. Tags with a suffix, such as `v0.3.0-rc.1`, become pre-releases.
 
 ## Roadmap
 
