@@ -92,7 +92,18 @@ Open **UDP 53 and TCP 53** on every server.
 
 ### 2. Get the binary
 
-Download a static Linux build (x86_64 or aarch64) from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
+The quickest way is the install script. It downloads the latest release for the machine (x86_64 or aarch64), checks it against `SHA256SUMS`, and installs the binary and the systemd unit (steps 2 and 3 in one go):
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/install.sh
+sudo sh install.sh
+```
+
+On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then start the service as the script says. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away.
+
+Run the script again to upgrade, optionally with a version such as `v0.2.0`. It checks the existing config with the new binary before replacing anything, then restarts the service.
+
+To do it by hand, download a static Linux build from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
 
 ```bash
 VERSION=v0.2.0
