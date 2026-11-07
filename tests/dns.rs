@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hickory_server::Server;
 use hickory_server::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_server::proto::rr::{Name, RecordType};
+use hickory_server::proto::rr::{Name, RData, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -120,6 +120,30 @@ async fn echoes_question_case() {
     let resp = over_udp(server.udp, &query("ApP-10-0-0-1.IpSsL.cC.", RecordType::A)).await;
     assert_eq!(resp.queries[0].name().to_string(), "ApP-10-0-0-1.IpSsL.cC.");
     assert_eq!(rdata(&resp), ["10.0.0.1"]);
+}
+
+#[tokio::test]
+async fn serves_mail_records() {
+    // An RSA DKIM key is longer than one 255-byte TXT string, so it has to
+    // go out split, and still fit a plain 512-byte UDP response.
+    let key = format!("v=DKIM1; k=rsa; p={}", "A".repeat(400));
+    let config = format!("{EXAMPLE_CONFIG}\n[hosts.\"s1._domainkey\"]\ntxt = [\"{key}\"]\n");
+    let server = start_with(Config::parse(&config).unwrap());
+
+    let mx = over_udp(server.udp, &query("ipssl.cc.", RecordType::MX)).await;
+    assert_eq!(rdata(&mx), ["10 mail.example.net."]);
+
+    let dkim = over_udp(
+        server.udp,
+        &query("s1._domainkey.ipssl.cc.", RecordType::TXT),
+    )
+    .await;
+    assert_eq!(dkim.metadata.response_code, ResponseCode::NoError);
+    assert!(!dkim.metadata.truncation);
+    let RData::TXT(txt) = &dkim.answers[0].data else {
+        panic!("not a TXT record");
+    };
+    assert_eq!(txt.txt_data.concat(), key.as_bytes());
 }
 
 #[tokio::test]

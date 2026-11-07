@@ -5,7 +5,7 @@ use std::net::IpAddr;
 
 use anyhow::{Context, Result, ensure};
 use hickory_server::proto::op::ResponseCode;
-use hickory_server::proto::rr::rdata::{A, AAAA, CAA, NS, SOA, TXT};
+use hickory_server::proto::rr::rdata::{A, AAAA, CAA, MX, NS, SOA, TXT};
 use hickory_server::proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use ipnet::IpNet;
 
@@ -121,7 +121,23 @@ impl Zone {
                 ));
             }
             for txt in &host.txt {
-                let data = RData::TXT(TXT::new(vec![txt.clone()]));
+                let data = RData::TXT(txt_record(txt));
+                records.push(Record::from_rdata(name.clone(), ttl, data));
+            }
+            let null_mx = host.mx.iter().any(|mx| mx.exchange.trim() == ".");
+            ensure!(
+                !null_mx || (host.mx.len() == 1 && host.mx[0].preference == 0),
+                "host {label:?}: a null MX (exchange \".\") must be the only MX and have preference 0"
+            );
+            for mx in &host.mx {
+                ensure!(
+                    mx.exchange.parse::<IpAddr>().is_err(),
+                    "host {label:?}: MX exchange must be a host name, not an address: {}",
+                    mx.exchange
+                );
+                let exchange = fqdn(&mx.exchange)
+                    .with_context(|| format!("host {label:?}: invalid MX exchange"))?;
+                let data = RData::MX(MX::new(mx.preference, exchange));
                 records.push(Record::from_rdata(name.clone(), ttl, data));
             }
         }
@@ -273,6 +289,18 @@ impl Answer {
     }
 }
 
+/// Maximum length of one DNS character-string (RFC 1035 section 3.3).
+const TXT_CHUNK: usize = 255;
+
+/// A TXT record holding `value`. Longer values are split into 255-byte
+/// strings; readers such as DKIM verifiers join them back together.
+fn txt_record(value: &str) -> TXT {
+    if value.is_empty() {
+        return TXT::new(vec![String::new()]);
+    }
+    TXT::from_bytes(value.as_bytes().chunks(TXT_CHUNK).collect())
+}
+
 /// Parses `name` as a fully qualified domain name.
 fn fqdn(name: &str) -> Result<Name> {
     let name = name.trim_end_matches('.');
@@ -317,6 +345,10 @@ mod tests {
 
         [hosts."@"]
         a = ["198.51.100.10"]
+        mx = [
+            { preference = 10, exchange = "mx.example.net." },
+            { preference = 20, exchange = "MX2.example.net" },
+        ]
 
         [hosts.www]
         a = ["198.51.100.10"]
@@ -439,6 +471,58 @@ mod tests {
         let a = query("www.ipssl.cc.", RecordType::AAAA);
         assert_eq!(a.rcode, ResponseCode::NoError);
         assert!(a.answers.is_empty());
+    }
+
+    fn zone_with(extra: &str) -> Result<Zone> {
+        Zone::from_config(&Config::parse(&format!("{CONFIG}\n{extra}\n")).unwrap())
+    }
+
+    #[test]
+    fn mx_records() {
+        assert_eq!(
+            rdata(&query("ipssl.cc.", RecordType::MX)),
+            ["10 mx.example.net.", "20 mx2.example.net."]
+        );
+        // Names computed from an address have no MX.
+        let a = query("10-0-0-1.ipssl.cc.", RecordType::MX);
+        assert_eq!(a.rcode, ResponseCode::NoError);
+        assert!(a.answers.is_empty());
+    }
+
+    #[test]
+    fn null_mx() {
+        let zone =
+            zone_with("[hosts.nomail]\nmx = [{ preference = 0, exchange = \".\" }]").unwrap();
+        let name = Name::from_ascii("nomail.ipssl.cc.").unwrap();
+        let a = zone.resolve(&name, RecordType::MX, DNSClass::IN, CLIENT);
+        assert_eq!(rdata(&a), ["0 ."]);
+    }
+
+    #[test]
+    fn rejects_bad_mx() {
+        for mx in [
+            r#"{ preference = 10, exchange = "." }"#,
+            r#"{ preference = 0, exchange = "." }, { preference = 10, exchange = "mx.example.net" }"#,
+            r#"{ preference = 10, exchange = "192.0.2.25" }"#,
+        ] {
+            let err = zone_with(&format!("[hosts.bad]\nmx = [{mx}]")).err();
+            assert!(err.is_some(), "accepted {mx}");
+        }
+    }
+
+    #[test]
+    fn long_txt_is_split() {
+        // An RSA DKIM key does not fit in one 255-byte string.
+        let key = format!("v=DKIM1; k=rsa; p={}", "A".repeat(600));
+        let zone = zone_with(&format!("[hosts.\"s1._domainkey\"]\ntxt = [\"{key}\"]")).unwrap();
+        let name = Name::from_ascii("s1._domainkey.ipssl.cc.").unwrap();
+        let a = zone.resolve(&name, RecordType::TXT, DNSClass::IN, CLIENT);
+        let RData::TXT(txt) = &a.answers[0].data else {
+            panic!("not a TXT record");
+        };
+        let lengths: Vec<usize> = txt.txt_data.iter().map(|s| s.len()).collect();
+        assert_eq!(lengths, [255, 255, 108]);
+        assert_eq!(txt.txt_data.concat(), key.as_bytes());
     }
 
     #[test]

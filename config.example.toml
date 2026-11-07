@@ -74,12 +74,23 @@ ip = 86400
 # Fixed records: SOA, NS, CAA and the hosts below
 records = 3600
 
-# Fixed records. Keys are relative to `domain`; "@" is the apex.
+# Fixed records. Keys are relative to `domain`; "@" is the apex. Each host
+# takes `a`, `aaaa`, `txt` and `mx`.
+# - txt: one record per entry. Values over 255 bytes (RSA DKIM keys) are
+#   split into 255-byte strings automatically; paste them in one piece.
+# - mx: `exchange` is always a full host name, never relative to `domain`.
+#   { preference = 0, exchange = "." } alone is a null MX: no mail accepted.
 # Note: "ip" is reserved. A TXT query for ip.ipssl.cc returns the address
 # of whoever asked.
 
 [hosts."@"]
 a = ["198.51.100.10"]
+# Mail for the domain, e.g. abuse@ipssl.cc
+mx = [{ preference = 10, exchange = "mail.example.net" }]
+txt = ["v=spf1 mx -all"]
+
+[hosts._dmarc]
+txt = ["v=DMARC1; p=quarantine; rua=mailto:postmaster@ipssl.cc"]
 
 [hosts.www]
 a = ["198.51.100.10"]

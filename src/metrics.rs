@@ -12,11 +12,12 @@ use hickory_server::proto::op::ResponseCode;
 use hickory_server::proto::rr::RecordType;
 
 /// Query types counted on their own; everything else is `other`.
-const QTYPES: [(RecordType, &str); 8] = [
+const QTYPES: [(RecordType, &str); 9] = [
     (RecordType::A, "A"),
     (RecordType::AAAA, "AAAA"),
     (RecordType::HTTPS, "HTTPS"),
     (RecordType::TXT, "TXT"),
+    (RecordType::MX, "MX"),
     (RecordType::NS, "NS"),
     (RecordType::SOA, "SOA"),
     (RecordType::CAA, "CAA"),
@@ -272,7 +273,7 @@ mod tests {
         let m = Metrics::new();
         m.query(Protocol::Udp, Some(RecordType::A));
         m.query(Protocol::Udp, Some(RecordType::A));
-        m.query(Protocol::Tcp, Some(RecordType::MX));
+        m.query(Protocol::Tcp, Some(RecordType::SRV));
         m.query(Protocol::Udp, None);
         m.response(ResponseCode::NXDomain);
         m.response(ResponseCode::BADVERS);

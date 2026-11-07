@@ -158,8 +158,23 @@ pub struct HostConfig {
     pub a: Vec<Ipv4Addr>,
     #[serde(default)]
     pub aaaa: Vec<Ipv6Addr>,
+    /// One TXT record per entry. Values longer than 255 bytes (such as RSA
+    /// DKIM keys) are split into several strings automatically.
     #[serde(default)]
     pub txt: Vec<String>,
+    #[serde(default)]
+    pub mx: Vec<MxConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MxConfig {
+    /// Lower values are tried first.
+    pub preference: u16,
+    /// Mail server host name, always taken as absolute (`mx.example.net`,
+    /// not relative to `domain`). `.` with preference 0 is a null MX
+    /// (RFC 7505): the name accepts no mail.
+    pub exchange: String,
 }
 
 impl Config {

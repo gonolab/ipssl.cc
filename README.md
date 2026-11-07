@@ -182,6 +182,22 @@ sudo systemctl reload ipssl-dns
 
 On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]` and `[metrics]` only take effect after a restart.
 
+### 6. Mail for the domain
+
+To receive mail such as `abuse@ipssl.cc`, add the records your mail server asks for under `[hosts]`. Paste DKIM keys in one piece; values over 255 bytes are split automatically.
+
+```toml
+[hosts."@"]
+mx = [{ preference = 10, exchange = "mail.example.net" }]
+txt = ["v=spf1 mx -all"]
+
+[hosts."202611r._domainkey"]
+txt = ["v=DKIM1; k=rsa; h=sha256; p=MIIBIjANBgkq..."]
+
+[hosts._dmarc]
+txt = ["v=DMARC1; p=quarantine; rua=mailto:postmaster@ipssl.cc"]
+```
+
 ## Rate limiting
 
 UDP source addresses are easy to forge, so an open authoritative server can be used to send floods of answers to someone else. The server limits UDP responses per client network (`/24` for IPv4, `/56` for IPv6), by default to 50 a second with bursts of up to 100. Over the limit, every second response is sent truncated and the rest are dropped. A real resolver that gets a truncated response retries over TCP, which cannot be forged and is never limited, so it still gets its answer.
@@ -244,6 +260,7 @@ The [release workflow](.github/workflows/release.yml) checks that the tag matche
 
 - [x] v0.1: DNS core (A/AAAA/SOA/NS/CAA/TXT, UDP + TCP, EDNS)
 - [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
+- [x] v0.3: MX records and long TXT values (DKIM keys) for mail on the domain
 - [ ] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
 - [x] Landing page
 
