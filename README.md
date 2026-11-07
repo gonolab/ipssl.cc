@@ -208,6 +208,18 @@ curl -s http://127.0.0.1:9153/metrics
 | `ipssl_build_info{version}` | Version of the running binary |
 | `process_start_time_seconds` | When the process started |
 
+## Website
+
+The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. The "Check live" button looks names up through Cloudflare's DNS-over-HTTPS API, and only when clicked.
+
+Preview it locally:
+
+```bash
+python3 -m http.server 4173 --directory site
+```
+
+To publish, copy the contents of `site/` into the web server's document root, and bump the `?v=` query on the stylesheet and script links in the HTML files so browsers fetch the new versions.
+
 ## FAQ
 
 **Private IPs don't resolve?** Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers pointing to private addresses. Allowlist this domain there, or use a public resolver.
@@ -233,7 +245,7 @@ The [release workflow](.github/workflows/release.yml) checks that the tag matche
 - [x] v0.1: DNS core (A/AAAA/SOA/NS/CAA/TXT, UDP + TCP, EDNS)
 - [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
 - [ ] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
-- [ ] Landing page
+- [x] Landing page
 
 ## License
 

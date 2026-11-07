@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ipssl.cc · Wildcard DNS for any IP address</title>
+  <meta name="description" content="Free wildcard DNS: 10-0-0-1.ipssl.cc resolves to 10.0.0.1. IPv4 and IPv6, no sign-up, and HTTPS certificates from any ACME CA. Open source, written in Rust.">
+  <meta name="theme-color" content="#f7f8fb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0a0f1d" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ipssl.cc">
+  <meta property="og:description" content="Wildcard DNS for any IP address. 10-0-0-1.ipssl.cc resolves to 10.0.0.1.">
+  <meta property="og:url" content="https://ipssl.cc/">
+  <link rel="canonical" href="https://ipssl.cc/">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css?v=1">
+  <script src="/assets/app.js?v=1" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main" data-i18n="skip">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap header-row">
+      <a class="brand" href="/" aria-label="ipssl.cc home">ipssl.cc</a>
+      <nav class="nav" aria-label="Sections">
+        <a href="#names" data-i18n="nav.names">Names</a>
+        <a href="#https" data-i18n="nav.https">HTTPS</a>
+        <a href="#servers" data-i18n="nav.servers">Servers</a>
+        <a href="#faq" data-i18n="nav.faq">FAQ</a>
+      </nav>
+      <div class="header-actions">
+        <button class="lang" id="lang-toggle" type="button" lang="zh-CN" aria-label="切换到中文">中文</button>
+        <a class="icon-link" href="https://github.com/gonolab/ipssl.cc" aria-label="ipssl.cc on GitHub">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <h1 id="hero-title"><span data-i18n="hero.t1">Every IP address</span><br><span class="accent" data-i18n="hero.t2">already has a name.</span></h1>
+        <p class="lead" data-i18n="hero.lead">Put an IP address in a hostname under <code>ipssl.cc</code> and it resolves to that address. Free, IPv4 and IPv6, no sign-up, and HTTPS certificates from any ACME CA.</p>
+        <div class="actions">
+          <a class="button primary" href="https://github.com/gonolab/ipssl.cc">
+            <span data-i18n="hero.source">View source</span>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg>
+          </a>
+          <a class="button ghost" href="#names">
+            <span data-i18n="hero.how">How names work</span>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+          </a>
+        </div>
+        <p class="stack">Rust · hickory-dns · IPv4 + IPv6 · MIT</p>
+      </div>
+
+      <div class="tool" id="tool">
+        <label class="tool-label" for="ip-input" data-i18n="tool.label">IP address or hostname</label>
+        <input class="ip-input" id="ip-input" type="text" value="203.0.113.10" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="tool-status">
+        <div class="examples">
+          <span data-i18n="tool.try">Try</span>
+          <button type="button" data-example="10.0.0.1">10.0.0.1</button>
+          <button type="button" data-example="192.168.1.10">192.168.1.10</button>
+          <button type="button" data-example="2001:db8::1">2001:db8::1</button>
+          <button type="button" data-example="app.10-0-0-1.ipssl.cc">app.10-0-0-1.ipssl.cc</button>
+        </div>
+        <p class="tool-status" id="tool-status" aria-live="polite"><strong>IPv4</strong> Documentation address, reserved for examples.</p>
+        <ul class="results" id="results">
+          <li><span class="host"><span class="a">203-0-113-10</span><span class="z">.ipssl.cc</span></span><span class="tag rec">Recommended</span><button class="copy" type="button" aria-label="Copy 203-0-113-10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
+          <li><span class="host"><span class="p">app-</span><span class="a">203-0-113-10</span><span class="z">.ipssl.cc</span></span><span class="tag">With a label</span><button class="copy" type="button" aria-label="Copy app-203-0-113-10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
+          <li><span class="host"><span class="a">203.0.113.10</span><span class="z">.ipssl.cc</span></span><span class="tag">Dotted</span><button class="copy" type="button" aria-label="Copy 203.0.113.10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
+          <li><span class="host"><span class="a">cb00710a</span><span class="z">.ipssl.cc</span></span><span class="tag">Hex</span><button class="copy" type="button" aria-label="Copy cb00710a.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
+        </ul>
+        <div class="check">
+          <button class="button secondary" id="check-btn" type="button">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></svg>
+            <span data-i18n="tool.check">Check live</span>
+          </button>
+          <p class="check-note" data-i18n="tool.checkNote">Looks the first name up through Cloudflare's public DNS over HTTPS.</p>
+        </div>
+        <div class="trace" id="trace" data-state="idle" hidden>
+          <ol class="trace-path">
+            <li><span data-i18n="trace.browser">Browser</span></li>
+            <li><span>Cloudflare DNS</span></li>
+            <li><span>ns1–3.ipssl.cc</span></li>
+          </ol>
+          <p class="answer" id="answer" aria-live="polite"></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section wrap" id="names" aria-labelledby="names-title">
+      <div class="section-head">
+        <h2 id="names-title" data-i18n="names.title">Write the address into the name.</h2>
+        <p data-i18n="names.lead">Dots become dashes, so the whole address fits in one label. Anything in front of it is yours to choose.</p>
+      </div>
+
+      <figure class="anatomy" id="anatomy">
+        <div class="seg seg-label"><code id="anat-label">app-</code><span class="cap" data-i18n="anat.label">Your label, optional</span></div>
+        <div class="seg seg-addr"><code id="anat-addr">203-0-113-10</code><span class="cap" data-i18n="anat.addr">The address, dots written as dashes</span></div>
+        <div class="seg seg-zone"><code>.ipssl.cc</code><span class="cap" data-i18n="anat.zone">The zone</span></div>
+        <div class="seg seg-result">
+          <code><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg><span id="anat-ip">203.0.113.10</span></code>
+          <span class="cap" data-i18n="anat.result">What it resolves to</span>
+        </div>
+      </figure>
+
+      <div class="forms-grid">
+        <div class="table-wrap">
+          <table class="forms">
+            <thead>
+              <tr><th data-i18n="forms.name">Name</th><th data-i18n="forms.result">Resolves to</th><th data-i18n="forms.notes">Notes</th></tr>
+            </thead>
+            <tbody>
+              <tr><td class="n"><code><span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n1"><strong>Recommended.</strong> One label, easiest to get certificates for</td></tr>
+              <tr><td class="n"><code>app-<span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n2">Words before or after the address, joined with <code>-</code></td></tr>
+              <tr><td class="n"><code><span class="a">10-0-0-1</span>-app<span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note"></td></tr>
+              <tr><td class="n"><code>app.<span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n3">Any number of subdomain levels</td></tr>
+              <tr><td class="n"><code><span class="a">10.0.0.1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n4">Dotted form</td></tr>
+              <tr><td class="n"><code>app.<span class="a">10.0.0.1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note"></td></tr>
+              <tr><td class="n"><code><span class="a">0a000001</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n5">Eight hex digits</td></tr>
+              <tr><td class="n"><code><span class="a">2001-db8--1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>2001:db8::1</code></td><td class="note" data-i18n="forms.n6">IPv6: write <code>:</code> as <code>-</code> and <code>::</code> as <code>--</code></td></tr>
+              <tr><td class="n"><code>app.<span class="a">2001-db8--1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>2001:db8::1</code></td><td class="note" data-i18n="forms.n7">Words in front of an IPv6 address go in their own label</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <aside class="rules" aria-labelledby="rules-title">
+          <h3 id="rules-title" data-i18n="rules.title">Rules</h3>
+          <ul>
+            <li data-i18n="rules.r1">When a name holds more than one address, the rightmost one, closest to the zone, wins.</li>
+            <li data-i18n="rules.r2">Numbers with leading zeros, such as <code>010</code>, are rejected, so nobody has to guess whether they are octal.</li>
+            <li data-i18n="rules.r3">An AAAA query for an IPv4 name, or the other way round, gets an empty answer, not NXDOMAIN.</li>
+            <li data-i18n="rules.r4">A TXT query for <code>ip.ipssl.cc</code> returns the address the query came from, usually your resolver.</li>
+          </ul>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section wrap split" id="https" aria-labelledby="https-title">
+      <div class="section-head">
+        <h2 id="https-title" data-i18n="https.title">Real certificates, issued to your own server.</h2>
+        <p data-i18n="https.lead">The name resolves to your server, so an ACME client running there passes HTTP-01 or TLS-ALPN-01 validation as it would for any other domain. There is nothing to sign up for, and the private key never leaves your machine.</p>
+        <ul class="notes">
+          <li data-i18n="https.n1"><strong>Any CA.</strong> The zone publishes no CAA record, so Let's Encrypt, ZeroSSL, Google Trust Services and others can all issue.</li>
+          <li data-i18n="https.n2"><strong>Public addresses only.</strong> The CA has to reach your server, so private addresses such as <code>192.168.1.10</code> cannot be validated.</li>
+          <li data-i18n="https.n3"><strong>One shared limit.</strong> Every name under ipssl.cc counts toward Let's Encrypt's rate limit for the registered domain. If you hit it, try again later or use another CA.</li>
+        </ul>
+      </div>
+
+      <div class="code-panel">
+        <div class="tabs" role="tablist" aria-label="ACME client">
+          <button role="tab" type="button" id="tab-certbot" aria-controls="snip-certbot" aria-selected="true">certbot</button>
+          <button role="tab" type="button" id="tab-acme" aria-controls="snip-acme" aria-selected="false" tabindex="-1">acme.sh</button>
+          <button role="tab" type="button" id="tab-caddy" aria-controls="snip-caddy" aria-selected="false" tabindex="-1">Caddy</button>
+        </div>
+        <div class="snip" role="tabpanel" id="snip-certbot" aria-labelledby="tab-certbot" tabindex="0"><pre><code><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \
+    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
+        <div class="snip" role="tabpanel" id="snip-acme" aria-labelledby="tab-acme" tabindex="0" hidden><pre><code><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \
+    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
+        <div class="snip" role="tabpanel" id="snip-caddy" aria-labelledby="tab-caddy" tabindex="0" hidden><pre><code><span class="comment"># Caddyfile</span>
+<span class="host-slot">203-0-113-10.ipssl.cc</span> {
+    reverse_proxy localhost:8080
+}</code></pre></div>
+        <div class="snip-foot">
+          <p id="snip-note" data-kind="doc">Uses the first name from the converter. Run it on the server that owns the address.</p>
+          <button class="copy copy-dark" id="snip-copy" type="button" aria-label="Copy command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="section wrap" id="servers" aria-labelledby="servers-title">
+      <div class="section-head">
+        <h2 id="servers-title" data-i18n="servers.title">Answered by three name servers in three regions.</h2>
+        <p data-i18n="servers.lead">Each one answers over UDP and TCP on port 53, on IPv4 and IPv6, running the same open source server.</p>
+      </div>
+      <div class="servers">
+        <ul class="ns-list">
+          <li>
+            <div class="ns-name"><code>ns1.ipssl.cc</code><span data-i18n="region.tokyo">Tokyo</span></div>
+            <div class="ns-addrs"><code>191.223.220.59</code><code>2403:18c0:1000:33e:c483:bbff:fe27:42c3</code></div>
+          </li>
+          <li>
+            <div class="ns-name"><code>ns2.ipssl.cc</code><span data-i18n="region.us">United States</span></div>
+            <div class="ns-addrs"><code>45.59.187.41</code><code>2605:52c0:3:1c4:be24:11ff:fe87:11f7</code></div>
+          </li>
+          <li>
+            <div class="ns-name"><code>ns3.ipssl.cc</code><span data-i18n="region.hk">Hong Kong</span></div>
+            <div class="ns-addrs"><code>191.223.218.37</code><code>2403:18c0:5:b56:be24:11ff:fe0e:1a61</code></div>
+          </li>
+        </ul>
+        <dl class="facts">
+          <div>
+            <dt data-i18n="facts.rl.t">Rate limited, never cut off</dt>
+            <dd data-i18n="facts.rl.d">UDP answers are limited per client network so the servers cannot be used to flood someone else. A resolver that gets a truncated answer retries over TCP, which is never limited.</dd>
+          </div>
+          <div>
+            <dt data-i18n="facts.log.t">No query logs</dt>
+            <dd data-i18n="facts.log.d">The servers keep aggregate counters only, such as how many A queries they answered. Query names and client addresses are not logged.</dd>
+          </div>
+          <div>
+            <dt data-i18n="facts.rust.t">Small, written in Rust</dt>
+            <dd data-i18n="facts.rust.d">An authoritative server built on hickory-dns. Config changes load without dropping a query.</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="section wrap faq" id="faq" aria-labelledby="faq-title">
+      <div class="section-head">
+        <h2 id="faq-title" data-i18n="faq.title">Questions</h2>
+        <p data-i18n="faq.lead">Something missing? Ask in the <a href="https://github.com/gonolab/ipssl.cc/issues">issue tracker</a>.</p>
+      </div>
+      <div class="faq-list">
+        <details>
+          <summary data-i18n="faq.q1">Why doesn't a private address resolve on my network?</summary>
+          <p data-i18n="faq.a1">Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers that point to private addresses. Allowlist <code>ipssl.cc</code> there, or use a public resolver.</p>
+        </details>
+        <details>
+          <summary data-i18n="faq.q2">Can I download a wildcard certificate for ipssl.cc?</summary>
+          <p data-i18n="faq.a2">No. Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key could revoke the certificate. Get a certificate on your own server instead; it takes one command.</p>
+        </details>
+        <details>
+          <summary data-i18n="faq.q3">Why isn't ipssl.cc on the Public Suffix List?</summary>
+          <p data-i18n="faq.a3">The list excludes services that resolve an IP address written in a hostname to that address: the same IP can belong to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the list.</p>
+        </details>
+        <details>
+          <summary data-i18n="faq.q4">How do I see where my DNS queries come from?</summary>
+          <p data-i18n="faq.a4">Run <code>dig +short TXT ip.ipssl.cc</code>. The answer is the address the query reached us from, which is usually your recursive resolver.</p>
+        </details>
+        <details>
+          <summary data-i18n="faq.q5">Can I run this for my own domain?</summary>
+          <p data-i18n="faq.a5">Yes. The server is open source under the MIT license, and the install script below sets it up on any Linux server. The README covers the config and the registrar setup.</p>
+        </details>
+        <details>
+          <summary data-i18n="faq.q6">How do I report abuse?</summary>
+          <p data-i18n="faq.a6">Open an issue on <a href="https://github.com/gonolab/ipssl.cc/issues">GitHub</a> with the name and what it is used for. The server has a blocklist, so names used for abuse can stop resolving.</p>
+        </details>
+      </div>
+    </section>
+
+    <section class="wrap closing" aria-labelledby="cta-title">
+      <div class="cta-panel">
+        <div class="cta-copy">
+          <h2 id="cta-title" data-i18n="cta.title">Run it for your own domain.</h2>
+          <p data-i18n="cta.lead">The install script downloads a static Linux binary, checks it against the release checksums and sets up a systemd service.</p>
+        </div>
+        <div class="actions cta-actions">
+          <a class="button primary" href="https://github.com/gonolab/ipssl.cc">
+            <span data-i18n="cta.github">View on GitHub</span>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg>
+          </a>
+          <a class="button secondary" href="https://github.com/gonolab/ipssl.cc/issues" data-i18n="cta.issue">Open an issue</a>
+        </div>
+        <div class="cmd">
+          <pre><code id="install-cmd">curl -fsSLO \
+    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/install.sh
+sudo sh install.sh</code></pre>
+          <button class="copy" id="install-copy" type="button" aria-label="Copy install command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap site-footer">
+    <span class="footer-brand">ipssl.cc</span>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="https://github.com/gonolab/ipssl.cc/blob/main/LICENSE" data-i18n="footer.license">MIT License</a>
+      <a href="https://github.com/gonolab/ipssl.cc">GitHub</a>
+      <a href="https://github.com/gonolab/ipssl.cc/issues" data-i18n="footer.abuse">Report abuse</a>
+    </nav>
+  </footer>
+</body>
+</html>

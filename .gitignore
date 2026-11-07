@@ -10,6 +10,10 @@
 AGENTS.md
 CLAUDE.md
 /.claude/
+# Design tool context and review captures
+/PRODUCT.md
+/DESIGN.md
+/.impeccable/
 
 # Secrets and environment files. This repo is public: ACME account keys
 # and certificate private keys must never be committed.
