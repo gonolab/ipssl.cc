@@ -242,6 +242,8 @@ To publish, copy the contents of `site/` into the web server's document root, an
 
 **Why not hand out a wildcard certificate?** Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key can revoke the certificate. Get a certificate on your own server instead (see [HTTPS certificates](#https-certificates)).
 
+**How do I report abuse?** Email abuse@ipssl.cc or open an issue on GitHub with the name and what it is used for. Names used for abuse can be put on the server's blocklist.
+
 **Why isn't ipssl.cc on the Public Suffix List?** The PSL explicitly excludes services that resolve an IP address encoded in a hostname to that address: the same IP can be assigned to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the PSL.
 
 ## Releasing

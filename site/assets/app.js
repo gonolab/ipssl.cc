@@ -320,7 +320,7 @@
     "faq.q5": "可以给自己的域名部署一套吗？",
     "faq.a5": "可以。服务端以 MIT 协议开源，用下面的安装脚本就能装到任何 Linux 服务器上。配置和注册商设置见 README。",
     "faq.q6": "怎么举报滥用？",
-    "faq.a6": "在 <a href=\"https://github.com/gonolab/ipssl.cc/issues\">GitHub</a> 上提交 issue，写明域名和它的用途。服务端支持屏蔽列表，用于滥用的名字可以停止解析。",
+    "faq.a6": "发邮件到 <a href=\"mailto:abuse@ipssl.cc\">abuse@ipssl.cc</a>，或者在 <a href=\"https://github.com/gonolab/ipssl.cc/issues\">GitHub</a> 上提交 issue，写明域名和它的用途。服务端支持屏蔽列表，用于滥用的名字可以停止解析。",
     "cta.title": "为你自己的域名部署一套。",
     "cta.lead": "安装脚本会下载静态编译的 Linux 程序，对照发布的校验和检查后，配置好 systemd 服务。",
     "cta.github": "在 GitHub 上查看",
