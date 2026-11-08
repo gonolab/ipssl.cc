@@ -58,6 +58,8 @@ pub struct Metrics {
     queries: [[AtomicU64; QTYPE_LABELS]; PROTOCOLS.len()],
     responses: [AtomicU64; RCODE_LABELS],
     send_errors: AtomicU64,
+    /// UDP answers too large for the client's buffer, sent truncated.
+    truncated: AtomicU64,
     /// Dropped, slipped.
     rate_limited: [AtomicU64; 2],
     /// Succeeded, failed.
@@ -80,6 +82,7 @@ impl Metrics {
             queries: Default::default(),
             responses: Default::default(),
             send_errors: AtomicU64::new(0),
+            truncated: AtomicU64::new(0),
             rate_limited: Default::default(),
             reloads: Default::default(),
         }
@@ -106,6 +109,11 @@ impl Metrics {
 
     pub fn send_error(&self) {
         inc(&self.send_errors);
+    }
+
+    /// Counts a UDP answer that did not fit and was sent truncated.
+    pub fn truncated(&self) {
+        inc(&self.truncated);
     }
 
     pub fn rate_limited(&self, what: Limited) {
@@ -166,6 +174,14 @@ impl Metrics {
             load(&self.send_errors)
         )
         .unwrap();
+
+        header(
+            &mut out,
+            "ipssl_dns_truncated_total",
+            "counter",
+            "UDP answers too large for the client's buffer, sent truncated so it retries over TCP.",
+        );
+        writeln!(out, "ipssl_dns_truncated_total {}", load(&self.truncated)).unwrap();
 
         header(
             &mut out,

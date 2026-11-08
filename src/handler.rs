@@ -8,6 +8,7 @@ use hickory_server::net::runtime::Time;
 use hickory_server::net::xfer::Protocol;
 use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_server::proto::rr::Record;
+use hickory_server::proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::{MessageResponse, MessageResponseBuilder};
 use tracing::{debug, warn};
@@ -132,6 +133,24 @@ impl RequestHandler for Handler {
         metadata.authoritative = answer.authoritative;
         metadata.response_code = answer.rcode;
 
+        // When an answer does not fit, hickory drops the records but leaves
+        // their partly written bytes at the end of the message, which strict
+        // parsers reject. Send a clean truncated response instead (header,
+        // question and OPT only), so the client retries over TCP.
+        if request.protocol() == Protocol::Udp {
+            let limit = usize::from(response_edns.as_ref().map_or(512, Edns::max_payload));
+            let records: Vec<&Record> = answer.answers.iter().chain(&answer.soa).collect();
+            let len = encoded_len(request.queries.as_bytes(), &records, response_edns.as_ref());
+            if len.is_none_or(|len| len > limit) {
+                self.metrics.truncated();
+                metadata.truncation = true;
+                let response =
+                    MessageResponseBuilder::new(&request.queries, response_edns.as_ref())
+                        .build_no_records(metadata);
+                return send(response_handle, response, metadata, &self.metrics).await;
+            }
+        }
+
         let response = MessageResponseBuilder::new(&request.queries, response_edns.as_ref()).build(
             metadata,
             answer.answers.iter(),
@@ -142,6 +161,25 @@ impl RequestHandler for Handler {
 
         send(response_handle, response, metadata, &self.metrics).await
     }
+}
+
+/// Size of the response hickory would send: the header, the question copied
+/// as the client sent it, the records and the OPT record. hickory copies the
+/// question verbatim, so record names only compress against each other.
+/// `None` if a record cannot be encoded at all.
+fn encoded_len(question: &[u8], records: &[&Record], edns: Option<&Edns>) -> Option<usize> {
+    const HEADER_LEN: usize = 12;
+    let mut buf = Vec::with_capacity(512);
+    let mut encoder = BinEncoder::new(&mut buf);
+    encoder.emit_vec(&[0; HEADER_LEN]).ok()?;
+    encoder.emit_vec(question).ok()?;
+    for record in records {
+        record.emit(&mut encoder).ok()?;
+    }
+    if let Some(edns) = edns {
+        Record::from(edns).emit(&mut encoder).ok()?;
+    }
+    Some(encoder.offset())
 }
 
 /// Sends `response` and counts it. If sending fails, the returned info

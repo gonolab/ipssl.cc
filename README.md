@@ -217,6 +217,7 @@ curl -s http://127.0.0.1:9153/metrics
 | `ipssl_dns_queries_total{protocol, qtype}` | Requests received |
 | `ipssl_dns_responses_total{rcode}` | Responses sent |
 | `ipssl_dns_send_errors_total` | Responses that could not be sent |
+| `ipssl_dns_truncated_total` | UDP answers too large for the client's buffer, sent truncated so it retries over TCP |
 | `ipssl_dns_rate_limited_total{action}` | UDP responses dropped (`drop`) or sent truncated (`slip`) by rate limiting |
 | `ipssl_rate_limit_tracked_networks` | Client networks the rate limiter is tracking |
 | `ipssl_config_reloads_total{result}` | Config reloads that succeeded or failed |

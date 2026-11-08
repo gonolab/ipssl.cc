@@ -66,6 +66,18 @@ async fn try_udp(addr: SocketAddr, msg: &Message, wait: Duration) -> Option<Mess
     Some(Message::from_vec(&buf[..n]).unwrap())
 }
 
+/// Sends `msg` over UDP and returns the response exactly as received.
+async fn raw_udp(addr: SocketAddr, msg: &Message) -> Vec<u8> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.send_to(&msg.to_vec().unwrap(), addr).await.unwrap();
+    let mut buf = [0u8; 4096];
+    let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+        .await
+        .expect("no UDP response")
+        .unwrap();
+    buf[..n].to_vec()
+}
+
 async fn over_tcp(addr: SocketAddr, msg: &Message) -> Message {
     let bytes = msg.to_vec().unwrap();
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -144,6 +156,57 @@ async fn serves_mail_records() {
         panic!("not a TXT record");
     };
     assert_eq!(txt.txt_data.concat(), key.as_bytes());
+}
+
+#[tokio::test]
+async fn oversized_udp_answer_is_cleanly_truncated() {
+    // Too big for 512 bytes even on its own, small enough for 1232.
+    let key = format!("v=DKIM1; k=rsa; p={}", "A".repeat(600));
+    let config = format!("{EXAMPLE_CONFIG}\n[hosts.\"s1._domainkey\"]\ntxt = [\"{key}\"]\n");
+    let server = start_with(Config::parse(&config).unwrap());
+    let name = "s1._domainkey.ipssl.cc.";
+    // Wire name (one byte longer than the dotted text), then type and class.
+    let question_len = name.len() + 1 + 4;
+    let with_edns = |payload: u16| {
+        let mut msg = query(name, RecordType::TXT);
+        let mut edns = Edns::new();
+        edns.set_max_payload(payload);
+        msg.set_edns(edns);
+        msg
+    };
+    let key_of = |msg: &Message| match &msg.answers[0].data {
+        RData::TXT(txt) => txt.txt_data.concat(),
+        other => panic!("not TXT: {other:?}"),
+    };
+
+    // No EDNS: header and question only, with nothing left over after them.
+    let plain = query(name, RecordType::TXT);
+    let bytes = raw_udp(server.udp, &plain).await;
+    assert_eq!(bytes.len(), 12 + question_len);
+    let resp = Message::from_vec(&bytes).unwrap();
+    assert!(resp.metadata.truncation);
+    assert!(resp.metadata.authoritative);
+    assert!(resp.answers.is_empty() && resp.authorities.is_empty());
+
+    // EDNS with a 512-byte buffer: the same plus the OPT record.
+    let bytes = raw_udp(server.udp, &with_edns(512)).await;
+    assert_eq!(bytes.len(), 12 + question_len + 11);
+    assert!(Message::from_vec(&bytes).unwrap().metadata.truncation);
+
+    // A 1232-byte buffer takes the whole record in one go.
+    let resp = over_udp(server.udp, &with_edns(1232)).await;
+    assert!(!resp.metadata.truncation);
+    assert_eq!(key_of(&resp), key.as_bytes());
+
+    // TCP always does.
+    let resp = over_tcp(server.tcp, &plain).await;
+    assert_eq!(key_of(&resp), key.as_bytes());
+
+    let metrics = server.handler.render_metrics();
+    assert!(
+        metrics.contains("\nipssl_dns_truncated_total 2\n"),
+        "{metrics}"
+    );
 }
 
 #[tokio::test]
