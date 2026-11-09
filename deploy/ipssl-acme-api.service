@@ -1,0 +1,34 @@
+[Unit]
+Description=ipssl DNS-01 challenge API
+Documentation=https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ipssl-dns --acme-api -c /etc/ipssl/config.toml
+Restart=always
+RestartSec=2
+
+# Run as a throwaway non-root user with no special capabilities: the API
+# listens on a high port behind the TLS reverse proxy.
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+
+# Hardening: read-only file system, no access to home directories,
+# devices or kernel settings
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

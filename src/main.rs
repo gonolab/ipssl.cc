@@ -1,5 +1,6 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -7,6 +8,7 @@ use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use ipssl::acme::{Api, Challenges, Node};
 use ipssl::config::Config;
 use ipssl::handler::Handler;
 use ipssl::ratelimit::RateLimiter;
@@ -23,6 +25,11 @@ struct Args {
     /// Validate the config and exit.
     #[arg(long)]
     check: bool,
+
+    /// Run the DNS-01 challenge API (`[acme]` in the config) instead of the
+    /// DNS server.
+    #[arg(long)]
+    acme_api: bool,
 }
 
 #[tokio::main]
@@ -40,8 +47,22 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config = Config::load(&args.config)?;
+    if args.acme_api {
+        let api = Api::from_config(&config)?;
+        if args.check {
+            info!(nodes = ?api.nodes(), "config OK");
+            return Ok(());
+        }
+        return run_acme_api(&config, api).await;
+    }
+
     let zone = Zone::from_config(&config)?;
     let limiter = RateLimiter::from_config(&config.rate_limit)?;
+    if let Some(acme) = &config.acme
+        && acme.writers.is_empty()
+    {
+        warn!("acme.writers is empty, so no challenge can be published");
+    }
     if args.check {
         info!("config OK");
         return Ok(());
@@ -58,7 +79,21 @@ async fn main() -> Result<()> {
     if limiter.is_none() {
         warn!("UDP rate limiting is off");
     }
-    let handler = Handler::new(zone).with_rate_limiter(limiter);
+    let mut handler = Handler::new(zone).with_rate_limiter(limiter);
+
+    if let Some(acme) = &config.acme {
+        let addr = acme.listen;
+        let listener = ipssl::bind_tcp(addr).with_context(|| format!("binding acme {addr}"))?;
+        info!(%addr, writers = ?acme.writers, "accepting DNS-01 challenges");
+        let store = Arc::new(Challenges::new());
+        handler = handler.with_challenges(store.clone());
+        tokio::spawn(purge_challenges(store.clone()));
+        let node = Arc::new(Node::new(handler.clone(), store, &acme.writers));
+        tokio::spawn(ipssl::http::serve(listener, move |req| {
+            let node = node.clone();
+            async move { node.handle(req).await }
+        }));
+    }
 
     if let Some(metrics) = &config.metrics {
         let addr = metrics.listen;
@@ -67,7 +102,7 @@ async fn main() -> Result<()> {
             .with_context(|| format!("binding metrics {addr}"))?;
         info!(%addr, "serving metrics at /metrics");
         let handler = handler.clone();
-        tokio::spawn(ipssl::http::serve(listener, move || {
+        tokio::spawn(ipssl::http::serve_metrics(listener, move || {
             handler.render_metrics()
         }));
     }
@@ -94,6 +129,34 @@ async fn main() -> Result<()> {
 
     server.block_until_done().await?;
     Ok(())
+}
+
+/// Serves the DNS-01 challenge API until SIGTERM or Ctrl-C. Config changes
+/// need a restart.
+async fn run_acme_api(config: &Config, api: Api) -> Result<()> {
+    let acme = config.acme.as_ref().expect("checked by Api::from_config");
+    let addr = acme.api_listen;
+    let listener = ipssl::bind_tcp(addr).with_context(|| format!("binding acme api {addr}"))?;
+    info!(%addr, nodes = ?api.nodes(), "serving the DNS-01 challenge API");
+    let api = Arc::new(api);
+    let server = tokio::spawn(ipssl::http::serve(listener, move |req| {
+        let api = api.clone();
+        async move { api.handle(req).await }
+    }));
+    shutdown_signal().await;
+    info!("shutting down");
+    server.abort();
+    Ok(())
+}
+
+/// Forgets expired challenge values once a minute, so the store does not
+/// fill up with values nobody asked for again.
+async fn purge_challenges(store: Arc<Challenges>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        store.purge();
+    }
 }
 
 /// Reloads the config on every SIGHUP (`systemctl reload ipssl-dns`).

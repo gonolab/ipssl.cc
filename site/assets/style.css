@@ -984,7 +984,6 @@ p {
   line-height: 1.5;
 }
 
-.snip-foot p[data-kind="private"],
 .snip-foot p[data-kind="other"] {
   color: var(--code-warn);
 }

@@ -92,18 +92,39 @@ impl RateLimiter {
             "rate_limit.max_tracked must be at least 1"
         );
 
+        let mut limiter = Self::new(
+            f64::from(cfg.responses_per_second),
+            cfg.burst,
+            cfg.ipv4_prefix,
+            cfg.ipv6_prefix,
+            cfg.max_tracked,
+        );
+        limiter.slip = cfg.slip;
+        limiter.exempt = cfg.exempt.clone();
+        Ok(Some(limiter))
+    }
+
+    /// A limiter allowing `rate` requests a second (fractions are fine) and
+    /// bursts of `burst` per client network. Limited requests are dropped:
+    /// it never slips. Arguments must be in range (see [`Self::from_config`]).
+    pub fn new(
+        rate: f64,
+        burst: u32,
+        ipv4_prefix: u8,
+        ipv6_prefix: u8,
+        max_tracked: usize,
+    ) -> Self {
         let now = Instant::now();
-        let rate = f64::from(cfg.responses_per_second);
-        let burst = f64::from(cfg.burst);
-        let shards = SHARDS.min(cfg.max_tracked);
-        Ok(Some(Self {
+        let burst = f64::from(burst);
+        let shards = SHARDS.min(max_tracked);
+        Self {
             rate,
             burst,
             refill: Duration::from_secs_f64(burst / rate),
-            slip: cfg.slip,
-            ipv4_prefix: cfg.ipv4_prefix,
-            ipv6_prefix: cfg.ipv6_prefix,
-            exempt: cfg.exempt.clone(),
+            slip: 0,
+            ipv4_prefix,
+            ipv6_prefix,
+            exempt: Vec::new(),
             hasher: RandomState::new(),
             shards: (0..shards)
                 .map(|_| {
@@ -113,9 +134,9 @@ impl RateLimiter {
                     })
                 })
                 .collect(),
-            shard_capacity: cfg.max_tracked / shards,
+            shard_capacity: max_tracked / shards,
             overflow: Mutex::new(Bucket::full(burst, now)),
-        }))
+        }
     }
 
     /// Accounts for one response to `client` and says what to do with it.

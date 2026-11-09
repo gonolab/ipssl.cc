@@ -13,8 +13,8 @@
   <meta property="og:url" content="https://ipssl.cc/">
   <link rel="canonical" href="https://ipssl.cc/">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=1">
-  <script src="/assets/app.js?v=3" defer></script>
+  <link rel="stylesheet" href="/assets/style.css?v=2">
+  <script src="/assets/app.js?v=4" defer></script>
 </head>
 <body>
   <a class="skip" href="#main" data-i18n="skip">Skip to content</a>
@@ -144,7 +144,7 @@
         <p data-i18n="https.lead">The name resolves to your server, so an ACME client running there passes HTTP-01 or TLS-ALPN-01 validation as it would for any other domain. There is nothing to sign up for, and the private key never leaves your machine.</p>
         <ul class="notes">
           <li data-i18n="https.n1"><strong>Any CA.</strong> The zone publishes no CAA record, so Let's Encrypt, ZeroSSL, Google Trust Services and others can all issue.</li>
-          <li data-i18n="https.n2"><strong>Public addresses only.</strong> The CA has to reach your server, so private addresses such as <code>192.168.1.10</code> cannot be validated.</li>
+          <li data-i18n="https.n2"><strong>Private addresses use DNS-01.</strong> A CA cannot reach <code>192.168.1.10</code>, so the challenge goes through DNS instead: point lego, Traefik, certbot or acme.sh at <code>https://ipssl.cc/acme</code>. <a href="https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses">How it works</a></li>
           <li data-i18n="https.n3"><strong>One shared limit.</strong> Every name under ipssl.cc counts toward Let's Encrypt's rate limit for the registered domain. If you hit it, try again later or use another CA.</li>
         </ul>
       </div>
@@ -155,12 +155,24 @@
           <button role="tab" type="button" id="tab-acme" aria-controls="snip-acme" aria-selected="false" tabindex="-1">acme.sh</button>
           <button role="tab" type="button" id="tab-caddy" aria-controls="snip-caddy" aria-selected="false" tabindex="-1">Caddy</button>
         </div>
-        <div class="snip" role="tabpanel" id="snip-certbot" aria-labelledby="tab-certbot" tabindex="0"><pre><code><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \
+        <div class="snip" role="tabpanel" id="snip-certbot" aria-labelledby="tab-certbot" tabindex="0"><pre data-mode="http"><code><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \
+    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre><pre data-mode="dns" hidden><code><span class="prompt" aria-hidden="true">$ </span>curl -fsSLO \
+    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/acme/ipssl-certbot-hook.sh
+<span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --manual --preferred-challenges dns \
+    --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" \
+    --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" \
     -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
-        <div class="snip" role="tabpanel" id="snip-acme" aria-labelledby="tab-acme" tabindex="0" hidden><pre><code><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \
+        <div class="snip" role="tabpanel" id="snip-acme" aria-labelledby="tab-acme" tabindex="0" hidden><pre data-mode="http"><code><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \
+    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre><pre data-mode="dns" hidden><code><span class="prompt" aria-hidden="true">$ </span>curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh \
+    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/acme/dns_ipssl.sh
+<span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --dns dns_ipssl \
     -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
-        <div class="snip" role="tabpanel" id="snip-caddy" aria-labelledby="tab-caddy" tabindex="0" hidden><pre><code><span class="comment"># Caddyfile</span>
+        <div class="snip" role="tabpanel" id="snip-caddy" aria-labelledby="tab-caddy" tabindex="0" hidden><pre data-mode="http"><code><span class="comment"># Caddyfile</span>
 <span class="host-slot">203-0-113-10.ipssl.cc</span> {
+    reverse_proxy localhost:8080
+}</code></pre><pre data-mode="dns" hidden><code><span class="comment"># Caddyfile, with a certificate from certbot or acme.sh</span>
+<span class="host-slot">203-0-113-10.ipssl.cc</span> {
+    tls fullchain.pem privkey.pem
     reverse_proxy localhost:8080
 }</code></pre></div>
         <div class="snip-foot">

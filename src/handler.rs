@@ -1,18 +1,20 @@
 //! Glue between hickory-server and [`Zone`].
 
 use std::iter;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hickory_server::net::runtime::Time;
 use hickory_server::net::xfer::Protocol;
 use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
-use hickory_server::proto::rr::Record;
+use hickory_server::proto::rr::{DNSClass, LowerName, Name, Record, RecordType};
 use hickory_server::proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::{MessageResponse, MessageResponseBuilder};
 use tracing::{debug, warn};
 
+use crate::acme::Challenges;
 use crate::metrics::{Gauges, Limited, Metrics};
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{Answer, Zone};
@@ -28,6 +30,8 @@ pub struct Handler {
     zone: Arc<ArcSwap<Zone>>,
     /// Limits UDP responses per client network; `None` when turned off.
     limiter: Option<Arc<RateLimiter>>,
+    /// Published DNS-01 challenges; `None` when `[acme]` is off.
+    challenges: Option<Arc<Challenges>>,
     metrics: Arc<Metrics>,
 }
 
@@ -36,6 +40,7 @@ impl Handler {
         Self {
             zone: Arc::new(ArcSwap::from_pointee(zone)),
             limiter: None,
+            challenges: None,
             metrics: Arc::new(Metrics::new()),
         }
     }
@@ -43,6 +48,17 @@ impl Handler {
     pub fn with_rate_limiter(mut self, limiter: Option<RateLimiter>) -> Self {
         self.limiter = limiter.map(Arc::new);
         self
+    }
+
+    /// Answers TXT queries for challenge names from `store`.
+    pub fn with_challenges(mut self, store: Arc<Challenges>) -> Self {
+        self.challenges = Some(store);
+        self
+    }
+
+    /// The zone being served right now.
+    pub fn zone(&self) -> Arc<Zone> {
+        self.zone.load_full()
     }
 
     /// Replaces the zone. Requests already being answered finish with the
@@ -60,7 +76,22 @@ impl Handler {
         self.metrics.render(&Gauges {
             zone_serial: self.zone.load().serial(),
             rate_limit_tracked: self.limiter.as_ref().map(|l| l.tracked()),
+            acme_challenges: self.challenges.as_ref().map(|c| c.len()),
         })
+    }
+
+    /// Looks up a query, answering challenge names from the published
+    /// challenges when `[acme]` is on.
+    fn resolve(&self, name: &Name, qtype: RecordType, qclass: DNSClass, src: IpAddr) -> Answer {
+        let zone = self.zone.load();
+        if let Some(store) = &self.challenges
+            && matches!(qtype, RecordType::TXT | RecordType::ANY)
+            && qclass == DNSClass::IN
+            && zone.check_challenge(name).is_ok()
+        {
+            return zone.challenge_answer(name, store.values(&LowerName::new(name)));
+        }
+        zone.resolve(name, qtype, qclass, src)
     }
 }
 
@@ -118,7 +149,7 @@ impl RequestHandler for Handler {
                 Ok(info) => {
                     let q = info.query;
                     debug!(name = %q.name(), qtype = %q.query_type(), "query");
-                    self.zone.load().resolve(
+                    self.resolve(
                         q.original().name(),
                         q.query_type(),
                         q.query_class(),

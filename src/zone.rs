@@ -9,6 +9,7 @@ use hickory_server::proto::rr::rdata::{A, AAAA, CAA, MX, NS, SOA, TXT};
 use hickory_server::proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use ipnet::IpNet;
 
+use crate::acme::{CHALLENGE_LABEL, is_private};
 use crate::config::Config;
 use crate::parse::extract_ip;
 
@@ -191,12 +192,7 @@ impl Zone {
             };
         }
 
-        let relative = qname.num_labels() as usize - self.origin_labels;
-        let labels: Vec<String> = qname
-            .iter()
-            .take(relative)
-            .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
-            .collect();
+        let labels = self.relative_labels(qname);
         let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
 
         match extract_ip(&labels) {
@@ -218,6 +214,73 @@ impl Zone {
             None if self.hosts.keys().any(|k| lower.zone_of(k)) => self.nodata(),
             None => self.nxdomain(),
         }
+    }
+
+    /// Parses `fqdn` (the trailing dot is optional) and checks that it can
+    /// hold a DNS-01 challenge, see [`Self::check_challenge`].
+    pub fn challenge_name(&self, fqdn: &str) -> Result<LowerName, ChallengeError> {
+        let trimmed = fqdn.trim().trim_end_matches('.');
+        if trimmed.is_empty() {
+            return Err(ChallengeError::Invalid);
+        }
+        let name = Name::from_ascii(format!("{trimmed}.")).map_err(|_| ChallengeError::Invalid)?;
+        self.check_challenge(&name)?;
+        Ok(LowerName::new(&name))
+    }
+
+    /// Checks that `name` is `_acme-challenge.<name>` in this zone, where
+    /// `<name>` holds a private address. Public addresses are left to
+    /// HTTP-01 and TLS-ALPN-01, which only whoever holds the address can
+    /// pass; letting anyone publish challenges for them would let anyone
+    /// get a certificate for someone else's server.
+    pub fn check_challenge(&self, name: &Name) -> Result<IpAddr, ChallengeError> {
+        if !self.origin.zone_of(&LowerName::new(name)) {
+            return Err(ChallengeError::OutsideZone);
+        }
+        let labels = self.relative_labels(name);
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        match labels.split_first() {
+            Some((&CHALLENGE_LABEL, rest)) => {
+                let ip = extract_ip(rest).ok_or(ChallengeError::NoAddress)?;
+                if self.blocklist.iter().any(|net| net.contains(&ip)) {
+                    Err(ChallengeError::Blocked)
+                } else if !is_private(ip) {
+                    Err(ChallengeError::PublicAddress)
+                } else {
+                    Ok(ip)
+                }
+            }
+            _ => Err(ChallengeError::NotChallenge),
+        }
+    }
+
+    /// The answer to a TXT query for a challenge name, given the values
+    /// published for it. Everything has TTL 0, the negative answer
+    /// included, so a client that retries is never answered from a cache.
+    pub fn challenge_answer(&self, qname: &Name, values: Vec<String>) -> Answer {
+        if values.is_empty() {
+            let mut soa = self.negative_soa.clone();
+            soa.ttl = 0;
+            return Answer {
+                soa: Some(soa),
+                ..self.nodata()
+            };
+        }
+        let answers = values
+            .into_iter()
+            .map(|v| Record::from_rdata(qname.clone(), 0, RData::TXT(TXT::new(vec![v]))))
+            .collect();
+        self.answer(answers)
+    }
+
+    /// The lowercase labels of `name` left of the apex, in normal order.
+    /// `name` must be inside the zone.
+    fn relative_labels(&self, name: &Name) -> Vec<String> {
+        let relative = name.num_labels() as usize - self.origin_labels;
+        name.iter()
+            .take(relative)
+            .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
+            .collect()
     }
 
     fn fixed(&self, qname: &Name, records: &[Record], qtype: RecordType) -> Answer {
@@ -269,6 +332,33 @@ impl Zone {
             authoritative: true,
             answers: vec![],
             soa: Some(self.negative_soa.clone()),
+        }
+    }
+}
+
+/// Why a name cannot hold a DNS-01 challenge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeError {
+    Invalid,
+    OutsideZone,
+    NotChallenge,
+    NoAddress,
+    PublicAddress,
+    Blocked,
+}
+
+impl ChallengeError {
+    /// Explanation for API clients.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Invalid => "fqdn is not a valid domain name",
+            Self::OutsideZone => "fqdn is outside this zone",
+            Self::NotChallenge => "fqdn must start with _acme-challenge.",
+            Self::NoAddress => "fqdn holds no IP address",
+            Self::PublicAddress => {
+                "only names with private addresses can use DNS-01; validate public addresses with HTTP-01 or TLS-ALPN-01"
+            }
+            Self::Blocked => "this address is blocked",
         }
     }
 }
@@ -563,5 +653,75 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn challenge_names() {
+        let cfg = CONFIG.replace(
+            r#"blocklist = ["203.0.113.0/24"]"#,
+            r#"blocklist = ["203.0.113.0/24", "10.9.0.0/16"]"#,
+        );
+        let zone = Zone::from_config(&Config::parse(&cfg).unwrap()).unwrap();
+        for ok in [
+            "_acme-challenge.10-0-2-2.ipssl.cc",
+            "_acme-challenge.10-0-2-2.ipssl.cc.",
+            "_ACME-Challenge.App.192-168-1-10.IPSSL.cc",
+            "_acme-challenge.fd00--1.ipssl.cc",
+            "_acme-challenge.100-64-0-1.ipssl.cc",
+        ] {
+            assert!(zone.challenge_name(ok).is_ok(), "{ok}");
+        }
+        for (bad, why) in [
+            ("", ChallengeError::Invalid),
+            ("_acme-challenge..ipssl.cc", ChallengeError::Invalid),
+            (
+                "_acme-challenge.10-0-2-2.example.com",
+                ChallengeError::OutsideZone,
+            ),
+            ("10-0-2-2.ipssl.cc", ChallengeError::NotChallenge),
+            (
+                "x._acme-challenge.10-0-2-2.ipssl.cc",
+                ChallengeError::NotChallenge,
+            ),
+            ("_acme-challenge.ipssl.cc", ChallengeError::NoAddress),
+            ("_acme-challenge.www.ipssl.cc", ChallengeError::NoAddress),
+            (
+                "_acme-challenge.198-51-100-10.ipssl.cc",
+                ChallengeError::PublicAddress,
+            ),
+            (
+                "_acme-challenge.203-0-113-10.ipssl.cc",
+                ChallengeError::Blocked,
+            ),
+            (
+                "_acme-challenge.2001-db8--1.ipssl.cc",
+                ChallengeError::PublicAddress,
+            ),
+            ("_acme-challenge.10-9-1-1.ipssl.cc", ChallengeError::Blocked),
+        ] {
+            assert_eq!(zone.challenge_name(bad).err(), Some(why), "{bad:?}");
+        }
+        // The name comes back normalized, so it can be used as a key.
+        assert_eq!(
+            zone.challenge_name("_ACME-challenge.10-0-2-2.ipssl.cc")
+                .unwrap()
+                .to_string(),
+            "_acme-challenge.10-0-2-2.ipssl.cc."
+        );
+    }
+
+    #[test]
+    fn challenge_answers_never_cache() {
+        let zone = zone();
+        let name = Name::from_ascii("_acme-challenge.10-0-2-2.ipssl.cc.").unwrap();
+        let a = zone.challenge_answer(&name, vec!["one".into(), "two".into()]);
+        assert!(a.authoritative);
+        assert_eq!(rdata(&a), ["one", "two"]);
+        assert!(a.answers.iter().all(|r| r.ttl == 0));
+
+        let empty = zone.challenge_answer(&name, vec![]);
+        assert_eq!(empty.rcode, ResponseCode::NoError);
+        assert!(empty.answers.is_empty());
+        assert_eq!(empty.soa.unwrap().ttl, 0);
     }
 }

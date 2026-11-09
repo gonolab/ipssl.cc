@@ -62,7 +62,7 @@ jobs:
           name="ipssl-dns-$GITHUB_REF_NAME-$TARGET"
           mkdir "$name"
           cp "target/$TARGET/release/ipssl-dns" config.example.toml README.md LICENSE "$name/"
-          cp deploy/ipssl-dns.service "$name/"
+          cp deploy/ipssl-dns.service deploy/ipssl-acme-api.service "$name/"
           # Smoke test the packaged binary.
           file "$name/ipssl-dns" || true
           "$name/ipssl-dns" --version

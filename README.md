@@ -41,9 +41,43 @@ certbot certonly --standalone -d 203-0-113-10.ipssl.cc
 
 Any ACME CA works: the zone publishes no CAA record that would limit the choice.
 
-This only works for public addresses the CA can reach. Private addresses such as `192-168-1-10.ipssl.cc` cannot be validated this way.
+This only works for public addresses the CA can reach. Names with private addresses such as `192-168-1-10.ipssl.cc` use DNS-01 instead, see [below](#certificates-for-private-addresses).
 
 Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for certificates per registered domain. The service asks Let's Encrypt to raise that limit for `ipssl.cc`.
+
+## Certificates for private addresses
+
+A CA cannot reach `10.0.2.2` or `192.168.1.10`, so names with private addresses prove control through DNS instead (DNS-01). Your ACME client publishes the challenge through the ipssl.cc API, and the CA finds it in DNS. This works for every name whose address is private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64/10`), loopback or link-local, IPv4 or IPv6. Wildcards such as `*.10-0-2-2.ipssl.cc` work too.
+
+The API takes `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup` with a JSON body such as `{"fqdn": "_acme-challenge.10-0-2-2.ipssl.cc", "value": "..."}`. That is the format of lego's `httpreq` provider, so lego and Traefik work as they are:
+
+```bash
+HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego --email you@example.com --dns httpreq --domains 10-0-2-2.ipssl.cc run
+```
+
+In Traefik, set the environment variable `HTTPREQ_ENDPOINT=https://ipssl.cc/acme` and use `httpreq` as the `dnsChallenge` provider.
+
+certbot, with [`ipssl-certbot-hook.sh`](deploy/acme/ipssl-certbot-hook.sh):
+
+```bash
+certbot certonly --manual --preferred-challenges dns \
+  --manual-auth-hook "sh ipssl-certbot-hook.sh present" \
+  --manual-cleanup-hook "sh ipssl-certbot-hook.sh cleanup" \
+  -d 10-0-2-2.ipssl.cc
+```
+
+acme.sh, with [`dns_ipssl.sh`](deploy/acme/dns_ipssl.sh) copied to `~/.acme.sh/dnsapi/`:
+
+```bash
+acme.sh --issue --dns dns_ipssl -d 10-0-2-2.ipssl.cc
+```
+
+Keep in mind:
+
+- The certificate encrypts the connection, but it does not prove whose machine you reached. `10.0.2.2` exists on countless networks, and anyone can get a certificate for the same name.
+- Names with public addresses are refused: otherwise anyone could get a certificate for someone else's server. Run the ACME client on that server and use HTTP-01 or TLS-ALPN-01.
+- Values must be real DNS-01 digests. They are dropped after 10 minutes, and each client network can make 10 requests a minute.
+- These certificates count toward the same Let's Encrypt limit as every other name under `ipssl.cc`. Keep a certificate until it is due for renewal, or use another CA such as ZeroSSL or Google Trust Services.
 
 ## Running locally
 
@@ -78,7 +112,9 @@ cargo test
 - `src/ratelimit.rs`: token buckets, client network grouping, the bounded table
 - `src/config.rs`: config parsing and which changes need a restart
 - `src/metrics.rs`, `src/http.rs`: metric counting, rendering and the `/metrics` endpoint
+- `src/acme.rs`: which addresses count as private, challenge values, the challenge store
 - `tests/dns.rs`: starts the server on a local port and sends real queries over UDP and TCP
+- `tests/acme.rs`: runs the challenge API and name servers locally and checks values reach DNS
 
 CI runs `cargo fmt --check`, clippy and the tests on every push and pull request, and checks that the code still builds with the minimum Rust version (`rust-version` in `Cargo.toml`).
 
@@ -180,7 +216,7 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]` and `[metrics]` only take effect after a restart.
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart.
 
 ### 6. Mail for the domain
 
@@ -197,6 +233,34 @@ txt = ["v=DKIM1; k=rsa; h=sha256; p=MIIBIjANBgkq..."]
 [hosts._dmarc]
 txt = ["v=DMARC1; p=quarantine; rua=mailto:postmaster@ipssl.cc"]
 ```
+
+### 7. DNS-01 challenge API (optional)
+
+This step enables [certificates for private addresses](#certificates-for-private-addresses). The API runs on one host, here the web server behind `https://ipssl.cc`. It checks each request and sends it to every name server. It reports success only once all of them hold the value, so the CA finds it whichever name server it asks.
+
+1. On every name server, add an `[acme]` section to the config (see `config.example.toml`), with the API host's address in `writers`:
+
+   ```toml
+   [acme]
+   listen = "0.0.0.0:8053"
+   writers = ["198.51.100.10"]
+   ```
+
+   Open TCP port 8053 to that address only, then restart `ipssl-dns`. The values live in memory only.
+
+2. On the API host, put the same config at `/etc/ipssl/config.toml`, install the binary and `ipssl-acme-api.service`, and start it:
+
+   ```bash
+   sudo ipssl-dns --acme-api -c /etc/ipssl/config.toml --check
+   ```
+
+   ```bash
+   sudo systemctl enable --now ipssl-acme-api
+   ```
+
+   The check lists the name server endpoints it will write to: by default, each name server's first address on port 8053.
+
+3. Add the two locations from [`deploy/acme/nginx.conf`](deploy/acme/nginx.conf) to the website's `server` block, so the API is reachable over HTTPS at `/acme`, and reload nginx.
 
 ## Rate limiting
 
@@ -221,6 +285,8 @@ curl -s http://127.0.0.1:9153/metrics
 | `ipssl_dns_rate_limited_total{action}` | UDP responses dropped (`drop`) or sent truncated (`slip`) by rate limiting |
 | `ipssl_rate_limit_tracked_networks` | Client networks the rate limiter is tracking |
 | `ipssl_config_reloads_total{result}` | Config reloads that succeeded or failed |
+| `ipssl_acme_challenges` | DNS-01 challenge values being served (with `[acme]` only) |
+| `ipssl_acme_writes_total{result}` | Challenge writes from the API, `accepted` or `rejected` (with `[acme]` only) |
 | `ipssl_zone_serial` | SOA serial being served; compare across servers to check they run the same config |
 | `ipssl_build_info{version}` | Version of the running binary |
 | `process_start_time_seconds` | When the process started |
@@ -264,6 +330,7 @@ The [release workflow](.github/workflows/release.yml) checks that the tag matche
 - [x] v0.1: DNS core (A/AAAA/SOA/NS/CAA/TXT, UDP + TCP, EDNS)
 - [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
 - [x] v0.3: MX records and long TXT values (DKIM keys) for mail on the domain
+- [x] v0.4: DNS-01 challenges, so names with private addresses can get certificates
 - [ ] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
 - [x] Landing page
 

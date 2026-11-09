@@ -1,6 +1,7 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
 # SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`,
-# `tcp_timeout_secs`, `[rate_limit]` and `[metrics]`, which need a restart.
+# `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]`, which need
+# a restart.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live.
 
@@ -60,6 +61,29 @@ max_tracked = 100000
 # them off. Keep the address private: loopback or an internal network.
 [metrics]
 listen = "127.0.0.1:9153"
+
+# DNS-01 challenges for names with private addresses (10-0-2-2.ipssl.cc),
+# so they can get certificates from a public CA. Off while the section is
+# missing. Two parts read it:
+# - every name server holds challenge values in memory and takes writes
+#   on `listen` from `writers` only;
+# - `ipssl-dns --acme-api` (see deploy/ipssl-acme-api.service) runs on the
+#   web host behind a TLS proxy, checks each request and sends it to all
+#   name servers.
+# Names with public addresses keep using HTTP-01 / TLS-ALPN-01.
+#[acme]
+# Name servers: plain HTTP for writes from the API host. Open this port
+# to the `writers` only.
+#listen = "0.0.0.0:8053"
+#writers = ["198.51.100.10"]
+# API: keep it on loopback behind the proxy, which sets X-Real-IP
+#api_listen = "127.0.0.1:8054"
+# Name server write endpoints; empty means each name server's first
+# address on the `listen` port
+#nodes = []
+# API requests per client network
+#requests_per_minute = 10
+#burst = 20
 
 [soa]
 email = "hostmaster@ipssl.cc"

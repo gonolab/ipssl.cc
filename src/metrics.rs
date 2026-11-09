@@ -51,6 +51,8 @@ pub struct Gauges {
     pub zone_serial: u32,
     /// `None` when rate limiting is off.
     pub rate_limit_tracked: Option<usize>,
+    /// DNS-01 challenge values held; `None` when `[acme]` is off.
+    pub acme_challenges: Option<usize>,
 }
 
 pub struct Metrics {
@@ -64,6 +66,8 @@ pub struct Metrics {
     rate_limited: [AtomicU64; 2],
     /// Succeeded, failed.
     reloads: [AtomicU64; 2],
+    /// Challenge writes accepted, rejected.
+    acme_writes: [AtomicU64; 2],
 }
 
 impl Default for Metrics {
@@ -85,6 +89,7 @@ impl Metrics {
             truncated: AtomicU64::new(0),
             rate_limited: Default::default(),
             reloads: Default::default(),
+            acme_writes: Default::default(),
         }
     }
 
@@ -122,6 +127,11 @@ impl Metrics {
 
     pub fn reload(&self, ok: bool) {
         inc(&self.reloads[usize::from(!ok)]);
+    }
+
+    /// Counts a challenge write from the API, accepted or rejected.
+    pub fn acme_write(&self, ok: bool) {
+        inc(&self.acme_writes[usize::from(!ok)]);
     }
 
     /// The Prometheus text exposition of all metrics.
@@ -223,6 +233,31 @@ impl Metrics {
             .unwrap();
         }
 
+        if let Some(held) = gauges.acme_challenges {
+            header(
+                &mut out,
+                "ipssl_acme_challenges",
+                "gauge",
+                "DNS-01 challenge values currently published.",
+            );
+            writeln!(out, "ipssl_acme_challenges {held}").unwrap();
+
+            header(
+                &mut out,
+                "ipssl_acme_writes_total",
+                "counter",
+                "DNS-01 challenge writes from the API, by result.",
+            );
+            for (i, result) in ["accepted", "rejected"].iter().enumerate() {
+                let value = load(&self.acme_writes[i]);
+                writeln!(
+                    out,
+                    "ipssl_acme_writes_total{{result=\"{result}\"}} {value}"
+                )
+                .unwrap();
+            }
+        }
+
         header(
             &mut out,
             "ipssl_zone_serial",
@@ -276,6 +311,7 @@ mod tests {
     const GAUGES: Gauges = Gauges {
         zone_serial: 2026110501,
         rate_limit_tracked: Some(3),
+        acme_challenges: Some(2),
     };
 
     fn line<'a>(text: &'a str, series: &str) -> &'a str {
@@ -296,6 +332,7 @@ mod tests {
         m.response(ResponseCode::YXDomain);
         m.rate_limited(Limited::Slipped);
         m.reload(false);
+        m.acme_write(true);
 
         let text = m.render(&GAUGES);
         let value = |series: &str| line(&text, series).rsplit(' ').next().unwrap().to_owned();
@@ -325,6 +362,8 @@ mod tests {
             "1"
         );
         assert_eq!(value("ipssl_rate_limit_tracked_networks"), "3");
+        assert_eq!(value("ipssl_acme_challenges"), "2");
+        assert_eq!(value(r#"ipssl_acme_writes_total{result="accepted"}"#), "1");
         assert_eq!(value("ipssl_zone_serial"), "2026110501");
     }
 
@@ -342,9 +381,11 @@ mod tests {
     fn rate_limit_gauge_is_left_out_when_off() {
         let gauges = Gauges {
             rate_limit_tracked: None,
+            acme_challenges: None,
             ..GAUGES
         };
         let text = Metrics::new().render(&gauges);
         assert!(!text.contains("ipssl_rate_limit_tracked_networks"));
+        assert!(!text.contains("ipssl_acme_"));
     }
 }

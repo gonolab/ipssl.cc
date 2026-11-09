@@ -1,7 +1,7 @@
 //! TOML configuration. See `config.example.toml` for a documented example.
 
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -47,6 +47,56 @@ pub struct Config {
 
     /// Prometheus metrics over HTTP; off when the section is missing.
     pub metrics: Option<MetricsConfig>,
+
+    /// DNS-01 challenges for names with private addresses, see
+    /// [`crate::acme`]; off when the section is missing.
+    pub acme: Option<AcmeConfig>,
+}
+
+/// DNS-01 challenge API. The same section serves both sides: name servers
+/// read `listen` and `writers`, `ipssl-dns --acme-api` reads the rest.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcmeConfig {
+    /// Name servers accept challenge writes on this address (plain HTTP).
+    #[serde(default = "default_acme_listen")]
+    pub listen: SocketAddr,
+    /// Addresses allowed to write challenges to a name server: the hosts
+    /// running the API. Everyone else is refused.
+    #[serde(default)]
+    pub writers: Vec<IpAddr>,
+    /// Where the API listens. Keep it on loopback behind a TLS reverse
+    /// proxy that sets `X-Real-IP`.
+    #[serde(default = "default_acme_api_listen")]
+    pub api_listen: SocketAddr,
+    /// Name server write endpoints the API sends every challenge to. Empty
+    /// means each name server's first address on the `listen` port.
+    #[serde(default)]
+    pub nodes: Vec<SocketAddr>,
+    /// API requests per minute for each client network.
+    #[serde(default = "default_acme_requests_per_minute")]
+    pub requests_per_minute: u32,
+    /// API requests a client network may make at once.
+    #[serde(default = "default_acme_burst")]
+    pub burst: u32,
+}
+
+impl AcmeConfig {
+    /// Write endpoints of every name server, as the API reaches them.
+    pub fn node_addrs(&self, nameservers: &[NameServer]) -> Vec<SocketAddr> {
+        if !self.nodes.is_empty() {
+            return self.nodes.clone();
+        }
+        let port = self.listen.port();
+        nameservers
+            .iter()
+            .filter_map(|ns| {
+                let ip = ns.ipv4.first().map(|ip| IpAddr::V4(*ip));
+                ip.or_else(|| ns.ipv6.first().map(|ip| IpAddr::V6(*ip)))
+            })
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -204,8 +254,27 @@ impl Config {
         if self.metrics != running.metrics {
             changed.push("metrics");
         }
+        if self.acme != running.acme {
+            changed.push("acme");
+        }
         changed
     }
+}
+
+fn default_acme_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 8053))
+}
+
+fn default_acme_api_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8054))
+}
+
+fn default_acme_requests_per_minute() -> u32 {
+    10
+}
+
+fn default_acme_burst() -> u32 {
+    20
 }
 
 fn default_listen() -> Vec<SocketAddr> {
@@ -310,9 +379,50 @@ mod tests {
         next.metrics = Some(MetricsConfig {
             listen: "127.0.0.1:9153".parse().unwrap(),
         });
+        next.acme = Config::parse(&format!("{MINIMAL}\n[acme]\n")).unwrap().acme;
         assert_eq!(
             next.restart_only_changes(&running),
-            ["listen", "tcp_timeout_secs", "rate_limit", "metrics"]
+            [
+                "listen",
+                "tcp_timeout_secs",
+                "rate_limit",
+                "metrics",
+                "acme"
+            ]
         );
+    }
+
+    #[test]
+    fn acme_nodes_default_to_name_servers() {
+        let text = r#"
+            domain = "ipssl.cc"
+
+            [[nameservers]]
+            name = "ns1.ipssl.cc"
+            ipv4 = ["198.51.100.1"]
+            ipv6 = ["2001:db8::1"]
+
+            [[nameservers]]
+            name = "ns2.ipssl.cc"
+            ipv6 = ["2001:db8::2"]
+
+            [soa]
+            email = "hostmaster@ipssl.cc"
+
+            [acme]
+            listen = "0.0.0.0:8053"
+        "#;
+        let config = Config::parse(text).unwrap();
+        let acme = config.acme.as_ref().unwrap();
+        let nodes: Vec<String> = acme
+            .node_addrs(&config.nameservers)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(nodes, ["198.51.100.1:8053", "[2001:db8::2]:8053"]);
+
+        let mut explicit = acme.clone();
+        explicit.nodes = vec!["127.0.0.1:9000".parse().unwrap()];
+        assert_eq!(explicit.node_addrs(&config.nameservers).len(), 1);
     }
 }

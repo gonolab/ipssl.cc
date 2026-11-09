@@ -1,6 +1,6 @@
 [package]
 name = "ipssl"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Wildcard DNS for any IP address: 10-0-0-1.ipssl.cc -> 10.0.0.1"
@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 hickory-server = { version = "0.26.3", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 toml = "0.9"

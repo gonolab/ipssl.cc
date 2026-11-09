@@ -1,5 +1,6 @@
 //! ipssl: wildcard DNS for any IP address (`10-0-0-1.ipssl.cc` -> `10.0.0.1`).
 
+pub mod acme;
 pub mod config;
 pub mod handler;
 pub mod http;

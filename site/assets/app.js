@@ -190,7 +190,7 @@
       none: "No IP address in this name, so ipssl.cc answers NXDOMAIN.",
       found: "{name} resolves to {ip}.",
       "kind.public": "Public address. A certificate for these names can be issued to the server at this address.",
-      "kind.private": "Private address. It resolves, but a CA cannot reach it, and some routers drop the answer.",
+      "kind.private": "Private address. It resolves, but some routers drop the answer. Certificates go through DNS-01.",
       "kind.doc": "Documentation address, reserved for examples.",
       "kind.other": "Not a public unicast address.",
       "tag.rec": "Recommended",
@@ -212,7 +212,7 @@
       ttl: "TTL {ttl}s",
       "snip.public": "Uses the first name from the converter. Run it on the server at {ip}.",
       "snip.doc": "Uses the first name from the converter. Run it on the server that owns the address.",
-      "snip.private": "{ip} is private, so a CA cannot reach it. Certificates need a public address.",
+      "snip.private": "{ip} is private, so the CA checks DNS instead (DNS-01). Run it on any machine.",
       "snip.other": "{ip} is not a public address, so a CA cannot reach it.",
     },
     zh: {
@@ -226,7 +226,7 @@
       none: "这个名字里没有 IP 地址，ipssl.cc 会返回 NXDOMAIN。",
       found: "{name} 解析到 {ip}。",
       "kind.public": "公网地址。这台服务器可以为这些域名申请证书。",
-      "kind.private": "私有地址。可以正常解析，但 CA 访问不到，有些路由器还会丢弃这类应答。",
+      "kind.private": "私有地址。可以正常解析，但有些路由器会丢弃这类应答。证书通过 DNS-01 申请。",
       "kind.doc": "文档示例地址，只用于举例。",
       "kind.other": "不是公网单播地址。",
       "tag.rec": "推荐",
@@ -248,7 +248,7 @@
       ttl: "TTL {ttl} 秒",
       "snip.public": "使用转换器里的第一个域名，在 {ip} 这台服务器上运行。",
       "snip.doc": "使用转换器里的第一个域名，在拥有这个地址的服务器上运行。",
-      "snip.private": "{ip} 是私有地址，CA 访问不到。申请证书需要公网地址。",
+      "snip.private": "{ip} 是私有地址，所以 CA 改为检查 DNS（DNS-01），在任意机器上运行都可以。",
       "snip.other": "{ip} 不是公网地址，CA 访问不到。",
     },
   };
@@ -294,7 +294,7 @@
     "https.title": "正规证书，签发给你自己的服务器。",
     "https.lead": "域名解析到你的服务器，所以在服务器上运行 ACME 客户端，就能像普通域名一样通过 HTTP-01 或 TLS-ALPN-01 验证。无需注册，私钥也不会离开你的机器。",
     "https.n1": "<strong>任意 CA。</strong>这个域没有 CAA 记录，Let's Encrypt、ZeroSSL、Google Trust Services 等都能签发。",
-    "https.n2": "<strong>只限公网地址。</strong>CA 要能访问到你的服务器，所以 <code>192.168.1.10</code> 这类私有地址无法验证。",
+    "https.n2": "<strong>私有地址走 DNS-01。</strong>CA 访问不到 <code>192.168.1.10</code>，所以改由 DNS 完成验证：让 lego、Traefik、certbot 或 acme.sh 通过 <code>https://ipssl.cc/acme</code> 发布验证记录。<a href=\"https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses\">用法</a>",
     "https.n3": "<strong>共用一份额度。</strong>ipssl.cc 下的所有名字共用 Let's Encrypt 按注册域名计算的签发限额。遇到限额可以稍后再试，或者换一家 CA。",
     "servers.title": "由四台权威服务器应答，分属两家服务商。",
     "servers.lead": "每台都通过 UDP 和 TCP 的 53 端口应答，运行同一份开源服务端。除圣何塞外，其余三台也支持 IPv6。",
@@ -426,6 +426,11 @@
     });
     snipNote.dataset.kind = kind;
     snipNote.textContent = t(`snip.${kind}`, { ip: ipText(ip) });
+    // A CA cannot reach a private address, so those snippets use DNS-01.
+    const mode = kind === "private" ? "dns" : "http";
+    document.querySelectorAll(".snip pre[data-mode]").forEach((pre) => {
+      pre.hidden = pre.dataset.mode !== mode;
+    });
   }
 
   function update() {
@@ -534,7 +539,7 @@
   });
 
   $("#snip-copy").addEventListener("click", (e) => {
-    const panel = document.querySelector(".snip:not([hidden]) code");
+    const panel = document.querySelector(".snip:not([hidden]) pre:not([hidden]) code");
     // Leave out the prompt and the file-name comment.
     const text = [...panel.childNodes]
       .filter((n) => !(n.nodeType === 1 && n.matches(".prompt, .comment")))
