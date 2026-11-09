@@ -137,7 +137,7 @@ sudo sh install.sh
 
 On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then start the service as the script says. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away.
 
-Run the script again to upgrade, optionally with a version such as `v0.2.0`. It checks the existing config with the new binary before replacing anything, then restarts the service.
+Run the script again to upgrade, optionally with a version such as `v0.2.0`. It checks the existing config with the new binary before replacing anything, then restarts the service. For the host running the DNS-01 challenge API, add `--acme-api` (see [step 7](#7-dns-01-challenge-api-optional)).
 
 To do it by hand, download a static Linux build from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
 
@@ -248,17 +248,13 @@ This step enables [certificates for private addresses](#certificates-for-private
 
    Open TCP port 8053 to that address only, then restart `ipssl-dns`. The values live in memory only.
 
-2. On the API host, put the same config at `/etc/ipssl/config.toml`, install the binary and `ipssl-acme-api.service`, and start it:
+2. On the API host, put the same config at `/etc/ipssl/config.toml` and run the install script in API mode. It installs `ipssl-acme-api.service` instead of the DNS server, checks the config and starts the API:
 
    ```bash
-   sudo ipssl-dns --acme-api -c /etc/ipssl/config.toml --check
+   sudo sh install.sh --acme-api
    ```
 
-   ```bash
-   sudo systemctl enable --now ipssl-acme-api
-   ```
-
-   The check lists the name server endpoints it will write to: by default, each name server's first address on port 8053.
+   Run it again to upgrade. Without `--acme-api` the script refuses to touch a host that only runs the API, so it never starts a DNS server there by mistake. The config check lists the name server endpoints the API writes to: by default, each name server's first address on port 8053.
 
 3. Add the two locations from [`deploy/acme/nginx.conf`](deploy/acme/nginx.conf) to the website's `server` block, so the API is reachable over HTTPS at `/acme`, and reload nginx.
 
