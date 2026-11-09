@@ -246,12 +246,17 @@
       "ai.prompt": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} a hostname under ipssl.cc and an SSL certificate for it.",
       "ai.promptNoIp": "Read https://ipssl.cc/llms.txt, then give my machine a hostname under ipssl.cc and an SSL certificate for it.",
       "forms.caption": "Every way to write {ip}",
+      "anat.label": "Your label, optional",
+      "anat.addr4": "The address, dots written as dashes",
+      "anat.addr6": "The address, <code>:</code> written as <code>-</code> and <span class=\"nobr\"><code>::</code> as <code>--</code></span>",
+      "family.bar": "Your address from the bar above",
+      "family.example4": "An example. Type an IPv4 address above to see yours.",
+      "family.example6": "An example. Type an IPv6 address above to see yours.",
       "form.rec": "<strong>Recommended.</strong> One label, easiest to get certificates for",
       "form.words": "Words before or after the address, joined with <code>-</code>",
       "form.sub": "Any number of subdomain levels",
       "form.dotted": "Dotted form",
       "form.hex": "Eight hex digits",
-      "form.v6": "<strong>Recommended.</strong> <code>:</code> written as <code>-</code>, <code>::</code> as <code>--</code>",
       "form.v6words": "Words in front of an IPv6 address go in their own label",
       "form.v6full": "Every group written out",
       "note.public": "Run it on the server at {ip}.",
@@ -300,12 +305,17 @@
       "ai.prompt": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
       "ai.promptNoIp": "请阅读 https://ipssl.cc/llms.txt，然后给我的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
       "forms.caption": "{ip} 的所有写法",
+      "anat.label": "可选前缀",
+      "anat.addr4": "地址，点写成横杠",
+      "anat.addr6": "地址，<code>:</code> 写成 <code>-</code>，<span class=\"nobr\"><code>::</code> 写成 <code>--</code></span>",
+      "family.bar": "来自上面地址栏的地址",
+      "family.example4": "这是示例。在上面输入 IPv4 地址，就会换成你的。",
+      "family.example6": "这是示例。在上面输入 IPv6 地址，就会换成你的。",
       "form.rec": "<strong>推荐。</strong>只有一级标签，最容易申请证书",
       "form.words": "地址前后可以加词，用 <code>-</code> 连接",
       "form.sub": "子域名层级不限",
       "form.dotted": "点分写法",
       "form.hex": "八位十六进制",
-      "form.v6": "<strong>推荐。</strong><code>:</code> 写成 <code>-</code>，<code>::</code> 写成 <code>--</code>",
       "form.v6words": "IPv6 地址前面的词要单独放一级标签",
       "form.v6full": "每一组都完整写出",
       "note.public": "在 {ip} 这台服务器上运行。",
@@ -334,7 +344,6 @@
     skip: "跳到正文",
     "nav.names": "命名规则",
     "nav.certs": "证书",
-    "nav.servers": "服务器",
     "nav.faq": "常见问题",
     "hero.t1": "每个\u00a0IP\u00a0地址都有域名，",
     "hero.t2": "还能拿到正规\u00a0SSL\u00a0证书。",
@@ -347,9 +356,7 @@
     "call.how": "查看命令",
     "ai.label": "或者交给 AI 助手",
     "names.title": "把地址写进域名。",
-    "names.lead": "点写成横杠，整个地址就放进了一级标签。地址前面的部分随你起名。无需注册，下面每个名字现在就能用。",
-    "anat.label": "你的前缀，可省略",
-    "anat.addr": "地址，点写成横杠",
+    "names.lead": "把地址里的符号写成横杠，整个地址就放进了一级标签：IPv4 的点、IPv6 的冒号都一样。地址前面的部分随你起名。无需注册，下面每个名字现在就能用。",
     "anat.zone": "域名后缀",
     "anat.result": "解析结果",
     "forms.name": "域名",
@@ -359,7 +366,6 @@
     "rules.title": "规则",
     "rules.r1": "一个名字里有多个地址时，以最右边、最靠近域名后缀的那个为准。",
     "rules.r2": "带前导零的数字（如 <code>010</code>）会被拒绝，免得有人猜它是不是八进制。",
-    "rules.r5": "IPv6 也一样：<code>:</code> 写成 <code>-</code>，<code>::</code> 写成 <code>--</code>，地址前面的词单独放一级标签。",
     "rules.r3": "对 IPv4 名字查 AAAA（反过来也一样）会得到空应答，而不是 NXDOMAIN。",
     "rules.r4": "查询 <code>ip.ipssl.cc</code> 的 TXT 记录，返回查询的来源地址，通常是你的解析器。",
     "certs.title": "正规 SSL 证书，公网和内网地址都能申请。",
@@ -377,18 +383,6 @@
     "certs.f2.d": "同一个内网地址存在于无数网络中，任何人都能为同一个名字申请证书。它能加密连接，但不能证明你连上的是谁的机器。",
     "certs.f3.t": "共用一份额度",
     "certs.f3.d": "ipssl.cc 下的所有名字共用 Let's Encrypt 按域名计算的签发额度。证书到期前不必重复申请，或者换一家 CA。",
-    "servers.title": "由四台权威服务器应答，分属两家服务商。",
-    "servers.lead": "每台都通过 UDP 和 TCP 的 53 端口应答，运行同一份开源服务端。除圣何塞外，其余三台也支持 IPv6。",
-    "region.tokyo": "东京",
-    "region.la": "洛杉矶",
-    "region.hk": "香港",
-    "region.sj": "圣何塞",
-    "facts.rl.t": "限速，但不会断",
-    "facts.rl.d": "UDP 应答按客户端网段限速，服务器不会被拿去攻击别人。收到截断应答的解析器会改用 TCP 重试，TCP 不限速。",
-    "facts.log.t": "不记录查询",
-    "facts.log.d": "服务器只保留汇总计数，比如回答了多少次 A 查询，不记录查询的名字和客户端地址。",
-    "facts.rust.t": "小巧，用 Rust 编写",
-    "facts.rust.d": "基于 hickory-dns 的权威服务器。修改配置后热加载，不丢任何一个查询。",
     "faq.title": "常见问题",
     "faq.lead": "没找到答案？到 <a href=\"https://github.com/gonolab/ipssl.cc/issues\">issue 区</a>提问。",
     "faq.q7": "能让 AI 助手帮我配置吗？",
@@ -436,7 +430,15 @@
   const i18nNodes = [...document.querySelectorAll("[data-i18n]")];
   const EN = Object.fromEntries(i18nNodes.map((n) => [n.dataset.i18n, n.innerHTML]));
 
+  // Shown in the names section when the bar holds the other family.
+  const EXAMPLE = {
+    4: { v: 4, a: [192, 168, 1, 10] },
+    6: { v: 6, a: [0x2001, 0xdb8, 0, 0, 0, 0, 0, 1] },
+  };
+  const familyTabs = [...document.querySelectorAll(".family [role=tab]")];
+
   let lang = "en";
+  let family = 4; // address family shown in the names section
   let current = null; // { ip, kind, names, query } for the address in the bar
   let checkSeq = 0;
 
@@ -554,7 +556,7 @@
       const label = v6Label(ip.a);
       const full = ip.a.map((g) => g.toString(16)).join("-");
       rows = [
-        ["", label, "", "form.v6"],
+        ["", label, "", "form.rec"],
         ["app.", label, "", "form.v6words"],
       ];
       if (full !== label) rows.push(["", full, "", "form.v6full"]);
@@ -573,13 +575,10 @@
 
   /** The anatomy figure and both certificate paths follow the bar. */
   function renderElsewhere() {
-    const ip = current ? current.ip : { v: 4, a: [192, 168, 1, 10] };
+    renderNames();
+    const ip = current ? current.ip : EXAMPLE[4];
     const kind = current ? current.kind : "private";
     const rec = namesFor(ip)[0];
-    $("#anat-label").textContent = ip.v === 4 ? "app-" : "app.";
-    $("#anat-addr").textContent = rec.addr;
-    $("#anat-ip").textContent = ipText(ip);
-    renderForms(ip);
 
     const name = current ? current.query : nameText(rec);
     const publicHere = current && (kind === "public" || kind === "doc");
@@ -607,6 +606,29 @@
     if (display.scrollWidth > display.clientWidth + 1) bar.dataset.compact = "";
   }
 
+  /**
+   * The names section: the bar's address when it is of the family picked in
+   * the switch, otherwise an example of that family.
+   */
+  function renderNames() {
+    const fromBar = Boolean(current) && current.ip.v === family;
+    const ip = fromBar ? current.ip : EXAMPLE[family];
+    $("#anat-label").textContent = ip.v === 4 ? "app-" : "app.";
+    $("#anat-addr").textContent = namesFor(ip)[0].addr;
+    $("#anat-ip").textContent = ipText(ip);
+    $("#anat-label-cap").textContent = t("anat.label");
+    // Captions come from the string tables above, never from the input.
+    $("#anat-addr-cap").innerHTML = t(`anat.addr${ip.v}`);
+    renderForms(ip);
+    $("#family-note").textContent = fromBar ? t("family.bar") : t(`family.example${family}`);
+    familyTabs.forEach((tab) => {
+      const on = Number(tab.dataset.family) === family;
+      tab.setAttribute("aria-selected", String(on));
+      tab.tabIndex = on ? 0 : -1;
+    });
+    $("#names-panel").setAttribute("aria-labelledby", `fam-${family}`);
+  }
+
   // The annotations hang from the lock and the address on thin lines when
   // there is room on both sides; otherwise they stack under the bar.
   const narrow = window.matchMedia("(max-width: 720px)");
@@ -626,11 +648,13 @@
     }
   }
 
-  function update() {
+  /** Re-renders the page; `fromBar` when the address bar itself changed. */
+  function update(fromBar = false) {
     const r = readInput(input.value);
     current = r.ip
       ? { ip: r.ip, kind: kindOf(r.ip), names: namesFor(r.ip), query: r.state === "name" ? r.name : nameText(namesFor(r.ip)[0]) }
       : null;
+    if (fromBar && current) family = current.ip.v;
     input.toggleAttribute("aria-invalid", r.state === "error");
     bar.dataset.kind = current ? current.kind : "none";
     renderDisplay(r);
@@ -652,7 +676,7 @@
     const r = readInput(input.value);
     if (r.state !== "ip") return false;
     input.value = nameText(namesFor(r.ip)[0]);
-    update();
+    update(true);
     // Replay the settle animation on the new name.
     delete bar.dataset.rewrite;
     void bar.offsetWidth;
@@ -803,7 +827,7 @@
   // ---------------------------------------------------------------------
   // Tabs, one group per code panel, with arrow-key navigation.
 
-  document.querySelectorAll('[role="tablist"]').forEach((list) => {
+  document.querySelectorAll('.code-panel [role="tablist"]').forEach((list) => {
     const tabs = [...list.querySelectorAll('[role="tab"]')];
     const select = (tab, focus) => {
       tabs.forEach((other) => {
@@ -826,6 +850,23 @@
           select(tabs[e.key === "Home" ? 0 : tabs.length - 1], true);
         }
       });
+    });
+  });
+
+  // The IPv4 / IPv6 switch shows the other family without touching the bar.
+  familyTabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      family = Number(tab.dataset.family);
+      renderNames();
+    });
+    tab.addEventListener("keydown", (e) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();
+      if (e.key === "Home") family = 4;
+      else if (e.key === "End") family = 6;
+      else family = family === 4 ? 6 : 4;
+      renderNames();
+      familyTabs.find((t) => Number(t.dataset.family) === family).focus();
     });
   });
 
@@ -864,7 +905,7 @@
   // ---------------------------------------------------------------------
   // Wire up
 
-  input.addEventListener("input", update);
+  input.addEventListener("input", () => update(true));
   input.addEventListener("blur", commit);
   input.addEventListener("keydown", (e) => {
     if (e.key !== "Enter") return;

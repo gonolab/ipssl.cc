@@ -14,8 +14,8 @@
   <link rel="canonical" href="https://ipssl.cc/">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="alternate" type="text/plain" href="/llms.txt" title="ipssl.cc for AI agents">
-  <link rel="stylesheet" href="/assets/style.css?v=3">
-  <script src="/assets/app.js?v=5" defer></script>
+  <link rel="stylesheet" href="/assets/style.css?v=4">
+  <script src="/assets/app.js?v=6" defer></script>
 </head>
 <body>
   <a class="skip" href="#main" data-i18n="skip">Skip to content</a>
@@ -26,7 +26,6 @@
       <nav class="nav" aria-label="Sections">
         <a href="#names" data-i18n="nav.names">Names</a>
         <a href="#certs" data-i18n="nav.certs">Certificates</a>
-        <a href="#servers" data-i18n="nav.servers">Servers</a>
         <a href="#faq" data-i18n="nav.faq">FAQ</a>
       </nav>
       <div class="header-actions">
@@ -112,12 +111,21 @@
     <section class="section wrap" id="names" aria-labelledby="names-title">
       <div class="section-head">
         <h2 id="names-title" data-i18n="names.title">Write the address into the name.</h2>
-        <p data-i18n="names.lead">Dots become dashes, so the whole address fits in one label. Anything in front of it is yours to choose. Nothing to register: every name below works now.</p>
+        <p data-i18n="names.lead">Write the address with dashes so it fits in one label: dots for IPv4, colons for IPv6. Anything in front of it is yours to choose. Nothing to register: every name below works now.</p>
       </div>
 
+      <div class="family-row">
+        <div class="family" role="tablist" aria-label="Address family">
+          <button type="button" role="tab" id="fam-4" data-family="4" aria-controls="names-panel" aria-selected="true">IPv4</button>
+          <button type="button" role="tab" id="fam-6" data-family="6" aria-controls="names-panel" aria-selected="false" tabindex="-1">IPv6</button>
+        </div>
+        <p class="family-note" id="family-note">From the address bar above</p>
+      </div>
+
+      <div class="names-panel" id="names-panel" role="tabpanel" aria-labelledby="fam-4">
       <figure class="anatomy" id="anatomy">
-        <div class="seg seg-label"><code id="anat-label">app-</code><span class="cap" data-i18n="anat.label">Your label, optional</span></div>
-        <div class="seg seg-addr"><code id="anat-addr">192-168-1-10</code><span class="cap" data-i18n="anat.addr">The address, dots written as dashes</span></div>
+        <div class="seg seg-label"><code id="anat-label">app-</code><span class="cap" id="anat-label-cap">Your label, optional</span></div>
+        <div class="seg seg-addr"><code id="anat-addr">192-168-1-10</code><span class="cap" id="anat-addr-cap">The address, dots written as dashes</span></div>
         <div class="seg seg-zone"><code>.ipssl.cc</code><span class="cap" data-i18n="anat.zone">The zone</span></div>
         <div class="seg seg-result">
           <code><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg><span id="anat-ip">192.168.1.10</span></code>
@@ -147,11 +155,11 @@
           <ul>
             <li data-i18n="rules.r1">When a name holds more than one address, the rightmost one, closest to the zone, wins.</li>
             <li data-i18n="rules.r2">Numbers with leading zeros, such as <code>010</code>, are rejected, so nobody has to guess whether they are octal.</li>
-            <li data-i18n="rules.r5">IPv6 works the same way: write <code>:</code> as <code>-</code> and <code>::</code> as <code>--</code>, and put words in front of it in their own label.</li>
             <li data-i18n="rules.r3">An AAAA query for an IPv4 name, or the other way round, gets an empty answer, not NXDOMAIN.</li>
             <li data-i18n="rules.r4">A TXT query for <code>ip.ipssl.cc</code> returns the address the query came from, usually your resolver.</li>
           </ul>
         </aside>
+      </div>
       </div>
     </section>
 
@@ -225,46 +233,6 @@
       </dl>
     </section>
 
-    <section class="section wrap" id="servers" aria-labelledby="servers-title">
-      <div class="section-head">
-        <h2 id="servers-title" data-i18n="servers.title">Answered by four name servers in four cities, on two networks.</h2>
-        <p data-i18n="servers.lead">Each one answers over UDP and TCP on port 53 and runs the same open source server. All but San Jose also answer over IPv6.</p>
-      </div>
-      <div class="servers">
-        <ul class="ns-list">
-          <li>
-            <div class="ns-name"><code>ns1.ipssl.cc</code><span data-i18n="region.tokyo">Tokyo</span></div>
-            <div class="ns-addrs"><code>191.223.220.59</code><code>2403:18c0:1000:33e:c483:bbff:fe27:42c3</code></div>
-          </li>
-          <li>
-            <div class="ns-name"><code>ns2.ipssl.cc</code><span data-i18n="region.la">Los Angeles</span></div>
-            <div class="ns-addrs"><code>45.59.187.41</code><code>2605:52c0:3:1c4:be24:11ff:fe87:11f7</code></div>
-          </li>
-          <li>
-            <div class="ns-name"><code>ns3.ipssl.cc</code><span data-i18n="region.hk">Hong Kong</span></div>
-            <div class="ns-addrs"><code>191.223.218.37</code><code>2403:18c0:5:b56:be24:11ff:fe0e:1a61</code></div>
-          </li>
-          <li>
-            <div class="ns-name"><code>ns4.ipssl.cc</code><span data-i18n="region.sj">San Jose</span></div>
-            <div class="ns-addrs"><code>165.1.71.149</code></div>
-          </li>
-        </ul>
-        <dl class="facts">
-          <div>
-            <dt data-i18n="facts.rl.t">Rate limited, never cut off</dt>
-            <dd data-i18n="facts.rl.d">UDP answers are limited per client network so the servers cannot be used to flood someone else. A resolver that gets a truncated answer retries over TCP, which is never limited.</dd>
-          </div>
-          <div>
-            <dt data-i18n="facts.log.t">No query logs</dt>
-            <dd data-i18n="facts.log.d">The servers keep aggregate counters only, such as how many A queries they answered. Query names and client addresses are not logged.</dd>
-          </div>
-          <div>
-            <dt data-i18n="facts.rust.t">Small, written in Rust</dt>
-            <dd data-i18n="facts.rust.d">An authoritative server built on hickory-dns. Config changes load without dropping a query.</dd>
-          </div>
-        </dl>
-      </div>
-    </section>
 
     <section class="section wrap faq" id="faq" aria-labelledby="faq-title">
       <div class="section-head">

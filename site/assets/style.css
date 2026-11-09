@@ -933,6 +933,52 @@ p {
   color: var(--muted);
 }
 
+/* IPv4 / IPv6 switch: a segmented control on the ground, above the figure. */
+
+.family-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  margin: -8px 0 20px;
+}
+
+.family {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.family button {
+  min-width: 76px;
+  height: 36px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted);
+  font: 600 14px/1 var(--sans);
+  transition: background-color 0.15s, color 0.15s;
+}
+
+.family button:hover {
+  color: var(--text);
+}
+
+.family button[aria-selected="true"] {
+  background: var(--soft);
+  color: var(--accent);
+}
+
+.family-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13.5px;
+}
+
 /* Anatomy of a name: dimension lines under each part. */
 
 .anatomy {
@@ -953,7 +999,7 @@ p {
   min-width: 0;
 }
 
-.seg code {
+.seg > code {
   position: relative;
   display: flex;
   align-items: center;
@@ -967,7 +1013,7 @@ p {
 }
 
 /* The dimension line with an end tick on each side. */
-.seg code::after {
+.seg > code::after {
   content: "";
   position: absolute;
   left: 2px;
@@ -988,23 +1034,41 @@ p {
   line-height: 1.45;
 }
 
-.seg-label code {
+/* Keeps a short rule such as ":: as --" on one line. */
+.nobr {
+  white-space: nowrap;
+}
+
+.seg .cap code {
+  padding: 0 4px;
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--text);
+  font-size: 0.95em;
+}
+
+.seg-label > code {
   color: var(--muted);
 }
 
-.seg-label code::after {
+.seg-label .cap {
+  width: 0;
+  min-width: 100%;
+}
+
+.seg-label > code::after {
   border-style: dashed;
 }
 
-.seg-addr code {
+.seg-addr > code {
   color: var(--accent);
 }
 
-.seg-addr code::after {
+.seg-addr > code::after {
   opacity: 0.8;
 }
 
-.seg-zone code {
+.seg-zone > code {
   color: var(--text);
 }
 
@@ -1013,11 +1077,11 @@ p {
   padding-left: 28px;
 }
 
-.seg-result code {
+.seg-result > code {
   color: var(--text);
 }
 
-.seg-result code::after {
+.seg-result > code::after {
   display: none;
 }
 
@@ -1353,85 +1417,6 @@ p {
   color: #34d399;
 }
 
-/* Name servers */
-
-.servers {
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  gap: 48px;
-  align-items: start;
-}
-
-.ns-list {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--panel);
-}
-
-.ns-list li {
-  display: grid;
-  grid-template-columns: 150px minmax(0, 1fr);
-  gap: 6px 24px;
-  padding: 20px 24px;
-  border-bottom: 1px solid var(--line);
-}
-
-.ns-list li:last-child {
-  border-bottom: 0;
-}
-
-.ns-name code {
-  display: block;
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.ns-name span {
-  color: var(--muted);
-  font-size: 13.5px;
-}
-
-.ns-addrs {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.ns-addrs code {
-  color: var(--muted);
-  font-size: 13.5px;
-  overflow-wrap: anywhere;
-}
-
-.facts {
-  margin: 0;
-}
-
-.facts div {
-  padding: 16px 0 18px;
-  border-top: 1px solid var(--line);
-}
-
-.facts div:first-child {
-  padding-top: 0;
-  border-top: 0;
-}
-
-.facts dt {
-  font-size: 15px;
-  font-weight: 600;
-}
-
-.facts dd {
-  margin: 4px 0 0;
-  color: var(--muted);
-  font-size: 14.5px;
-}
-
 /* FAQ */
 
 .faq {
@@ -1582,7 +1567,6 @@ p {
 /* Responsive */
 
 @media (max-width: 960px) {
-  .servers,
   .faq,
   .cta-panel,
   .paths {
@@ -1707,11 +1691,7 @@ p {
     align-self: flex-end;
   }
 
-  /* Short captions keep the label and the address on one row. */
-  .seg-label .cap {
-    max-width: 6.5em;
-  }
-
+  /* A short caption keeps the label and the address on one row. */
   .seg-addr .cap {
     max-width: 11em;
   }
@@ -1811,11 +1791,6 @@ p {
   .forms td.n code {
     white-space: normal;
     overflow-wrap: anywhere;
-  }
-
-  .ns-list li {
-    grid-template-columns: minmax(0, 1fr);
-    padding: 18px;
   }
 
   .cta-panel {
