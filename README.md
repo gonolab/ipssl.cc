@@ -297,7 +297,7 @@ Preview it locally:
 python3 -m http.server 4173 --directory site
 ```
 
-To publish, copy the contents of `site/` into the web server's document root, and bump the `?v=` query on the stylesheet and script links in the HTML files so browsers fetch the new versions.
+To publish, copy the contents of `site/` into the web server's document root, following symlinks (`cp -RL` or `rsync -L`): `site/acme/` links to the hook scripts in `deploy/acme/`, so they are also served at `https://ipssl.cc/acme/`. Bump the `?v=` query on the stylesheet and script links in the HTML files so browsers fetch the new versions.
 
 ## FAQ
 

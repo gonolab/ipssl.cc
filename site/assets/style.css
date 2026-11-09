@@ -174,7 +174,6 @@ p {
 .lead code,
 .note code,
 .rules code,
-.notes code,
 .faq-list code {
   padding: 1px 6px;
   border-radius: 5px;
@@ -329,24 +328,25 @@ p {
   opacity: 0.7;
 }
 
-/* Hero */
-
-.hero {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr);
-  gap: 64px;
-  /* Top-aligned so the copy stays put when the live check grows the panel. */
-  align-items: start;
-  padding: 76px 0 40px;
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
-.hero-copy {
-  padding-top: 84px;
+/* Hero: the address bar is the subject, annotated like a diagram. */
+
+.hero {
+  padding: 84px 0 8px;
+  text-align: center;
 }
 
 .hero h1 {
-  margin: 0 0 22px;
-  font-size: clamp(2.5rem, 1.4rem + 3.3vw, 3.65rem);
+  margin: 0 auto 20px;
+  font-size: clamp(2.35rem, 1.3rem + 3.1vw, 3.55rem);
   font-weight: 700;
   line-height: 1.1;
   letter-spacing: -0.035em;
@@ -357,58 +357,37 @@ p {
 }
 
 .lead {
-  max-width: 33em;
+  max-width: 38em;
   margin: 0 0 30px;
   color: var(--muted);
   font-size: 17px;
   line-height: 1.75;
 }
 
-.stack {
-  margin: 24px 0 0;
-  color: var(--muted);
-  font-size: 13px;
+.hero .lead {
+  margin: 0 auto;
 }
 
-/* Converter */
-
-.tool {
-  padding: 24px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--panel);
-  box-shadow: var(--shadow);
+.address {
+  max-width: 980px;
+  margin: 52px auto 0;
+  text-align: left;
 }
 
-.tool-label {
-  display: block;
-  margin-bottom: 8px;
+.bar-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 10px;
+  padding: 0 4px;
+}
+
+.bar-head label {
   color: var(--muted);
   font-size: 13px;
   font-weight: 600;
-}
-
-.ip-input {
-  width: 100%;
-  height: 54px;
-  padding: 0 16px;
-  border: 1px solid var(--line);
-  border-radius: 9px;
-  background: var(--bg);
-  color: var(--text);
-  font: 500 18px/1 var(--mono);
-  transition: border-color 0.15s, box-shadow 0.15s, background-color 0.15s;
-}
-
-.ip-input:focus {
-  outline: none;
-  border-color: var(--accent);
-  background: var(--panel);
-  box-shadow: 0 0 0 4px var(--focus);
-}
-
-.ip-input[aria-invalid="true"] {
-  border-color: var(--bad);
 }
 
 .examples {
@@ -416,7 +395,6 @@ p {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
-  margin-top: 10px;
   color: var(--muted);
   font-size: 12.5px;
 }
@@ -440,77 +418,165 @@ p {
   color: var(--accent);
 }
 
-.tool-status {
-  min-height: 1.6em;
-  margin: 18px 0 8px;
-  color: var(--muted);
-  font-size: 13.5px;
-  line-height: 1.55;
+/* The one lifted panel on the page. */
+.bar {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.tool-status strong {
-  margin-right: 8px;
-  padding: 1px 7px;
-  border-radius: 5px;
-  background: var(--soft);
-  color: var(--accent);
-  font: 600 12px/1.6 var(--mono);
+.bar:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--shadow), 0 0 0 4px var(--focus);
 }
 
-.tool-status[data-kind="private"] strong,
-.tool-status[data-kind="other"] strong {
-  background: color-mix(in srgb, var(--warn) 14%, transparent);
-  color: var(--warn);
-}
-
-.tool-status[data-kind="error"] {
-  color: var(--bad);
-}
-
-.results {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border-top: 1px solid var(--line);
-}
-
-.results li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+.bar-row {
+  display: flex;
   align-items: center;
-  gap: 12px;
-  min-height: 50px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--line);
+  gap: 6px;
+  min-height: 78px;
+  padding: 11px 11px 11px 20px;
 }
 
-.host {
-  font: 500 15px/1.45 var(--mono);
-  overflow-wrap: anywhere;
+/* Balances the buttons on the right, so the name is centered on the bar
+   itself; it gives way first when a long name needs the room. */
+.bar-row::before {
+  content: "";
+  flex: 0 1 150px;
 }
 
-.host .a,
-.forms .a {
-  color: var(--accent);
+/* Lock, scheme and name, centered as one group like an idle browser bar. */
+.url {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-width: 0;
+  cursor: text;
+  font: 500 clamp(17px, 0.85rem + 0.75vw, 23px)/1.3 var(--mono);
+  font-variant-numeric: tabular-nums;
 }
 
-.host .z,
-.forms .z {
+.lock {
+  flex: none;
+  width: 1.05em;
+  height: 1.05em;
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: stroke 0.2s;
+}
+
+.bar[data-kind="other"] .lock,
+.bar[data-kind="none"] .lock {
+  stroke: var(--muted);
+}
+
+.scheme {
+  flex: none;
   color: var(--muted);
 }
 
-.tag {
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
+/* Set by the script when the name would not fit beside the scheme. */
+.bar[data-compact] .scheme {
+  display: none;
 }
 
-.tag.rec {
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--soft);
+/* The input and its colored copy share one grid cell; the copy sets the width. */
+.field {
+  display: inline-grid;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.field-input,
+.field-display {
+  grid-area: 1 / 1;
+  font: inherit;
+}
+
+.field-input {
+  width: 100%;
+  min-width: 3ch;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: transparent;
+  caret-color: var(--accent);
+}
+
+.field-input:focus {
+  outline: none;
+  color: var(--text);
+}
+
+.field-display {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: pre;
+  pointer-events: none;
+}
+
+.field:focus-within .field-display {
+  visibility: hidden;
+}
+
+.field-display .a {
   color: var(--accent);
-  font-weight: 600;
+  background: linear-gradient(currentColor, currentColor) 0 100% / 0 2px no-repeat;
+}
+
+.field-display .z {
+  color: var(--muted);
+}
+
+/* A typed address settles into its name: the address is drawn under once. */
+.bar[data-rewrite] .field-display {
+  animation: settle 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.bar[data-rewrite] .field-display .a {
+  animation: underline 1.1s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes settle {
+  from {
+    filter: blur(3px);
+    opacity: 0.35;
+  }
+}
+
+@keyframes underline {
+  0% {
+    background-size: 0 2px;
+  }
+
+  55% {
+    background-size: 100% 2px;
+  }
+
+  100% {
+    background-size: 100% 0;
+  }
+}
+
+.bar .copy {
+  flex: none;
+  width: 42px;
+  height: 42px;
+}
+
+.go {
+  flex: none;
+  min-height: 54px;
+  padding: 0 20px;
+  border-radius: 9px;
 }
 
 .copy {
@@ -531,24 +597,195 @@ p {
   color: var(--accent);
 }
 
+.copy:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.copy:disabled:hover {
+  background: transparent;
+  color: var(--muted);
+}
+
 .copy[data-copied] {
   color: var(--ok);
 }
 
-.check {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px 16px;
+/* Annotations under the bar. Anchored: thin lines up to the lock and the
+   address. Stacked: a plain list with icons, for narrow screens. */
+
+.callouts {
   margin-top: 18px;
 }
 
-.check-note {
-  flex: 1 1 220px;
+.callouts[data-layout="anchored"] {
+  display: grid;
+  grid-template-columns: var(--lock-x) calc(var(--addr-x) - var(--lock-x)) minmax(0, 1fr);
+  margin-top: 34px;
+}
+
+.callouts[data-layout="stack"] {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 14px 32px;
+  padding: 0 4px;
+}
+
+.callout {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.callouts[data-layout="stack"] .callout-name {
+  order: -1;
+}
+
+.callout-icon {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 3px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.callouts[data-layout="anchored"] .callout-icon {
+  display: none;
+}
+
+.callouts[data-layout="anchored"] .callout-lock {
+  grid-column: 1;
+  justify-content: flex-end;
+  padding-right: 18px;
+  text-align: right;
+}
+
+.callouts[data-layout="anchored"] .callout-name {
+  grid-column: 3;
+  padding-left: 18px;
+}
+
+/* The leader: a hairline from the bar's edge, with a dot where it lands. */
+.callouts[data-layout="anchored"] .callout::before,
+.callouts[data-layout="anchored"] .callout::after {
+  content: "";
+  position: absolute;
+  top: -34px;
+}
+
+.callouts[data-layout="anchored"] .callout::before {
+  width: 1px;
+  height: 52px;
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.callouts[data-layout="anchored"] .callout::after {
+  width: 7px;
+  height: 7px;
+  margin-top: -3px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.callouts[data-layout="anchored"] .callout-lock::before {
+  right: 0;
+}
+
+.callouts[data-layout="anchored"] .callout-lock::after {
+  right: -3px;
+}
+
+.callouts[data-layout="anchored"] .callout-name::before {
+  left: 0;
+}
+
+.callouts[data-layout="anchored"] .callout-name::after {
+  left: -3px;
+}
+
+.callout-title {
   margin: 0;
-  color: var(--muted);
-  font-size: 12.5px;
+  font-size: 15.5px;
+  font-weight: 600;
   line-height: 1.5;
+}
+
+.callouts[data-state="error"] .callout-name .callout-title,
+.callouts[data-state="none"] .callout-name .callout-title {
+  color: var(--bad);
+}
+
+.callout-text {
+  max-width: 36ch;
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.callouts[data-layout="anchored"] .callout-lock .callout-text {
+  margin-left: auto;
+}
+
+.callout-text strong {
+  margin-right: 8px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--accent);
+  font: 600 11.5px/1.6 var(--mono);
+}
+
+.callout-link {
+  display: inline-block;
+  margin-top: 6px;
+  color: var(--accent);
+  font-size: 13.5px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.callout-link:hover {
+  text-decoration: underline;
+}
+
+/* One sentence to hand to an AI agent. */
+.ask-ai {
+  display: flex;
+  align-items: center;
+  gap: 8px 16px;
+  margin-top: 34px;
+  padding: 10px 10px 10px 18px;
+  border: 1px solid var(--soft-line);
+  border-radius: var(--radius);
+  background: var(--soft);
+}
+
+.ask-label {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: var(--accent);
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.ask-prompt {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding-left: 16px;
+  border-left: 1px solid var(--soft-line);
+  color: var(--text);
+  font-size: 14.5px;
+  line-height: 1.55;
 }
 
 /* Live check: the path a query takes, lit up while it runs. */
@@ -819,6 +1056,7 @@ p {
 
 .forms th {
   padding: 12px 18px;
+  white-space: nowrap;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--bg) 70%, var(--panel));
   color: var(--muted);
@@ -835,6 +1073,14 @@ p {
 
 .forms tr:last-child td {
   border-bottom: 0;
+}
+
+.forms .a {
+  color: var(--accent);
+}
+
+.forms .z {
+  color: var(--muted);
 }
 
 .forms td.n code {
@@ -878,40 +1124,134 @@ p {
 .rules li:last-child {
   border-bottom: 0;
 }
+/* The live check opens inside the bar, under the address. */
+.bar .trace {
+  margin: 0 12px 12px;
+}
 
-/* HTTPS */
+/* Forms table: one copy button per name */
 
-.split {
+.forms-caption {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  font-size: 14.5px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.forms td.c {
+  width: 1%;
+  padding: 6px 10px 6px 0;
+  vertical-align: middle;
+}
+
+.forms td.n,
+.forms td.r,
+.forms td.note {
+  vertical-align: middle;
+}
+
+/* Certificates: two paths side by side, one per kind of address */
+
+.paths {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
-  gap: 64px;
+  grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
+  gap: 48px;
   align-items: start;
 }
 
-.split .section-head {
-  margin-bottom: 0;
+.path-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
 }
 
-.notes {
-  margin: 26px 0 0;
-  padding: 0;
-  list-style: none;
+.path-head h3 {
+  margin: 0;
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: -0.015em;
 }
 
-.notes li {
-  padding: 14px 0;
-  border-top: 1px solid var(--line);
+.yours {
+  display: none;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.path.is-yours .yours {
+  display: inline-block;
+}
+
+.path-sub {
+  margin: 4px 0 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.path-text {
+  min-height: 5.4em;
+  margin: 10px 0 20px;
   color: var(--muted);
   font-size: 14.5px;
 }
 
-.notes strong {
+.path-text code {
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--soft);
   color: var(--text);
+  font-size: 0.9em;
+  white-space: nowrap;
+}
+
+.term {
+  display: inline-block;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--muted);
+  font: 12px/1.7 var(--mono);
+  white-space: nowrap;
+}
+
+.path .snip pre {
+  font-size: 13px;
+}
+
+.path.is-yours .code-panel {
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.cert-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px 32px;
+  margin: 48px 0 0;
+}
+
+.cert-facts div {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.cert-facts dt {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.cert-facts dd {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 14.5px;
 }
 
 .code-panel {
-  position: sticky;
-  top: 24px;
   overflow: hidden;
   border: 1px solid var(--code-border);
   border-radius: var(--radius);
@@ -956,6 +1296,18 @@ p {
   font-size: 14px;
   line-height: 1.75;
   scrollbar-color: rgb(255 255 255 / 0.15) transparent;
+}
+
+/* A wrapped command line hangs under its own start. */
+.snip .ln {
+  display: block;
+  padding-left: 6ch;
+  text-indent: -6ch;
+}
+
+.snip .w,
+.snip .host-slot {
+  white-space: nowrap;
 }
 
 .snip .prompt,
@@ -1230,30 +1582,26 @@ p {
 /* Responsive */
 
 @media (max-width: 960px) {
-  .hero,
-  .split,
   .servers,
   .faq,
-  .cta-panel {
+  .cta-panel,
+  .paths {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .hero {
+  .paths {
     gap: 44px;
-    padding-top: 56px;
   }
 
-  .hero-copy {
-    padding-top: 0;
+  .path-text {
+    min-height: 0;
   }
 
-  .split,
   .faq {
     gap: 32px;
   }
 
-  .faq .section-head,
-  .code-panel {
+  .faq .section-head {
     position: static;
   }
 
@@ -1264,6 +1612,15 @@ p {
 
   .seg-result {
     margin-left: 0;
+  }
+
+  .cert-facts {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .cert-facts div {
+    padding: 14px 0;
   }
 }
 
@@ -1286,37 +1643,88 @@ p {
   }
 
   .hero {
-    padding-top: 44px;
+    padding-top: 48px;
   }
+
+  .hero h1 {
+    font-size: clamp(1.8rem, 1.1rem + 3.6vw, 2.35rem);
+  }
+
 
   .lead {
     font-size: 16px;
   }
 
-  .tool {
-    padding: 18px;
+  .address {
+    margin-top: 36px;
   }
 
-  .ip-input {
+  /* Address on its own row, actions under it. */
+  .bar-row {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .bar-row::before {
+    display: none;
+  }
+
+  .url {
+    flex-basis: 100%;
+    justify-content: flex-start;
+    padding: 6px 4px 2px;
     font-size: 16px;
   }
 
-  .results li {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 2px 8px;
+  .go {
+    flex: 1;
+    min-height: 46px;
   }
 
-  .results .tag {
-    grid-row: 2;
-    justify-self: start;
+  .bar .trace {
+    margin: 0 10px 10px;
   }
 
-  .results .copy {
-    grid-row: 1 / span 2;
-    grid-column: 2;
+  /* Commands wrap at spaces only; a token too long for the line scrolls. */
+  .snip pre,
+  .path .snip pre {
+    padding: 18px 16px;
+    font-size: 12.5px;
+    white-space: pre-wrap;
   }
 
-  .results .host {
+  .cmd {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .cmd pre {
+    font-size: 12px;
+  }
+
+  .cmd .copy {
+    align-self: flex-end;
+  }
+
+  /* Short captions keep the label and the address on one row. */
+  .seg-label .cap {
+    max-width: 6.5em;
+  }
+
+  .seg-addr .cap {
+    max-width: 11em;
+  }
+
+  .ask-ai {
+    flex-wrap: wrap;
+    padding: 14px 10px 12px 14px;
+  }
+
+  .ask-prompt {
+    flex-basis: calc(100% - 50px);
+    padding-left: 0;
+    border-left: 0;
     font-size: 14px;
   }
 
@@ -1356,14 +1764,16 @@ p {
     display: none;
   }
 
-  .forms tr {
+  .forms tbody tr {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
-    padding: 12px 16px;
+    align-items: center;
+    gap: 0 8px;
+    padding: 10px 6px 10px 16px;
     border-bottom: 1px solid var(--line);
   }
 
-  .forms tr:last-child {
+  .forms tbody tr:last-child {
     border-bottom: 0;
   }
 
@@ -1372,8 +1782,25 @@ p {
     border: 0;
   }
 
+  .forms td.n {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .forms td.c {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    width: auto;
+    padding: 0;
+  }
+
+  .forms td.r {
+    grid-column: 1;
+    font-size: 13px;
+  }
+
   .forms td.note {
-    grid-column: 1 / -1;
+    grid-column: 1;
     margin-top: 2px;
   }
 

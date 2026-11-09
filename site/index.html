@@ -3,18 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ipssl.cc · Wildcard DNS for any IP address</title>
-  <meta name="description" content="Free wildcard DNS: 10-0-0-1.ipssl.cc resolves to 10.0.0.1. IPv4 and IPv6, no sign-up, and HTTPS certificates from any ACME CA. Open source, written in Rust.">
+  <title>ipssl.cc · A name and an SSL certificate for any IP address</title>
+  <meta name="description" content="Free wildcard DNS: 192-168-1-10.ipssl.cc resolves to 192.168.1.10, and the name can get a real SSL certificate from Let's Encrypt or any ACME CA, private addresses included. IPv4 and IPv6, no sign-up. Open source, written in Rust.">
   <meta name="theme-color" content="#f7f8fb" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0a0f1d" media="(prefers-color-scheme: dark)">
   <meta property="og:type" content="website">
   <meta property="og:title" content="ipssl.cc">
-  <meta property="og:description" content="Wildcard DNS for any IP address. 10-0-0-1.ipssl.cc resolves to 10.0.0.1.">
+  <meta property="og:description" content="A hostname and a real SSL certificate for any IP address, private ones included.">
   <meta property="og:url" content="https://ipssl.cc/">
   <link rel="canonical" href="https://ipssl.cc/">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/assets/style.css?v=2">
-  <script src="/assets/app.js?v=4" defer></script>
+  <link rel="alternate" type="text/plain" href="/llms.txt" title="ipssl.cc for AI agents">
+  <link rel="stylesheet" href="/assets/style.css?v=3">
+  <script src="/assets/app.js?v=5" defer></script>
 </head>
 <body>
   <a class="skip" href="#main" data-i18n="skip">Skip to content</a>
@@ -24,7 +25,7 @@
       <a class="brand" href="/" aria-label="ipssl.cc home">ipssl.cc</a>
       <nav class="nav" aria-label="Sections">
         <a href="#names" data-i18n="nav.names">Names</a>
-        <a href="#https" data-i18n="nav.https">HTTPS</a>
+        <a href="#certs" data-i18n="nav.certs">Certificates</a>
         <a href="#servers" data-i18n="nav.servers">Servers</a>
         <a href="#faq" data-i18n="nav.faq">FAQ</a>
       </nav>
@@ -39,53 +40,71 @@
 
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
-      <div class="hero-copy">
-        <h1 id="hero-title"><span data-i18n="hero.t1">Every IP address</span><br><span class="accent" data-i18n="hero.t2">already has a name.</span></h1>
-        <p class="lead" data-i18n="hero.lead">Put an IP address in a hostname under <code>ipssl.cc</code> and it resolves to that address. Free, IPv4 and IPv6, no sign-up, and HTTPS certificates from any ACME CA.</p>
-        <div class="actions">
-          <a class="button primary" href="https://github.com/gonolab/ipssl.cc">
-            <span data-i18n="hero.source">View source</span>
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg>
-          </a>
-          <a class="button ghost" href="#names">
-            <span data-i18n="hero.how">How names work</span>
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
-          </a>
-        </div>
-        <p class="stack">Rust · hickory-dns · IPv4 + IPv6 · MIT</p>
-      </div>
+      <h1 id="hero-title"><span data-i18n="hero.t1">Every IP address gets a name,</span><br><span class="accent" data-i18n="hero.t2">and a real SSL certificate.</span></h1>
+      <p class="lead" data-i18n="hero.lead">Any name under <code>ipssl.cc</code> with an IP address in it resolves to that address and gets a real certificate, even on a private network. Free, no sign-up.</p>
 
-      <div class="tool" id="tool">
-        <label class="tool-label" for="ip-input" data-i18n="tool.label">IP address or hostname</label>
-        <input class="ip-input" id="ip-input" type="text" value="203.0.113.10" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="tool-status">
-        <div class="examples">
-          <span data-i18n="tool.try">Try</span>
-          <button type="button" data-example="10.0.0.1">10.0.0.1</button>
-          <button type="button" data-example="192.168.1.10">192.168.1.10</button>
-          <button type="button" data-example="2001:db8::1">2001:db8::1</button>
-          <button type="button" data-example="app.10-0-0-1.ipssl.cc">app.10-0-0-1.ipssl.cc</button>
+      <div class="address">
+        <div class="bar-head">
+          <label for="ip-input" data-i18n="bar.label">Type any IP address or hostname</label>
+          <div class="examples">
+            <span data-i18n="tool.try">Try</span>
+            <button type="button" data-example="10.0.2.2">10.0.2.2</button>
+            <button type="button" data-example="203.0.113.10">203.0.113.10</button>
+            <button type="button" data-example="2001:db8::1">2001:db8::1</button>
+          </div>
         </div>
-        <p class="tool-status" id="tool-status" aria-live="polite"><strong>IPv4</strong> Documentation address, reserved for examples.</p>
-        <ul class="results" id="results">
-          <li><span class="host"><span class="a">203-0-113-10</span><span class="z">.ipssl.cc</span></span><span class="tag rec">Recommended</span><button class="copy" type="button" aria-label="Copy 203-0-113-10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
-          <li><span class="host"><span class="p">app-</span><span class="a">203-0-113-10</span><span class="z">.ipssl.cc</span></span><span class="tag">With a label</span><button class="copy" type="button" aria-label="Copy app-203-0-113-10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
-          <li><span class="host"><span class="a">203.0.113.10</span><span class="z">.ipssl.cc</span></span><span class="tag">Dotted</span><button class="copy" type="button" aria-label="Copy 203.0.113.10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
-          <li><span class="host"><span class="a">cb00710a</span><span class="z">.ipssl.cc</span></span><span class="tag">Hex</span><button class="copy" type="button" aria-label="Copy cb00710a.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button></li>
-        </ul>
-        <div class="check">
-          <button class="button secondary" id="check-btn" type="button">
-            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.4-4.4"/></svg>
-            <span data-i18n="tool.check">Check live</span>
-          </button>
-          <p class="check-note" data-i18n="tool.checkNote">Looks the first name up through Cloudflare's public DNS over HTTPS.</p>
+
+        <div class="bar" id="bar">
+          <div class="bar-row">
+            <div class="url" id="url">
+              <svg class="lock" id="lock" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V7.8a3.5 3.5 0 0 1 7 0v2.7"/></svg>
+              <span class="scheme" aria-hidden="true">https://</span>
+              <span class="field">
+                <input class="field-input" id="ip-input" type="text" value="192-168-1-10.ipssl.cc" size="1" spellcheck="false" autocomplete="off" autocapitalize="off" enterkeyhint="go" aria-describedby="name-text">
+                <span class="field-display" id="display" aria-hidden="true"><span class="a">192-168-1-10</span><span class="z">.ipssl.cc</span></span>
+              </span>
+            </div>
+            <button class="copy" id="bar-copy" type="button" aria-label="Copy 192-168-1-10.ipssl.cc"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+            <button class="button primary go" id="check-btn" type="button">
+              <span data-i18n="tool.check">Check</span>
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19 6v5a3 3 0 0 1-3 3H6"/><path d="m9.5 10.5-3.5 3.5 3.5 3.5"/></svg>
+            </button>
+          </div>
+          <div class="trace" id="trace" data-state="idle" hidden>
+            <ol class="trace-path">
+              <li><span data-i18n="trace.browser">Browser</span></li>
+              <li><span>Cloudflare DNS</span></li>
+              <li><span>ns1–4.ipssl.cc</span></li>
+            </ol>
+            <p class="answer" id="answer" aria-live="polite"></p>
+          </div>
         </div>
-        <div class="trace" id="trace" data-state="idle" hidden>
-          <ol class="trace-path">
-            <li><span data-i18n="trace.browser">Browser</span></li>
-            <li><span>Cloudflare DNS</span></li>
-            <li><span>ns1–4.ipssl.cc</span></li>
-          </ol>
-          <p class="answer" id="answer" aria-live="polite"></p>
+
+        <div class="callouts" id="callouts" data-layout="stack">
+          <div class="callout callout-lock">
+            <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V7.8a3.5 3.5 0 0 1 7 0v2.7"/></svg>
+            <div>
+              <p class="callout-title" data-i18n="call.cert">A real SSL certificate</p>
+              <p class="callout-text" id="cert-text">A CA cannot reach 192.168.1.10, so ipssl.cc proves the name through DNS for you. Get it from any machine.</p>
+              <a class="callout-link" href="#certs" data-i18n="call.how">See the command</a>
+            </div>
+          </div>
+          <div class="callout callout-name">
+            <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+            <div>
+              <p class="callout-title" id="name-title">Resolves to 192.168.1.10</p>
+              <p class="callout-text" id="name-text" aria-live="polite"><strong>IPv4</strong>Private address. No DNS server of your own, nothing to register.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="ask-ai">
+          <p class="ask-label">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 18.5V7a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H8.5Z"/><path d="M9 10h6M9 13h3.5"/></svg>
+            <span data-i18n="ai.label">Or ask an AI agent</span>
+          </p>
+          <p class="ask-prompt" id="ai-prompt">Read https://ipssl.cc/llms.txt, then give my machine at 192.168.1.10 a hostname under ipssl.cc and an SSL certificate for it.</p>
+          <button class="copy" id="ai-copy" type="button" aria-label="Copy prompt"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
         </div>
       </div>
     </section>
@@ -93,15 +112,15 @@
     <section class="section wrap" id="names" aria-labelledby="names-title">
       <div class="section-head">
         <h2 id="names-title" data-i18n="names.title">Write the address into the name.</h2>
-        <p data-i18n="names.lead">Dots become dashes, so the whole address fits in one label. Anything in front of it is yours to choose.</p>
+        <p data-i18n="names.lead">Dots become dashes, so the whole address fits in one label. Anything in front of it is yours to choose. Nothing to register: every name below works now.</p>
       </div>
 
       <figure class="anatomy" id="anatomy">
         <div class="seg seg-label"><code id="anat-label">app-</code><span class="cap" data-i18n="anat.label">Your label, optional</span></div>
-        <div class="seg seg-addr"><code id="anat-addr">203-0-113-10</code><span class="cap" data-i18n="anat.addr">The address, dots written as dashes</span></div>
+        <div class="seg seg-addr"><code id="anat-addr">192-168-1-10</code><span class="cap" data-i18n="anat.addr">The address, dots written as dashes</span></div>
         <div class="seg seg-zone"><code>.ipssl.cc</code><span class="cap" data-i18n="anat.zone">The zone</span></div>
         <div class="seg seg-result">
-          <code><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg><span id="anat-ip">203.0.113.10</span></code>
+          <code><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg><span id="anat-ip">192.168.1.10</span></code>
           <span class="cap" data-i18n="anat.result">What it resolves to</span>
         </div>
       </figure>
@@ -109,19 +128,16 @@
       <div class="forms-grid">
         <div class="table-wrap">
           <table class="forms">
+            <caption class="forms-caption" id="forms-caption">Every way to write 192.168.1.10</caption>
             <thead>
-              <tr><th data-i18n="forms.name">Name</th><th data-i18n="forms.result">Resolves to</th><th data-i18n="forms.notes">Notes</th></tr>
+              <tr><th data-i18n="forms.name">Name</th><th data-i18n="forms.result">Resolves to</th><th data-i18n="forms.notes">Notes</th><th><span class="visually-hidden" data-i18n="forms.copy">Copy</span></th></tr>
             </thead>
-            <tbody>
-              <tr><td class="n"><code><span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n1"><strong>Recommended.</strong> One label, easiest to get certificates for</td></tr>
-              <tr><td class="n"><code>app-<span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n2">Words before or after the address, joined with <code>-</code></td></tr>
-              <tr><td class="n"><code><span class="a">10-0-0-1</span>-app<span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note"></td></tr>
-              <tr><td class="n"><code>app.<span class="a">10-0-0-1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n3">Any number of subdomain levels</td></tr>
-              <tr><td class="n"><code><span class="a">10.0.0.1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n4">Dotted form</td></tr>
-              <tr><td class="n"><code>app.<span class="a">10.0.0.1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note"></td></tr>
-              <tr><td class="n"><code><span class="a">0a000001</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>10.0.0.1</code></td><td class="note" data-i18n="forms.n5">Eight hex digits</td></tr>
-              <tr><td class="n"><code><span class="a">2001-db8--1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>2001:db8::1</code></td><td class="note" data-i18n="forms.n6">IPv6: write <code>:</code> as <code>-</code> and <code>::</code> as <code>--</code></td></tr>
-              <tr><td class="n"><code>app.<span class="a">2001-db8--1</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>2001:db8::1</code></td><td class="note" data-i18n="forms.n7">Words in front of an IPv6 address go in their own label</td></tr>
+            <tbody id="forms-body">
+              <tr><td class="n"><code><span class="a">192-168-1-10</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>192.168.1.10</code></td><td class="note"><strong>Recommended.</strong> One label, easiest to get certificates for</td><td class="c"></td></tr>
+              <tr><td class="n"><code>app-<span class="a">192-168-1-10</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>192.168.1.10</code></td><td class="note">Words before or after the address, joined with <code>-</code></td><td class="c"></td></tr>
+              <tr><td class="n"><code>app.<span class="a">192-168-1-10</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>192.168.1.10</code></td><td class="note">Any number of subdomain levels</td><td class="c"></td></tr>
+              <tr><td class="n"><code><span class="a">192.168.1.10</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>192.168.1.10</code></td><td class="note">Dotted form</td><td class="c"></td></tr>
+              <tr><td class="n"><code><span class="a">c0a8010a</span><span class="z">.ipssl.cc</span></code></td><td class="r"><code>192.168.1.10</code></td><td class="note">Eight hex digits</td><td class="c"></td></tr>
             </tbody>
           </table>
         </div>
@@ -131,6 +147,7 @@
           <ul>
             <li data-i18n="rules.r1">When a name holds more than one address, the rightmost one, closest to the zone, wins.</li>
             <li data-i18n="rules.r2">Numbers with leading zeros, such as <code>010</code>, are rejected, so nobody has to guess whether they are octal.</li>
+            <li data-i18n="rules.r5">IPv6 works the same way: write <code>:</code> as <code>-</code> and <code>::</code> as <code>--</code>, and put words in front of it in their own label.</li>
             <li data-i18n="rules.r3">An AAAA query for an IPv4 name, or the other way round, gets an empty answer, not NXDOMAIN.</li>
             <li data-i18n="rules.r4">A TXT query for <code>ip.ipssl.cc</code> returns the address the query came from, usually your resolver.</li>
           </ul>
@@ -138,48 +155,74 @@
       </div>
     </section>
 
-    <section class="section wrap split" id="https" aria-labelledby="https-title">
+    <section class="section wrap" id="certs" aria-labelledby="certs-title">
       <div class="section-head">
-        <h2 id="https-title" data-i18n="https.title">Real certificates, issued to your own server.</h2>
-        <p data-i18n="https.lead">The name resolves to your server, so an ACME client running there passes HTTP-01 or TLS-ALPN-01 validation as it would for any other domain. There is nothing to sign up for, and the private key never leaves your machine.</p>
-        <ul class="notes">
-          <li data-i18n="https.n1"><strong>Any CA.</strong> The zone publishes no CAA record, so Let's Encrypt, ZeroSSL, Google Trust Services and others can all issue.</li>
-          <li data-i18n="https.n2"><strong>Private addresses use DNS-01.</strong> A CA cannot reach <code>192.168.1.10</code>, so the challenge goes through DNS instead: point lego, Traefik, certbot or acme.sh at <code>https://ipssl.cc/acme</code>. <a href="https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses">How it works</a></li>
-          <li data-i18n="https.n3"><strong>One shared limit.</strong> Every name under ipssl.cc counts toward Let's Encrypt's rate limit for the registered domain. If you hit it, try again later or use another CA.</li>
-        </ul>
+        <h2 id="certs-title" data-i18n="certs.title">Real SSL certificates, for public and private addresses.</h2>
+        <p data-i18n="certs.lead">The certificate comes from Let's Encrypt or any other ACME CA and is issued to you: the private key never leaves your machine. How the CA checks the name depends on where the address lives.</p>
       </div>
 
-      <div class="code-panel">
-        <div class="tabs" role="tablist" aria-label="ACME client">
-          <button role="tab" type="button" id="tab-certbot" aria-controls="snip-certbot" aria-selected="true">certbot</button>
-          <button role="tab" type="button" id="tab-acme" aria-controls="snip-acme" aria-selected="false" tabindex="-1">acme.sh</button>
-          <button role="tab" type="button" id="tab-caddy" aria-controls="snip-caddy" aria-selected="false" tabindex="-1">Caddy</button>
-        </div>
-        <div class="snip" role="tabpanel" id="snip-certbot" aria-labelledby="tab-certbot" tabindex="0"><pre data-mode="http"><code><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \
-    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre><pre data-mode="dns" hidden><code><span class="prompt" aria-hidden="true">$ </span>curl -fsSLO \
-    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/acme/ipssl-certbot-hook.sh
-<span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --manual --preferred-challenges dns \
-    --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" \
-    --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" \
-    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
-        <div class="snip" role="tabpanel" id="snip-acme" aria-labelledby="tab-acme" tabindex="0" hidden><pre data-mode="http"><code><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \
-    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre><pre data-mode="dns" hidden><code><span class="prompt" aria-hidden="true">$ </span>curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh \
-    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/acme/dns_ipssl.sh
-<span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --dns dns_ipssl \
-    -d <span class="host-slot">203-0-113-10.ipssl.cc</span></code></pre></div>
-        <div class="snip" role="tabpanel" id="snip-caddy" aria-labelledby="tab-caddy" tabindex="0" hidden><pre data-mode="http"><code><span class="comment"># Caddyfile</span>
-<span class="host-slot">203-0-113-10.ipssl.cc</span> {
-    reverse_proxy localhost:8080
-}</code></pre><pre data-mode="dns" hidden><code><span class="comment"># Caddyfile, with a certificate from certbot or acme.sh</span>
-<span class="host-slot">203-0-113-10.ipssl.cc</span> {
-    tls fullchain.pem privkey.pem
-    reverse_proxy localhost:8080
-}</code></pre></div>
-        <div class="snip-foot">
-          <p id="snip-note" data-kind="doc">Uses the first name from the converter. Run it on the server that owns the address.</p>
-          <button class="copy copy-dark" id="snip-copy" type="button" aria-label="Copy command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
-        </div>
+      <div class="paths">
+        <article class="path" id="path-public" aria-labelledby="path-public-title">
+          <div class="path-head">
+            <h3 id="path-public-title" data-i18n="path.public.t">Public address</h3>
+            <span class="yours" data-i18n="path.yours">Your address</span>
+          </div>
+          <p class="path-sub" data-i18n="path.public.s">On the server itself</p>
+          <p class="path-text" data-i18n="path.public.d">The name resolves to your server, so the CA connects to it to check. Run one command on that server. <span class="term">HTTP-01 or TLS-ALPN-01</span></p>
+          <div class="code-panel">
+            <div class="tabs" role="tablist" aria-label="ACME client for a public address">
+              <button role="tab" type="button" id="tab-pub-certbot" aria-controls="snip-pub-certbot" aria-selected="true">certbot</button>
+              <button role="tab" type="button" id="tab-pub-acme" aria-controls="snip-pub-acme" aria-selected="false" tabindex="-1">acme.sh</button>
+              <button role="tab" type="button" id="tab-pub-caddy" aria-controls="snip-pub-caddy" aria-selected="false" tabindex="-1">Caddy</button>
+            </div>
+            <div class="snip" role="tabpanel" id="snip-pub-certbot" aria-labelledby="tab-pub-certbot" tabindex="0"><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \</span><span class="ln">    -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pub-acme" aria-labelledby="tab-pub-acme" tabindex="0" hidden><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \</span><span class="ln">    -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pub-caddy" aria-labelledby="tab-pub-caddy" tabindex="0" hidden><pre><code><span class="ln"><span class="comment"># Caddyfile</span></span><span class="ln"><span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span> {</span><span class="ln">    reverse_proxy localhost:8080</span><span class="ln">}</span></code></pre></div>
+            <div class="snip-foot">
+              <p class="snip-note" id="note-public">Example name. Type a public IP above to use yours.</p>
+              <button class="copy copy-dark" type="button" data-copy-snip aria-label="Copy command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+            </div>
+          </div>
+        </article>
+
+        <article class="path is-yours" id="path-private" aria-labelledby="path-private-title">
+          <div class="path-head">
+            <h3 id="path-private-title" data-i18n="path.private.t">Private address</h3>
+            <span class="yours" data-i18n="path.yours">Your address</span>
+          </div>
+          <p class="path-sub" data-i18n="path.private.s">From any machine, through DNS</p>
+          <p class="path-text" data-i18n="path.private.d">A CA cannot reach <code class="ip-slot">192.168.1.10</code>, so your ACME client posts the check to <code>https://ipssl.cc/acme</code> and ipssl.cc answers it in DNS. <span class="term">DNS-01</span></p>
+          <div class="code-panel">
+            <div class="tabs" role="tablist" aria-label="ACME client for a private address">
+              <button role="tab" type="button" id="tab-pri-certbot" aria-controls="snip-pri-certbot" aria-selected="true">certbot</button>
+              <button role="tab" type="button" id="tab-pri-acme" aria-controls="snip-pri-acme" aria-selected="false" tabindex="-1">acme.sh</button>
+              <button role="tab" type="button" id="tab-pri-lego" aria-controls="snip-pri-lego" aria-selected="false" tabindex="-1">lego</button>
+            </div>
+            <div class="snip" role="tabpanel" id="snip-pri-certbot" aria-labelledby="tab-pri-certbot" tabindex="0"><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>curl -fsSLO https://ipssl.cc/acme/ipssl-certbot-hook.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --manual --preferred-challenges dns \</span><span class="ln">    --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" \</span><span class="ln">    --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pri-acme" aria-labelledby="tab-pri-acme" tabindex="0" hidden><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh \</span><span class="ln">    https://ipssl.cc/acme/dns_ipssl.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --dns dns_ipssl \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pri-lego" aria-labelledby="tab-pri-lego" tabindex="0" hidden><pre><code><span class="ln"><span class="comment"># lego, and Traefik with the httpreq provider</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego \</span><span class="ln">    --email you@example.com --dns httpreq \</span><span class="ln">    --domains <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span> run</span></code></pre></div>
+            <div class="snip-foot">
+              <p class="snip-note" id="note-private">Run it on any machine with internet access.</p>
+              <button class="copy copy-dark" type="button" data-copy-snip aria-label="Copy command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
+            </div>
+          </div>
+        </article>
       </div>
+
+      <dl class="cert-facts">
+        <div>
+          <dt data-i18n="certs.f1.t">Any CA</dt>
+          <dd data-i18n="certs.f1.d">The zone publishes no CAA record, so Let's Encrypt, ZeroSSL, Google Trust Services and others can all issue.</dd>
+        </div>
+        <div>
+          <dt data-i18n="certs.f2.t">Encrypted, not identified</dt>
+          <dd data-i18n="certs.f2.d">A private address exists on countless networks, so anyone can get a certificate for the same name. It encrypts the connection; it does not prove whose machine you reached.</dd>
+        </div>
+        <div>
+          <dt data-i18n="certs.f3.t">One shared limit</dt>
+          <dd data-i18n="certs.f3.d">Every name under ipssl.cc counts toward Let's Encrypt's limit for the domain. Keep a certificate until it is due for renewal, or use another CA.</dd>
+        </div>
+      </dl>
     </section>
 
     <section class="section wrap" id="servers" aria-labelledby="servers-title">
@@ -230,12 +273,16 @@
       </div>
       <div class="faq-list">
         <details>
+          <summary data-i18n="faq.q7">Can an AI agent set this up for me?</summary>
+          <p data-i18n="faq.a7">Yes. Give it the prompt at the top of this page. <a href="/llms.txt">llms.txt</a> tells it how to pick the name, which certificate path fits the address, and the exact commands.</p>
+        </details>
+        <details>
           <summary data-i18n="faq.q1">Why doesn't a private address resolve on my network?</summary>
           <p data-i18n="faq.a1">Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers that point to private addresses. Allowlist <code>ipssl.cc</code> there, or use a public resolver.</p>
         </details>
         <details>
           <summary data-i18n="faq.q2">Can I download a wildcard certificate for ipssl.cc?</summary>
-          <p data-i18n="faq.a2">No. Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key could revoke the certificate. Get a certificate on your own server instead; it takes one command.</p>
+          <p data-i18n="faq.a2">No. Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key could revoke the certificate. Get your own certificate instead; it takes one command.</p>
         </details>
         <details>
           <summary data-i18n="faq.q3">Why isn't ipssl.cc on the Public Suffix List?</summary>
@@ -270,8 +317,7 @@
           <a class="button secondary" href="https://github.com/gonolab/ipssl.cc/issues" data-i18n="cta.issue">Open an issue</a>
         </div>
         <div class="cmd">
-          <pre><code id="install-cmd">curl -fsSLO \
-    https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/install.sh
+          <pre><code id="install-cmd">curl -fsSLO https://ipssl.cc/install.sh
 sudo sh install.sh</code></pre>
           <button class="copy" id="install-copy" type="button" aria-label="Copy install command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
         </div>
@@ -282,6 +328,7 @@ sudo sh install.sh</code></pre>
   <footer class="wrap site-footer">
     <span class="footer-brand">ipssl.cc</span>
     <nav class="footer-links" aria-label="Footer">
+      <a href="/llms.txt" data-i18n="footer.llms">llms.txt for AI agents</a>
       <a href="https://github.com/gonolab/ipssl.cc/blob/main/LICENSE" data-i18n="footer.license">MIT License</a>
       <a href="https://github.com/gonolab/ipssl.cc">GitHub</a>
       <a href="mailto:abuse@ipssl.cc" data-i18n="footer.abuse">Report abuse</a>

@@ -1,0 +1,72 @@
+# ipssl.cc
+
+> Free wildcard DNS. Any hostname with an IP address in it resolves to that address (192-168-1-10.ipssl.cc -> 192.168.1.10, IPv4 and IPv6), and that hostname can get a real SSL/TLS certificate from Let's Encrypt or any other ACME CA, including for private addresses. No account, no API key, nothing to register.
+
+Use this file to give a machine a hostname and an HTTPS certificate. Work in this order: pick the hostname, check that it resolves, get the certificate the way that fits the address, then configure the service to use the certificate and to be reached by the hostname, not by the bare IP.
+
+## 1. Pick the hostname
+
+- Recommended form: the IPv4 address with dashes, in one label: `192.168.1.10` -> `192-168-1-10.ipssl.cc`.
+- IPv6: write `:` as `-` and `::` as `--`: `2001:db8::1` -> `2001-db8--1.ipssl.cc`. An address that starts or ends with `::` gets an explicit zero group: `::1` -> `0--1.ipssl.cc`.
+- Words may go before or after the address, joined with `-` (`app-192-168-1-10.ipssl.cc`, `192-168-1-10-app.ipssl.cc`), or in their own labels (`api.app.192-168-1-10.ipssl.cc`). Words in front of an IPv6 address must be in their own label.
+- Also accepted: dotted `192.168.1.10.ipssl.cc` and eight hex digits `c0a8010a.ipssl.cc`. Prefer the dashed one-label form: it is the easiest to get certificates for.
+- When a name holds more than one address, the rightmost one wins. Octets with leading zeros (`010`) are rejected.
+
+## 2. Check it resolves
+
+- `dig +short 192-168-1-10.ipssl.cc` should print `192.168.1.10`. An IPv4 name has no AAAA record and an IPv6 name has no A record.
+- If a private address does not resolve on the user's network, the router probably has DNS rebinding protection (OpenWrt, pfSense, dnsmasq, Fritz!Box). Allowlist `ipssl.cc` there, or use a public resolver such as 1.1.1.1 or 8.8.8.8.
+
+## 3. Get the certificate
+
+Decide by the address.
+
+### Public address: on the machine itself
+
+The CA connects to the address, so run the ACME client on that machine, with port 80 (HTTP-01) or 443 (TLS-ALPN-01) reachable from the internet:
+
+- certbot: `sudo certbot certonly --standalone -d 203-0-113-10.ipssl.cc`
+- acme.sh: `acme.sh --issue --standalone -d 203-0-113-10.ipssl.cc`
+- Caddy: put `203-0-113-10.ipssl.cc` in the Caddyfile; Caddy gets the certificate by itself.
+
+The DNS API below refuses names with public addresses.
+
+### Private address: DNS-01 through the ipssl.cc API
+
+Private means 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, fc00::/7, fe80::/10 or ::1. A CA cannot reach these, so the ACME client publishes the DNS-01 challenge through the API and ipssl.cc answers it in DNS. The client can run on any machine with internet access, not only the one at the address.
+
+- lego, or Traefik with the `httpreq` DNS provider:
+  `HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego --email you@example.com --dns httpreq --domains 192-168-1-10.ipssl.cc run`
+- certbot, with the hook script:
+  `curl -fsSLO https://ipssl.cc/acme/ipssl-certbot-hook.sh`
+  `sudo certbot certonly --manual --preferred-challenges dns --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" -d 192-168-1-10.ipssl.cc`
+- acme.sh, with the DNS API plugin:
+  `curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh https://ipssl.cc/acme/dns_ipssl.sh`
+  `acme.sh --issue --dns dns_ipssl -d 192-168-1-10.ipssl.cc`
+- Wildcards work too: add `*.192-168-1-10.ipssl.cc` as a second name.
+
+The API, for other clients:
+
+- `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup`
+- Body: `{"fqdn": "_acme-challenge.192-168-1-10.ipssl.cc", "value": "<the DNS-01 TXT value>"}`; a trailing dot on `fqdn` is fine.
+- Success is HTTP 200 with `{"ok":true}`, returned once all four name servers hold the value. Errors carry `{"ok":false,"error":"..."}`: 400 for a malformed request, 403 for a public address, 429 when rate limited, 502 when a name server did not take the change (retry).
+- The value must be the real DNS-01 digest (43 base64url characters). Values are dropped after 10 minutes. Each client network may make 10 requests a minute.
+
+## 4. Use it
+
+- Point the service (nginx, Caddy, a dev server) at the certificate and key, and open it as `https://192-168-1-10.ipssl.cc`. The certificate is for the hostname, so `https://192.168.1.10` still shows a warning.
+- Renew before expiry with the same client; certbot and acme.sh set up renewal on their own.
+
+## Limits
+
+- Every name under ipssl.cc shares Let's Encrypt's rate limit for the domain. Do not request new certificates in loops; keep one until it is due for renewal, or use ZeroSSL or Google Trust Services.
+- A certificate for a private address encrypts the connection but does not prove whose machine it is: anyone can get one for the same name.
+- There is no wildcard certificate for all of ipssl.cc to download.
+- Report abuse to abuse@ipssl.cc.
+
+## Links
+
+- [Landing page](https://ipssl.cc/)
+- [README](https://github.com/gonolab/ipssl.cc#readme): naming rules, certificates, self-hosting the server
+- [Certificates for private addresses](https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses)
+- [Source](https://github.com/gonolab/ipssl.cc): MIT licensed, written in Rust
