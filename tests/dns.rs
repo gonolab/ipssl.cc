@@ -243,6 +243,22 @@ async fn edns_is_echoed_and_capped() {
 }
 
 #[tokio::test]
+async fn dnssec_ok_bit_is_copied() {
+    let server = start();
+    for dnssec_ok in [true, false] {
+        let mut req = query("10-0-0-1.ipssl.cc.", RecordType::A);
+        let mut edns = Edns::new();
+        edns.set_dnssec_ok(dnssec_ok);
+        req.set_edns(edns);
+
+        let resp = over_udp(server.udp, &req).await;
+        let edns = resp.edns.as_ref().expect("response should carry EDNS");
+        assert_eq!(edns.flags().dnssec_ok, dnssec_ok);
+        assert_eq!(rdata(&resp), ["10.0.0.1"]);
+    }
+}
+
+#[tokio::test]
 async fn unknown_edns_version_is_badvers() {
     let server = start();
     let mut req = query("10-0-0-1.ipssl.cc.", RecordType::A);

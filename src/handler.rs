@@ -108,6 +108,9 @@ impl RequestHandler for Handler {
             let mut edns = Edns::new();
             edns.set_max_payload(req.max_payload().clamp(512, MAX_UDP_PAYLOAD));
             edns.set_version(0);
+            // RFC 3225 section 3: copy DO from the query, even though
+            // nothing here is signed.
+            edns.set_dnssec_ok(req.flags().dnssec_ok);
             edns
         });
         let bad_version = request.edns.as_ref().is_some_and(|e| e.version() > 0);
