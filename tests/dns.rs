@@ -210,14 +210,56 @@ async fn oversized_udp_answer_is_cleanly_truncated() {
 }
 
 #[tokio::test]
-async fn nxdomain_carries_soa() {
+async fn names_without_records_are_nodata() {
+    // Resolvers that minimise queries ask for `1.ipssl.cc` on the way to
+    // `10.0.0.1.ipssl.cc`; an NXDOMAIN there would stop them short.
     let server = start();
-    let resp = over_udp(server.udp, &query("nothing.ipssl.cc.", RecordType::A)).await;
+    for name in [
+        "nothing.ipssl.cc.",
+        "1.ipssl.cc.",
+        "0.1.ipssl.cc.",
+        "0.0.1.ipssl.cc.",
+        "app.ipssl.cc.",
+    ] {
+        let resp = over_udp(server.udp, &query(name, RecordType::A)).await;
+        assert_eq!(resp.metadata.response_code, ResponseCode::NoError, "{name}");
+        assert!(resp.metadata.authoritative);
+        assert!(resp.answers.is_empty());
+        assert_eq!(resp.authorities.len(), 1);
+        assert_eq!(resp.authorities[0].record_type(), RecordType::SOA);
+        assert_eq!(resp.authorities[0].ttl, 300);
+    }
+    for name in ["10.0.0.1.ipssl.cc.", "10-0-0-1.app.ipssl.cc."] {
+        let resp = over_udp(server.udp, &query(name, RecordType::A)).await;
+        assert_eq!(rdata(&resp), ["10.0.0.1"], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn blocklisted_name_is_nxdomain_with_soa() {
+    let mut config = Config::parse(EXAMPLE_CONFIG).unwrap();
+    config.blocklist = vec!["203.0.113.0/24".parse().unwrap()];
+    let server = start_with(config);
+    let resp = over_udp(server.udp, &query("203-0-113-5.ipssl.cc.", RecordType::A)).await;
     assert_eq!(resp.metadata.response_code, ResponseCode::NXDomain);
     assert!(resp.metadata.authoritative);
     assert_eq!(resp.authorities.len(), 1);
     assert_eq!(resp.authorities[0].record_type(), RecordType::SOA);
     assert_eq!(resp.authorities[0].ttl, 300);
+}
+
+#[tokio::test]
+async fn zone_transfers_are_refused() {
+    let server = start();
+    for qtype in [RecordType::AXFR, RecordType::IXFR] {
+        let resp = over_tcp(server.tcp, &query("ipssl.cc.", qtype)).await;
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::Refused,
+            "{qtype}"
+        );
+        assert!(resp.answers.is_empty() && resp.authorities.is_empty());
+    }
 }
 
 #[tokio::test]

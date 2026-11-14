@@ -1,6 +1,6 @@
 //! Answers queries for the zone. Pure logic with no I/O, so it is easy to test.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, ensure};
@@ -33,6 +33,10 @@ pub struct Zone {
     negative_soa: Record,
     /// Fixed records by owner name. The apex is always present, SOA first.
     hosts: HashMap<LowerName, Vec<Record>>,
+    /// Names above fixed hosts (`nested.<domain>` for `deep.nested.<domain>`).
+    /// They have to exist for the hosts to be found, even when the address
+    /// in them is blocked.
+    fixed_ancestors: HashSet<LowerName>,
     whoami: LowerName,
     ip_ttl: u32,
     blocklist: Vec<IpNet>,
@@ -143,16 +147,28 @@ impl Zone {
             }
         }
 
+        let origin_lower = LowerName::new(&origin);
+        let mut fixed_ancestors = HashSet::new();
+        for owner in hosts.keys() {
+            let mut name = owner.base_name();
+            while name != origin_lower && origin_lower.zone_of(&name) {
+                let parent = name.base_name();
+                fixed_ancestors.insert(name);
+                name = parent;
+            }
+        }
+
         let whoami = fqdn(&format!(
             "{WHOAMI_LABEL}.{}",
             cfg.domain.trim_end_matches('.')
         ))?;
 
         Ok(Self {
-            origin_labels: origin.num_labels() as usize,
-            origin: LowerName::new(&origin),
+            origin_labels: origin.iter().count(),
+            origin: origin_lower,
             negative_soa,
             hosts,
+            fixed_ancestors,
             whoami: LowerName::new(&whoami),
             ip_ttl: cfg.ttl.ip,
             blocklist: cfg.blocklist.clone(),
@@ -177,6 +193,11 @@ impl Zone {
         if qclass != DNSClass::IN || !self.origin.zone_of(&lower) {
             return Answer::refused();
         }
+        // No zone transfers: most of the zone is computed from the names,
+        // so there is nothing to transfer.
+        if matches!(qtype, RecordType::AXFR | RecordType::IXFR) {
+            return Answer::refused();
+        }
 
         if let Some(records) = self.hosts.get(&lower) {
             return self.fixed(qname, records, qtype);
@@ -192,27 +213,24 @@ impl Zone {
             };
         }
 
-        let labels = self.relative_labels(qname);
-        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-
-        match extract_ip(&labels) {
-            Some(ip) if self.blocklist.iter().any(|net| net.contains(&ip)) => self.nxdomain(),
-            Some(IpAddr::V4(ip)) if matches!(qtype, RecordType::A | RecordType::ANY) => self
-                .answer(vec![Record::from_rdata(
-                    qname.clone(),
-                    self.ip_ttl,
-                    RData::A(A(ip)),
-                )]),
-            Some(IpAddr::V6(ip)) if matches!(qtype, RecordType::AAAA | RecordType::ANY) => self
-                .answer(vec![Record::from_rdata(
-                    qname.clone(),
-                    self.ip_ttl,
-                    RData::AAAA(AAAA(ip)),
-                )]),
-            Some(_) => self.nodata(),
-            // A name that only exists as the parent of a fixed host.
-            None if self.hosts.keys().any(|k| lower.zone_of(k)) => self.nodata(),
-            None => self.nxdomain(),
+        match self.embedded_ip(qname) {
+            // A blocked name does not exist, and neither do the names below
+            // it, which hold the same address. Names above fixed hosts are
+            // kept, or the hosts could not be found.
+            Some(ip) if self.is_blocked(ip) => {
+                if self.fixed_ancestors.contains(&lower) {
+                    self.nodata()
+                } else {
+                    self.nxdomain()
+                }
+            }
+            Some(ip) => self.address(qname, qtype, ip),
+            // Every other name exists, with or without records: any name
+            // can have names with addresses below it (`1.<domain>` is above
+            // `10.0.0.1.<domain>`, `app.<domain>` above
+            // `10-0-0-1.app.<domain>`), and NXDOMAIN would tell resolvers
+            // that none of them exist (RFC 8020).
+            None => self.nodata(),
         }
     }
 
@@ -242,7 +260,7 @@ impl Zone {
         match labels.split_first() {
             Some((&CHALLENGE_LABEL, rest)) => {
                 let ip = extract_ip(rest).ok_or(ChallengeError::NoAddress)?;
-                if self.blocklist.iter().any(|net| net.contains(&ip)) {
+                if self.is_blocked(ip) {
                     Err(ChallengeError::Blocked)
                 } else if !is_private(ip) {
                     Err(ChallengeError::PublicAddress)
@@ -276,21 +294,35 @@ impl Zone {
     /// The lowercase labels of `name` left of the apex, in normal order.
     /// `name` must be inside the zone.
     fn relative_labels(&self, name: &Name) -> Vec<String> {
-        let relative = name.num_labels() as usize - self.origin_labels;
+        // Not `num_labels()`, which leaves out a leading `*`.
+        let relative = name.iter().count() - self.origin_labels;
         name.iter()
             .take(relative)
             .map(|l| String::from_utf8_lossy(l).to_ascii_lowercase())
             .collect()
     }
 
+    /// The address embedded in `name`, which must be inside the zone.
+    fn embedded_ip(&self, name: &Name) -> Option<IpAddr> {
+        let labels = self.relative_labels(name);
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        extract_ip(&labels)
+    }
+
+    /// Whether `ip` is blocked. An IPv4-mapped IPv6 address
+    /// (`::ffff:10.9.0.1`) also counts as the IPv4 address it holds.
+    fn is_blocked(&self, ip: IpAddr) -> bool {
+        let canonical = ip.to_canonical();
+        self.blocklist
+            .iter()
+            .any(|net| net.contains(&ip) || net.contains(&canonical))
+    }
+
     fn fixed(&self, qname: &Name, records: &[Record], qtype: RecordType) -> Answer {
         // RFC 8482: answer ANY with one RRset instead of everything.
-        let wanted = match qtype {
-            RecordType::ANY => match records.first() {
-                Some(r) => r.record_type(),
-                None => return self.nodata(),
-            },
-            t => t,
+        let wanted = match (qtype, records.first()) {
+            (RecordType::ANY, Some(first)) => first.record_type(),
+            (qtype, _) => qtype,
         };
         let matched: Vec<Record> = records
             .iter()
@@ -301,11 +333,30 @@ impl Zone {
                 r
             })
             .collect();
-        if matched.is_empty() {
-            self.nodata()
-        } else {
-            self.answer(matched)
+        if !matched.is_empty() {
+            return self.answer(matched);
         }
+        // A host with no address of the asked type (say, only a TXT record
+        // for a site verification) keeps the address its name holds.
+        if matches!(qtype, RecordType::A | RecordType::AAAA | RecordType::ANY)
+            && let Some(ip) = self.embedded_ip(qname)
+            && !self.is_blocked(ip)
+        {
+            return self.address(qname, qtype, ip);
+        }
+        self.nodata()
+    }
+
+    /// The answer from the address embedded in `qname`.
+    fn address(&self, qname: &Name, qtype: RecordType, ip: IpAddr) -> Answer {
+        let data = match ip {
+            IpAddr::V4(ip) if matches!(qtype, RecordType::A | RecordType::ANY) => RData::A(A(ip)),
+            IpAddr::V6(ip) if matches!(qtype, RecordType::AAAA | RecordType::ANY) => {
+                RData::AAAA(AAAA(ip))
+            }
+            _ => return self.nodata(),
+        };
+        self.answer(vec![Record::from_rdata(qname.clone(), self.ip_ttl, data)])
     }
 
     fn answer(&self, answers: Vec<Record>) -> Answer {
@@ -456,13 +507,29 @@ mod tests {
         Zone::from_config(&Config::parse(CONFIG).unwrap()).unwrap()
     }
 
+    fn zone_with(extra: &str) -> Result<Zone> {
+        Zone::from_config(&Config::parse(&format!("{CONFIG}\n{extra}\n")).unwrap())
+    }
+
     fn query(name: &str, qtype: RecordType) -> Answer {
+        query_zone(&zone(), name, qtype)
+    }
+
+    fn query_zone(zone: &Zone, name: &str, qtype: RecordType) -> Answer {
         let name = Name::from_ascii(name).unwrap();
-        zone().resolve(&name, qtype, DNSClass::IN, CLIENT)
+        zone.resolve(&name, qtype, DNSClass::IN, CLIENT)
     }
 
     fn rdata(answer: &Answer) -> Vec<String> {
         answer.answers.iter().map(|r| r.data.to_string()).collect()
+    }
+
+    /// NOERROR with no records and the SOA for negative caching.
+    fn is_nodata(answer: &Answer) -> bool {
+        answer.rcode == ResponseCode::NoError
+            && answer.authoritative
+            && answer.answers.is_empty()
+            && answer.soa.is_some()
     }
 
     #[test]
@@ -487,19 +554,35 @@ mod tests {
             ("10-0-0-1.ipssl.cc.", RecordType::TXT),
             ("2001-db8--1.ipssl.cc.", RecordType::A),
         ] {
-            let a = query(name, qtype);
-            assert_eq!(a.rcode, ResponseCode::NoError, "{name} {qtype}");
-            assert!(a.answers.is_empty());
-            assert!(a.soa.is_some());
+            assert!(is_nodata(&query(name, qtype)), "{name} {qtype}");
         }
     }
 
     #[test]
-    fn unknown_name_is_nxdomain() {
-        let a = query("nothing-here.ipssl.cc.", RecordType::A);
-        assert_eq!(a.rcode, ResponseCode::NXDomain);
-        assert!(a.authoritative);
-        assert_eq!(a.soa.unwrap().ttl, 300);
+    fn names_without_records_are_nodata() {
+        // Any name can have names with addresses below it, so none is
+        // NXDOMAIN; otherwise resolvers that minimise queries or follow
+        // RFC 8020 would never reach `10.0.0.1.ipssl.cc`.
+        for name in [
+            "nothing-here.ipssl.cc.",
+            "1.ipssl.cc.",
+            "0.1.ipssl.cc.",
+            "0.0.1.ipssl.cc.",
+            "app.ipssl.cc.",
+            "x.ip.ipssl.cc.",
+        ] {
+            let a = query(name, RecordType::A);
+            assert!(is_nodata(&a), "{name}");
+            assert_eq!(a.soa.unwrap().ttl, 300, "{name}");
+        }
+        assert_eq!(
+            rdata(&query("10.0.0.1.ipssl.cc.", RecordType::A)),
+            ["10.0.0.1"]
+        );
+        assert_eq!(
+            rdata(&query("10-0-0-1.app.ipssl.cc.", RecordType::A)),
+            ["10.0.0.1"]
+        );
     }
 
     #[test]
@@ -512,10 +595,33 @@ mod tests {
     }
 
     #[test]
+    fn zone_transfers_are_refused() {
+        for name in ["ipssl.cc.", "www.ipssl.cc.", "10-0-0-1.ipssl.cc."] {
+            for qtype in [RecordType::AXFR, RecordType::IXFR] {
+                let a = query(name, qtype);
+                assert_eq!(a.rcode, ResponseCode::Refused, "{name} {qtype}");
+                assert!(a.answers.is_empty() && a.soa.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn case_is_ignored_and_preserved() {
         let a = query("App-10-0-0-1.IPSSL.cc.", RecordType::A);
         assert_eq!(rdata(&a), ["10.0.0.1"]);
         assert_eq!(a.answers[0].name.to_string(), "App-10-0-0-1.IPSSL.cc.");
+    }
+
+    #[test]
+    fn leading_wildcard_label_counts() {
+        // The address nearest the zone wins, with `*` in front as with
+        // any other label.
+        for name in [
+            "*.10-0-0-2.10-0-0-1.ipssl.cc.",
+            "app.10-0-0-2.10-0-0-1.ipssl.cc.",
+        ] {
+            assert_eq!(rdata(&query(name, RecordType::A)), ["10.0.0.1"], "{name}");
+        }
     }
 
     #[test]
@@ -557,14 +663,66 @@ mod tests {
         );
         let dmarc = query("_dmarc.ipssl.cc.", RecordType::TXT);
         assert_eq!(rdata(&dmarc), ["v=DMARC1; p=reject"]);
-        // A fixed name has only the records configured for it.
-        let a = query("www.ipssl.cc.", RecordType::AAAA);
-        assert_eq!(a.rcode, ResponseCode::NoError);
-        assert!(a.answers.is_empty());
+        // A fixed name has only the records configured for it, plus the
+        // address in its name, and `www` holds none.
+        assert!(is_nodata(&query("www.ipssl.cc.", RecordType::AAAA)));
     }
 
-    fn zone_with(extra: &str) -> Result<Zone> {
-        Zone::from_config(&Config::parse(&format!("{CONFIG}\n{extra}\n")).unwrap())
+    #[test]
+    fn fixed_host_without_address_keeps_the_one_in_its_name() {
+        let zone = zone_with(
+            r#"
+            [hosts."10-0-0-7"]
+            txt = ["site-verification=1"]
+
+            [hosts."10-0-0-8"]
+            a = ["198.51.100.20"]
+
+            [hosts."2001-db8--7"]
+            txt = ["site-verification=2"]
+
+            [hosts."empty-10-0-0-9"]
+
+            [hosts."203-0-113-9"]
+            txt = ["site-verification=3"]
+            "#,
+        )
+        .unwrap();
+        let q = |name: &str, qtype| query_zone(&zone, name, qtype);
+
+        assert_eq!(rdata(&q("10-0-0-7.ipssl.cc.", RecordType::A)), ["10.0.0.7"]);
+        assert_eq!(
+            rdata(&q("10-0-0-7.ipssl.cc.", RecordType::TXT)),
+            ["site-verification=1"]
+        );
+        // ANY still gets the first configured RRset.
+        assert_eq!(
+            q("10-0-0-7.ipssl.cc.", RecordType::ANY).answers[0].record_type(),
+            RecordType::TXT
+        );
+        assert!(is_nodata(&q("10-0-0-7.ipssl.cc.", RecordType::AAAA)));
+        assert_eq!(
+            rdata(&q("2001-db8--7.ipssl.cc.", RecordType::AAAA)),
+            ["2001:db8::7"]
+        );
+        assert_eq!(
+            rdata(&q("empty-10-0-0-9.ipssl.cc.", RecordType::ANY)),
+            ["10.0.0.9"]
+        );
+
+        // A configured address replaces the one in the name.
+        assert_eq!(
+            rdata(&q("10-0-0-8.ipssl.cc.", RecordType::A)),
+            ["198.51.100.20"]
+        );
+        assert!(is_nodata(&q("10-0-0-8.ipssl.cc.", RecordType::AAAA)));
+
+        // A blocked address stays unserved, but the name has records.
+        assert!(is_nodata(&q("203-0-113-9.ipssl.cc.", RecordType::A)));
+        assert_eq!(
+            rdata(&q("203-0-113-9.ipssl.cc.", RecordType::TXT)),
+            ["site-verification=3"]
+        );
     }
 
     #[test]
@@ -574,17 +732,14 @@ mod tests {
             ["10 mx.example.net.", "20 mx2.example.net."]
         );
         // Names computed from an address have no MX.
-        let a = query("10-0-0-1.ipssl.cc.", RecordType::MX);
-        assert_eq!(a.rcode, ResponseCode::NoError);
-        assert!(a.answers.is_empty());
+        assert!(is_nodata(&query("10-0-0-1.ipssl.cc.", RecordType::MX)));
     }
 
     #[test]
     fn null_mx() {
         let zone =
             zone_with("[hosts.nomail]\nmx = [{ preference = 0, exchange = \".\" }]").unwrap();
-        let name = Name::from_ascii("nomail.ipssl.cc.").unwrap();
-        let a = zone.resolve(&name, RecordType::MX, DNSClass::IN, CLIENT);
+        let a = query_zone(&zone, "nomail.ipssl.cc.", RecordType::MX);
         assert_eq!(rdata(&a), ["0 ."]);
     }
 
@@ -605,8 +760,7 @@ mod tests {
         // An RSA DKIM key does not fit in one 255-byte string.
         let key = format!("v=DKIM1; k=rsa; p={}", "A".repeat(600));
         let zone = zone_with(&format!("[hosts.\"s1._domainkey\"]\ntxt = [\"{key}\"]")).unwrap();
-        let name = Name::from_ascii("s1._domainkey.ipssl.cc.").unwrap();
-        let a = zone.resolve(&name, RecordType::TXT, DNSClass::IN, CLIENT);
+        let a = query_zone(&zone, "s1._domainkey.ipssl.cc.", RecordType::TXT);
         let RData::TXT(txt) = &a.answers[0].data else {
             panic!("not a TXT record");
         };
@@ -617,9 +771,7 @@ mod tests {
 
     #[test]
     fn empty_non_terminal_is_nodata() {
-        let a = query("nested.ipssl.cc.", RecordType::A);
-        assert_eq!(a.rcode, ResponseCode::NoError);
-        assert!(a.answers.is_empty());
+        assert!(is_nodata(&query("nested.ipssl.cc.", RecordType::A)));
         assert_eq!(
             rdata(&query("deep.nested.ipssl.cc.", RecordType::A)),
             ["198.51.100.11"]
@@ -635,8 +787,26 @@ mod tests {
 
     #[test]
     fn blocklisted_address_is_nxdomain() {
-        let a = query("203-0-113-5.ipssl.cc.", RecordType::A);
-        assert_eq!(a.rcode, ResponseCode::NXDomain);
+        for (name, qtype) in [
+            ("203-0-113-5.ipssl.cc.", RecordType::A),
+            ("203.0.113.5.ipssl.cc.", RecordType::A),
+            ("app.203-0-113-5.ipssl.cc.", RecordType::TXT),
+            // ::ffff:203.0.113.5 is the same address.
+            ("0--ffff-cb00-7105.ipssl.cc.", RecordType::AAAA),
+        ] {
+            let a = query(name, qtype);
+            assert_eq!(a.rcode, ResponseCode::NXDomain, "{name}");
+            assert!(a.authoritative && a.soa.is_some());
+        }
+    }
+
+    #[test]
+    fn blocked_names_above_fixed_hosts_exist() {
+        let zone = zone_with("[hosts.\"www.203-0-113-6\"]\na = [\"198.51.100.30\"]").unwrap();
+        let q = |name: &str| query_zone(&zone, name, RecordType::A);
+        assert!(is_nodata(&q("203-0-113-6.ipssl.cc.")));
+        assert_eq!(rdata(&q("www.203-0-113-6.ipssl.cc.")), ["198.51.100.30"]);
+        assert_eq!(q("app.203-0-113-6.ipssl.cc.").rcode, ResponseCode::NXDomain);
     }
 
     #[test]
@@ -698,6 +868,11 @@ mod tests {
                 ChallengeError::PublicAddress,
             ),
             ("_acme-challenge.10-9-1-1.ipssl.cc", ChallengeError::Blocked),
+            // ::ffff:10.9.1.1, the same address as IPv4-mapped IPv6.
+            (
+                "_acme-challenge.0--ffff-a09-101.ipssl.cc",
+                ChallengeError::Blocked,
+            ),
         ] {
             assert_eq!(zone.challenge_name(bad).err(), Some(why), "{bad:?}");
         }
