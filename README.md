@@ -43,7 +43,7 @@ Any ACME CA works: the zone publishes no CAA record that would limit the choice.
 
 This only works for public addresses the CA can reach. Names with private addresses such as `192-168-1-10.ipssl.cc` use DNS-01 instead, see [below](#certificates-for-private-addresses).
 
-Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for certificates per registered domain. The service asks Let's Encrypt to raise that limit for `ipssl.cc`.
+Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for certificates per registered domain. Let's Encrypt raised that limit for `ipssl.cc` in November 2026, but it is still one limit for every user of the service.
 
 ## Certificates for private addresses
 
@@ -327,7 +327,7 @@ The [release workflow](.github/workflows/release.yml) checks that the tag matche
 - [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
 - [x] v0.3: MX records and long TXT values (DKIM keys) for mail on the domain
 - [x] v0.4: DNS-01 challenges, so names with private addresses can get certificates
-- [ ] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
+- [x] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
 - [x] Landing page
 
 ## License
