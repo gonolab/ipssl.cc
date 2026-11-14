@@ -321,17 +321,35 @@ async fn udp_is_rate_limited_but_tcp_is_not() {
     config.rate_limit.slip = 2;
     let server = start_with(config);
     let req = query("10-0-0-1.ipssl.cc.", RecordType::A);
-    let wait = Duration::from_millis(300);
 
-    // The burst is answered as usual.
-    for _ in 0..2 {
-        let resp = try_udp(server.udp, &req, wait).await.unwrap();
-        assert_eq!(rdata(&resp), ["10.0.0.1"]);
+    // Send all four queries at once, so the bucket gets no time to refill
+    // (one token a second) however slow the machine is: the burst of two
+    // is answered, then responses alternate between dropped and truncated
+    // (slip = 2). Nothing waits for the dropped one; the metrics below
+    // count it.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bytes = req.to_vec().unwrap();
+    for _ in 0..4 {
+        socket.send_to(&bytes, server.udp).await.unwrap();
     }
-    // Then responses alternate between dropped and truncated (slip = 2).
-    assert!(try_udp(server.udp, &req, wait).await.is_none());
-    let slipped = try_udp(server.udp, &req, wait).await.unwrap();
-    assert!(slipped.metadata.truncation);
+    let mut buf = [0u8; 4096];
+    let mut responses = Vec::new();
+    while responses.len() < 3 {
+        let (n, _) = timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+            .await
+            .expect("fewer than three UDP responses")
+            .unwrap();
+        responses.push(Message::from_vec(&buf[..n]).unwrap());
+    }
+    let (slipped, answered): (Vec<_>, Vec<_>) =
+        responses.into_iter().partition(|r| r.metadata.truncation);
+    assert_eq!(answered.len(), 2);
+    for resp in &answered {
+        assert_eq!(rdata(resp), ["10.0.0.1"]);
+    }
+    let [slipped] = slipped.as_slice() else {
+        panic!("expected one truncated response, got {}", slipped.len());
+    };
     assert!(slipped.answers.is_empty());
     assert_eq!(slipped.metadata.id, req.metadata.id);
     assert_eq!(slipped.queries, req.queries);
