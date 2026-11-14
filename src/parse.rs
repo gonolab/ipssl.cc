@@ -16,8 +16,10 @@
 //! | `app.2001-db8--1.ipssl.cc`   | 2001:db8::1   |
 //!
 //! When a name holds more than one address, the one closest to the zone
-//! (the rightmost) wins. Octets with leading zeros (`010`) are rejected so
-//! nobody has to guess whether they are octal.
+//! (the rightmost) wins. A label of eight decimal octets
+//! (`10-0-0-1-192-168-1-1`) holds two IPv4 addresses, so it gives
+//! 192.168.1.1, not an IPv6 address. Octets with leading zeros (`010`) are
+//! rejected so nobody has to guess whether they are octal.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -54,13 +56,19 @@ fn dotted_v4(parts: &[&str]) -> Option<Ipv4Addr> {
 /// label), or IPv4 as four dash-separated octets or eight hex digits,
 /// optionally surrounded by other dash-separated words.
 fn single_label(label: &str) -> Option<IpAddr> {
+    let tokens: Vec<&str> = label.split('-').collect();
+    // Eight decimal octets also make a full IPv6 address
+    // (`10-0-0-1-192-168-1-1` as 10:0:0:1:192:168:1:1), but read as two
+    // IPv4 addresses they follow the rightmost-address rule like every
+    // other name, so take them as IPv4.
+    let two_ipv4 = tokens.len() == 8 && tokens.iter().all(|t| octet(t).is_some());
     if label.contains('-')
+        && !two_ipv4
         && let Ok(ip) = label.replace('-', ":").parse::<Ipv6Addr>()
     {
         return Some(IpAddr::V6(ip));
     }
 
-    let tokens: Vec<&str> = label.split('-').collect();
     for end in (0..tokens.len()).rev() {
         if end >= 3 {
             let w = &tokens[end - 3..=end];
@@ -163,6 +171,15 @@ mod tests {
         assert_eq!(ip("10-0-0-1.192-168-1-1"), v4("192.168.1.1"));
         assert_eq!(ip("1.2.3.4.5"), v4("2.3.4.5"));
         assert_eq!(ip("10.0.0.1.192-168-1-1"), v4("192.168.1.1"));
+        // Eight decimal octets in one label are two IPv4 addresses, not IPv6.
+        assert_eq!(ip("10-0-0-1-192-168-1-1"), v4("192.168.1.1"));
+        assert_eq!(ip("app-10-0-0-1-192-168-1-1"), v4("192.168.1.1"));
+        assert_eq!(ip("1-2-3-4-5-6-7-8"), v4("5.6.7.8"));
+        // Anything that is not a decimal octet keeps it IPv6.
+        assert_eq!(
+            ip("10-0-0-1-192-168-1-ff"),
+            Some("10:0:0:1:192:168:1:ff".parse().unwrap())
+        );
     }
 
     #[test]
