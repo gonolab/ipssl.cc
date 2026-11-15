@@ -9,20 +9,27 @@ pub mod parse;
 pub mod ratelimit;
 pub mod zone;
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use anyhow::{Context, anyhow, ensure};
 use hickory_server::Server;
+use hickory_server::server::RequestHandler;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::task::JoinSet;
 
 use crate::handler::Handler;
 
 /// How many responses may queue per TCP connection.
 const TCP_RESPONSE_BUFFER: usize = 32;
 
-/// Starts serving on already-bound sockets. Must be called inside a Tokio runtime.
+/// Starts serving on already-bound sockets, all in one server. Must be
+/// called inside a Tokio runtime. The server only reports a listener that
+/// stopped once every other one has stopped too; [`serve_until`] notices
+/// each one.
 pub fn serve(
     handler: Handler,
     udp: Vec<UdpSocket>,
@@ -37,6 +44,97 @@ pub fn serve(
         server.register_listener(listener, tcp_timeout, TCP_RESPONSE_BUFFER);
     }
     server
+}
+
+/// A bound DNS socket.
+pub enum Listener {
+    Udp(UdpSocket),
+    Tcp(TcpListener),
+}
+
+impl Listener {
+    /// `udp 0.0.0.0:53` or `tcp [::]:53`, for logs and errors.
+    fn describe(&self) -> String {
+        let (protocol, addr) = match self {
+            Self::Udp(socket) => ("udp", socket.local_addr()),
+            Self::Tcp(listener) => ("tcp", listener.local_addr()),
+        };
+        match addr {
+            Ok(addr) => format!("{protocol} {addr}"),
+            Err(_) => protocol.to_string(),
+        }
+    }
+}
+
+/// Serves DNS on every listener until `shutdown` completes, then stops
+/// them all. Must be called inside a Tokio runtime.
+///
+/// Each listener gets a server of its own. With one server for all of
+/// them, a listener that failed (some TCP `accept` errors end it) would
+/// only be reported once every other listener had stopped as well, so a
+/// dead TCP listener would go unnoticed while UDP still answered. Here the
+/// first listener to stop before `shutdown` ends the call with an error
+/// naming it, so the process can exit and the service manager restart it.
+pub async fn serve_until(
+    handler: Handler,
+    listeners: Vec<Listener>,
+    tcp_timeout: Duration,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let servers = listeners
+        .into_iter()
+        .map(|listener| {
+            let name = listener.describe();
+            let mut server = Server::new(handler.clone());
+            match listener {
+                Listener::Udp(socket) => server.register_socket(socket),
+                Listener::Tcp(listener) => {
+                    server.register_listener(listener, tcp_timeout, TCP_RESPONSE_BUFFER)
+                }
+            }
+            (name, server)
+        })
+        .collect();
+    supervise(servers, shutdown).await
+}
+
+/// Waits for `shutdown` or for the first server to stop, whichever comes
+/// first; see [`serve_until`].
+async fn supervise<T: RequestHandler>(
+    servers: Vec<(String, Server<T>)>,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    ensure!(!servers.is_empty(), "no DNS listener to serve on");
+    let mut stop = Vec::new();
+    let mut running = JoinSet::new();
+    for (name, mut server) in servers {
+        stop.push(server.shutdown_token().clone());
+        running.spawn(async move {
+            let result = server.block_until_done().await;
+            (name, result)
+        });
+    }
+
+    tokio::select! {
+        () = shutdown => {}
+        Some(ended) = running.join_next() => {
+            let (name, result) = ended.context("a DNS listener task panicked")?;
+            return Err(match result {
+                Ok(()) => anyhow!("{name} stopped serving"),
+                Err(e) => anyhow!("{name} stopped serving: {e}"),
+            });
+        }
+    }
+
+    for token in &stop {
+        token.cancel();
+    }
+    while let Some(ended) = running.join_next().await {
+        if let Ok((name, Err(e))) = ended {
+            tracing::warn!("{name} failed while shutting down: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// Binds a UDP socket. IPv6 sockets are IPv6-only, so `0.0.0.0:53` and
@@ -62,4 +160,54 @@ pub fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
     TcpListener::from_std(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::zone::Zone;
+
+    fn handler() -> Handler {
+        let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+        Handler::new(Zone::from_config(&config).unwrap())
+    }
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_listener_that_stops_ends_serving() {
+        let mut udp = Server::new(handler());
+        udp.register_socket(bind_udp(loopback()).unwrap());
+        // A server with nothing left to serve has stopped, like one whose
+        // listener failed.
+        let stopped = Server::new(handler());
+        let servers = vec![
+            ("udp 127.0.0.1:53".to_string(), udp),
+            ("tcp 127.0.0.1:53".to_string(), stopped),
+        ];
+        let error = supervise(servers, std::future::pending())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "tcp 127.0.0.1:53 stopped serving");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_every_listener() {
+        let listeners = vec![
+            Listener::Udp(bind_udp(loopback()).unwrap()),
+            Listener::Tcp(bind_tcp(loopback()).unwrap()),
+        ];
+        let timeout = Duration::from_secs(1);
+        serve_until(handler(), listeners, timeout, async {})
+            .await
+            .unwrap();
+        assert!(
+            serve_until(handler(), Vec::new(), timeout, async {})
+                .await
+                .is_err()
+        );
+    }
 }

@@ -8,6 +8,7 @@ use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+use ipssl::Listener;
 use ipssl::acme::{Api, Challenges, Node};
 use ipssl::config::Config;
 use ipssl::handler::Handler;
@@ -65,12 +66,13 @@ async fn main() -> Result<()> {
     let (config, zone) = load(&args.config)?;
     warn_about(&config);
     let limiter = RateLimiter::from_config(&config.rate_limit)?;
-    let mut udp = Vec::new();
-    let mut tcp = Vec::new();
+    let mut listeners = Vec::new();
     for addr in &config.listen {
-        udp.push(ipssl::bind_udp(*addr).with_context(|| format!("binding udp {addr}"))?);
-        tcp.push(ipssl::bind_tcp(*addr).with_context(|| format!("binding tcp {addr}"))?);
+        let udp = ipssl::bind_udp(*addr).with_context(|| format!("binding udp {addr}"))?;
+        let tcp = ipssl::bind_tcp(*addr).with_context(|| format!("binding tcp {addr}"))?;
         info!(%addr, "listening (udp + tcp)");
+        listeners.push(Listener::Udp(udp));
+        listeners.push(Listener::Tcp(tcp));
     }
 
     if limiter.is_none() {
@@ -110,22 +112,18 @@ async fn main() -> Result<()> {
         handler.clone(),
     ));
 
-    let mut server = ipssl::serve(
+    // A listener that stops on its own ends this with an error, and the
+    // non-zero exit lets systemd restart the service with all of them.
+    ipssl::serve_until(
         handler,
-        udp,
-        tcp,
+        listeners,
         Duration::from_secs(config.tcp_timeout_secs),
-    );
-
-    let token = server.shutdown_token().clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("shutting down");
-        token.cancel();
-    });
-
-    server.block_until_done().await?;
-    Ok(())
+        async {
+            shutdown_signal().await;
+            info!("shutting down");
+        },
+    )
+    .await
 }
 
 /// Loads the config at `path`, checks it and builds its zone: the same
