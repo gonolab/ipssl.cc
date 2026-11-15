@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use ipnet::IpNet;
 
 use crate::config::RateLimitConfig;
@@ -75,22 +75,10 @@ impl RateLimiter {
     /// Builds a limiter from the config, or `None` when limiting is off
     /// (`responses_per_second = 0`).
     pub fn from_config(cfg: &RateLimitConfig) -> Result<Option<Self>> {
+        cfg.validate()?;
         if cfg.responses_per_second == 0 {
             return Ok(None);
         }
-        ensure!(cfg.burst >= 1, "rate_limit.burst must be at least 1");
-        ensure!(
-            cfg.ipv4_prefix <= 32,
-            "rate_limit.ipv4_prefix must be 0..=32"
-        );
-        ensure!(
-            cfg.ipv6_prefix <= 128,
-            "rate_limit.ipv6_prefix must be 0..=128"
-        );
-        ensure!(
-            cfg.max_tracked >= 1,
-            "rate_limit.max_tracked must be at least 1"
-        );
 
         let mut limiter = Self::new(
             f64::from(cfg.responses_per_second),
@@ -106,7 +94,8 @@ impl RateLimiter {
 
     /// A limiter allowing `rate` requests a second (fractions are fine) and
     /// bursts of `burst` per client network. Limited requests are dropped:
-    /// it never slips. Arguments must be in range (see [`Self::from_config`]).
+    /// it never slips. Arguments must be in range (see
+    /// [`RateLimitConfig::validate_networks`]).
     pub fn new(
         rate: f64,
         burst: u32,

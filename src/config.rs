@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use ipnet::IpNet;
 use serde::Deserialize;
 
@@ -14,7 +14,8 @@ pub struct Config {
     /// The zone this server is authoritative for, e.g. `ipssl.cc`.
     pub domain: String,
 
-    /// Addresses to serve DNS on, both UDP and TCP.
+    /// Addresses to serve DNS on, both UDP and TCP. See [`Config::validate`]
+    /// for what is allowed.
     #[serde(default = "default_listen")]
     pub listen: Vec<SocketAddr>,
 
@@ -188,6 +189,37 @@ pub struct RateLimitConfig {
     pub max_tracked: usize,
 }
 
+impl RateLimitConfig {
+    /// Checks the settings the DNS server's limiter uses. Nothing is
+    /// checked while limiting is off (`responses_per_second = 0`).
+    pub fn validate(&self) -> Result<()> {
+        if self.responses_per_second == 0 {
+            return Ok(());
+        }
+        ensure!(self.burst >= 1, "rate_limit.burst must be at least 1");
+        self.validate_networks()
+    }
+
+    /// Checks how clients are grouped into networks and how many are
+    /// tracked. The API's limiter uses these settings too, even when the
+    /// DNS server's limiting is off.
+    pub fn validate_networks(&self) -> Result<()> {
+        ensure!(
+            self.ipv4_prefix <= 32,
+            "rate_limit.ipv4_prefix must be 0..=32"
+        );
+        ensure!(
+            self.ipv6_prefix <= 128,
+            "rate_limit.ipv6_prefix must be 0..=128"
+        );
+        ensure!(
+            self.max_tracked >= 1,
+            "rate_limit.max_tracked must be at least 1"
+        );
+        Ok(())
+    }
+}
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
@@ -239,6 +271,55 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
+    /// Checks the settings the DNS server would otherwise trip over only
+    /// at startup or later. `--check`, startup and reload all run it, so a
+    /// config that passes is one the server accepts. The zone's own data
+    /// is checked by [`crate::zone::Zone::from_config`].
+    pub fn validate(&self) -> Result<()> {
+        // With no listener the server would have nothing to do and exit at
+        // once, and the service manager would restart it in a loop.
+        ensure!(
+            !self.listen.is_empty(),
+            "listen is empty: give at least one address to serve DNS on"
+        );
+        for addr in &self.listen {
+            // UDP and TCP bind separately, so port 0 would give them two
+            // different ports, and TCP fallback after a truncated UDP
+            // answer would go nowhere.
+            ensure!(
+                addr.port() != 0,
+                "listen {addr}: port 0 is not allowed, give the port to serve DNS on"
+            );
+        }
+        self.check_tcp_overlaps()?;
+        self.rate_limit.validate()
+    }
+
+    /// Fails when two of the TCP listeners the DNS server opens (every
+    /// `listen` address, `[metrics]` and `[acme]`) would need the same port,
+    /// since the second one could not be bound.
+    fn check_tcp_overlaps(&self) -> Result<()> {
+        let mut listeners: Vec<(&str, SocketAddr)> =
+            self.listen.iter().map(|addr| ("listen", *addr)).collect();
+        if let Some(metrics) = &self.metrics {
+            listeners.push(("metrics.listen", metrics.listen));
+        }
+        if let Some(acme) = &self.acme {
+            listeners.push(("acme.listen", acme.listen));
+        }
+        for (i, &(name_a, a)) in listeners.iter().enumerate() {
+            for &(name_b, b) in &listeners[i + 1..] {
+                ensure!(
+                    !tcp_overlap(a, b),
+                    "{name_a} {a} and {name_b} {b} overlap: both need TCP port {} \
+                     on the same addresses; use different ports",
+                    a.port()
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Names of the settings that differ from `running` but only take
     /// effect after a restart. Everything else is applied on reload.
     pub fn restart_only_changes(&self, running: &Config) -> Vec<&'static str> {
@@ -260,6 +341,18 @@ impl Config {
         }
         changed
     }
+}
+
+/// Whether TCP listeners on `a` and `b` would need the same socket: same
+/// port and address family, and the same address or a wildcard on either
+/// side. IPv6 listeners are IPv6-only (see [`crate::bind_tcp`]), so
+/// `0.0.0.0:53` and `[::]:53` do not overlap. Port 0 picks a free port, so
+/// it never clashes.
+fn tcp_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+    a.port() != 0
+        && a.port() == b.port()
+        && a.is_ipv4() == b.is_ipv4()
+        && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
 fn default_acme_listen() -> SocketAddr {
@@ -391,6 +484,77 @@ mod tests {
                 "acme"
             ]
         );
+    }
+
+    fn err(result: Result<()>) -> String {
+        format!("{:#}", result.unwrap_err())
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        let config = Config::parse(include_str!("../config.example.toml")).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn listen_must_not_be_empty() {
+        let config = Config::parse(&format!("listen = []\n{MINIMAL}")).unwrap();
+        assert!(err(config.validate()).contains("listen is empty"));
+    }
+
+    #[test]
+    fn listen_port_zero_is_rejected() {
+        let config = Config::parse(&format!("listen = [\"127.0.0.1:0\"]\n{MINIMAL}")).unwrap();
+        assert!(err(config.validate()).contains("port 0"));
+    }
+
+    #[test]
+    fn overlapping_tcp_listeners_are_rejected() {
+        let check = |listen: &str, sections: &str| {
+            let text = format!("listen = [{listen}]\n{MINIMAL}\n{sections}");
+            Config::parse(&text).unwrap().validate()
+        };
+        let metrics = |addr: &str| format!("[metrics]\nlisten = \"{addr}\"\n");
+        let acme = |addr: &str| format!("[acme]\nlisten = \"{addr}\"\n");
+
+        // Same address and port.
+        assert!(err(check("\"127.0.0.1:53\"", &metrics("127.0.0.1:53"))).contains("overlap"));
+        // A wildcard covers every specific address of its family.
+        assert!(check("\"0.0.0.0:9153\"", &metrics("127.0.0.1:9153")).is_err());
+        assert!(check("\"[::]:8053\"", &acme("[2001:db8::1]:8053")).is_err());
+        assert!(
+            check(
+                "\"[::]:53\"",
+                &format!("{}{}", metrics("[::1]:9000"), acme("[::]:9000"))
+            )
+            .is_err()
+        );
+        // Twice in `listen`.
+        assert!(check("\"0.0.0.0:53\", \"198.51.100.1:53\"", "").is_err());
+
+        // Another port, another address or another family is fine.
+        check("\"0.0.0.0:53\", \"[::]:53\"", "").unwrap();
+        check("\"127.0.0.1:53\"", &metrics("127.0.0.2:53")).unwrap();
+        check("\"0.0.0.0:8053\"", &acme("[::]:8053")).unwrap();
+        check(
+            "\"0.0.0.0:53\"",
+            &format!("{}{}", metrics("127.0.0.1:9153"), acme("0.0.0.0:8053")),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rate_limit_is_checked_only_when_on() {
+        let config = |settings: &str| {
+            Config::parse(&format!("{MINIMAL}\n[rate_limit]\n{settings}\n")).unwrap()
+        };
+        assert!(err(config("burst = 0").validate()).contains("burst"));
+        assert!(config("ipv4_prefix = 33").validate().is_err());
+        assert!(config("ipv6_prefix = 129").validate().is_err());
+        assert!(config("max_tracked = 0").validate().is_err());
+        config("responses_per_second = 0\nburst = 0\nmax_tracked = 0")
+            .validate()
+            .unwrap();
     }
 
     #[test]

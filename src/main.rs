@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,8 +46,8 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
     if args.acme_api {
+        let config = Config::load(&args.config)?;
         let api = Api::from_config(&config)?;
         if args.check {
             info!(nodes = ?api.nodes(), "config OK");
@@ -55,19 +55,16 @@ async fn main() -> Result<()> {
         }
         return run_acme_api(&config, api).await;
     }
-
-    let zone = Zone::from_config(&config)?;
-    let limiter = RateLimiter::from_config(&config.rate_limit)?;
-    if let Some(acme) = &config.acme
-        && acme.writers.is_empty()
-    {
-        warn!("acme.writers is empty, so no challenge can be published");
-    }
     if args.check {
+        let (config, _) = load(&args.config)?;
+        warn_about(&config);
         info!("config OK");
         return Ok(());
     }
 
+    let (config, zone) = load(&args.config)?;
+    warn_about(&config);
+    let limiter = RateLimiter::from_config(&config.rate_limit)?;
     let mut udp = Vec::new();
     let mut tcp = Vec::new();
     for addr in &config.listen {
@@ -97,9 +94,9 @@ async fn main() -> Result<()> {
 
     if let Some(metrics) = &config.metrics {
         let addr = metrics.listen;
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("binding metrics {addr}"))?;
+        // IPv6-only for IPv6 addresses, like every other listener, so the
+        // overlap check in `Config::validate` holds.
+        let listener = ipssl::bind_tcp(addr).with_context(|| format!("binding metrics {addr}"))?;
         info!(%addr, "serving metrics at /metrics");
         let handler = handler.clone();
         tokio::spawn(ipssl::http::serve_metrics(listener, move || {
@@ -131,6 +128,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Loads the config at `path`, checks it and builds its zone: the same
+/// steps for `--check`, startup and reload, so a config one accepts the
+/// others accept too.
+fn load(path: &Path) -> Result<(Config, Zone)> {
+    let config = Config::load(path)?;
+    config
+        .validate()
+        .with_context(|| format!("checking {}", path.display()))?;
+    let zone = Zone::from_config(&config)?;
+    Ok((config, zone))
+}
+
+/// Logs settings that are allowed but probably not what was meant.
+fn warn_about(config: &Config) {
+    if let Some(acme) = &config.acme
+        && acme.writers.is_empty()
+    {
+        warn!("acme.writers is empty, so no challenge can be published");
+    }
+}
+
 /// Serves the DNS-01 challenge API until SIGTERM or Ctrl-C. Config changes
 /// need a restart.
 async fn run_acme_api(config: &Config, api: Api) -> Result<()> {
@@ -160,7 +178,8 @@ async fn purge_challenges(store: Arc<Challenges>) {
 }
 
 /// Reloads the config on every SIGHUP (`systemctl reload ipssl-dns`).
-/// A config that fails to load is logged and the running zone kept.
+/// A config that fails to load or validate is logged and the running one
+/// kept.
 #[cfg(unix)]
 async fn reload_on_sighup(path: PathBuf, running: Config, handler: Handler) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -179,11 +198,11 @@ async fn reload_on_sighup(path: PathBuf, running: Config, handler: Handler) {
 /// Loads the config at `path` into `handler` and returns the new SOA serial.
 /// `running` is the config the process started with: settings that need a
 /// restart are compared against it, so the warning repeats on every reload
-/// until the process is restarted.
+/// until the process is restarted. They are still validated, so a reload
+/// never accepts a config a restart would refuse.
 #[cfg(unix)]
-fn reload(path: &std::path::Path, running: &Config, handler: &Handler) -> Result<u32> {
-    let config = Config::load(path)?;
-    let zone = Zone::from_config(&config)?;
+fn reload(path: &Path, running: &Config, handler: &Handler) -> Result<u32> {
+    let (config, zone) = load(path)?;
     for setting in config.restart_only_changes(running) {
         warn!(setting, "changed, but only takes effect after a restart");
     }

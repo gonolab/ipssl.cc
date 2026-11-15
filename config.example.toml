@@ -1,14 +1,19 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
 # SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`,
 # `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]`, which need
-# a restart.
+# a restart. A reload checks the whole file the way `--check` and startup
+# do, and keeps the running config if it fails.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live.
 
 # The zone this server is authoritative for
 domain = "ipssl.cc"
 
-# Addresses to listen on, for both UDP and TCP.
+# Addresses to listen on, for both UDP and TCP: at least one, with a real
+# port (not 0). They must not overlap each other or the `[metrics]` and
+# `[acme]` listeners (a wildcard such as 0.0.0.0 covers every address of
+# its family). IPv6 addresses are IPv6-only, so 0.0.0.0:53 and [::]:53 can
+# be used together.
 # On Ubuntu, systemd-resolved holds 127.0.0.53:53, which can make binding
 # 0.0.0.0:53 fail: either disable its stub listener or list the server's
 # public IP here instead.
