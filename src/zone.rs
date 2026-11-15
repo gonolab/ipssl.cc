@@ -211,7 +211,7 @@ impl Zone {
             cfg.domain.trim_end_matches('.')
         ))?;
 
-        Ok(Self {
+        let zone = Self {
             origin_labels: origin.iter().count(),
             origin: origin_lower,
             negative_soa,
@@ -221,7 +221,22 @@ impl Zone {
             ip_ttl: cfg.ttl.ip,
             blocklist: cfg.blocklist.clone(),
             serial: cfg.soa.serial,
-        })
+        };
+
+        // With [acme] on, TXT queries for names that can take a challenge
+        // are answered from the challenge store, so records configured for
+        // such a name would never be served.
+        if cfg.acme.is_some() {
+            for label in cfg.hosts.keys() {
+                let name = host_name(label, &cfg.domain, &origin)?;
+                ensure!(
+                    zone.check_challenge(&name).is_err(),
+                    "host {label:?}: with [acme] on, TXT answers for this name come from the DNS-01 challenge API; remove the host or turn [acme] off"
+                );
+            }
+        }
+
+        Ok(zone)
     }
 
     /// The SOA serial.
@@ -1301,6 +1316,26 @@ mod tests {
         ] {
             assert!(zone.challenge_name(name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn challenge_hosts_clash_with_acme() {
+        let host = "[hosts.\"_acme-challenge.10-0-2-2\"]\ntxt = [\"manual\"]";
+        // Without [acme] the record is served as configured.
+        let zone = zone_with(host).unwrap();
+        assert_eq!(
+            rdata(&query_zone(
+                &zone,
+                "_acme-challenge.10-0-2-2.ipssl.cc.",
+                RecordType::TXT
+            )),
+            ["manual"]
+        );
+        // With [acme] the challenge store would hide it.
+        let err = zone_with(&format!("{host}\n[acme]")).err().unwrap();
+        assert!(err.to_string().contains("[acme]"), "{err}");
+        // Names that cannot take a challenge keep their records.
+        zone_with("[hosts.\"_acme-challenge.198-51-100-10\"]\ntxt = [\"manual\"]\n[acme]").unwrap();
     }
 
     #[test]
