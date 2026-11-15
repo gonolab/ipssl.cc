@@ -230,7 +230,9 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
     })?;
     let name = zone.challenge_name(&body.fqdn).map_err(|e| {
         let status = match e {
-            ChallengeError::PublicAddress | ChallengeError::Blocked => 403,
+            ChallengeError::PublicAddress
+            | ChallengeError::FixedAddress
+            | ChallengeError::Blocked => 403,
             _ => 400,
         };
         error(status, e.message())

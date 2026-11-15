@@ -295,28 +295,26 @@ impl Zone {
     }
 
     /// Checks that `name` is `_acme-challenge.<name>` in this zone, where
-    /// `<name>` holds a private address. Public addresses are left to
+    /// `<name>` resolves to a private address. Public addresses are left to
     /// HTTP-01 and TLS-ALPN-01, which only whoever holds the address can
     /// pass; letting anyone publish challenges for them would let anyone
     /// get a certificate for someone else's server.
+    ///
+    /// `<name>` is judged by what DNS answers for it: a fixed host with an
+    /// address of its own never qualifies, whatever address its name holds.
     pub fn check_challenge(&self, name: &Name) -> Result<IpAddr, ChallengeError> {
-        if !self.origin.zone_of(&LowerName::new(name)) {
-            return Err(ChallengeError::OutsideZone);
+        let base = self.challenge_base(name)?;
+        let fixed = self.hosts.get(&LowerName::new(&base));
+        if fixed.is_some_and(|records| records.iter().any(is_address)) {
+            return Err(ChallengeError::FixedAddress);
         }
-        let labels = self.relative_labels(name);
-        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-        match labels.split_first() {
-            Some((&CHALLENGE_LABEL, rest)) => {
-                let ip = extract_ip(rest).ok_or(ChallengeError::NoAddress)?;
-                if self.is_blocked(ip) {
-                    Err(ChallengeError::Blocked)
-                } else if !is_private(ip) {
-                    Err(ChallengeError::PublicAddress)
-                } else {
-                    Ok(ip)
-                }
-            }
-            _ => Err(ChallengeError::NotChallenge),
+        let ip = self.embedded_ip(&base).ok_or(ChallengeError::NoAddress)?;
+        if self.is_blocked(ip) {
+            Err(ChallengeError::Blocked)
+        } else if !is_private(ip) {
+            Err(ChallengeError::PublicAddress)
+        } else {
+            Ok(ip)
         }
     }
 
@@ -337,6 +335,18 @@ impl Zone {
             .map(|v| Record::from_rdata(qname.clone(), 0, RData::TXT(TXT::new(vec![v]))))
             .collect();
         self.answer(answers)
+    }
+
+    /// The name a challenge name is for: `10-0-2-2.<domain>` for
+    /// `_acme-challenge.10-0-2-2.<domain>`.
+    fn challenge_base(&self, name: &Name) -> Result<Name, ChallengeError> {
+        if !self.origin.zone_of(&LowerName::new(name)) {
+            return Err(ChallengeError::OutsideZone);
+        }
+        match self.relative_labels(name).first() {
+            Some(label) if label == CHALLENGE_LABEL => Ok(name.base_name()),
+            _ => Err(ChallengeError::NotChallenge),
+        }
     }
 
     /// The lowercase labels of `name` left of the apex, in normal order.
@@ -442,6 +452,8 @@ pub enum ChallengeError {
     OutsideZone,
     NotChallenge,
     NoAddress,
+    /// The name is a fixed host with its own A or AAAA records.
+    FixedAddress,
     PublicAddress,
     Blocked,
 }
@@ -454,8 +466,11 @@ impl ChallengeError {
             Self::OutsideZone => "fqdn is outside this zone",
             Self::NotChallenge => "fqdn must start with _acme-challenge.",
             Self::NoAddress => "fqdn holds no IP address",
+            Self::FixedAddress => {
+                "this name has a fixed address set by the zone operator, so it cannot use this API"
+            }
             Self::PublicAddress => {
-                "only names with private addresses can use DNS-01; validate public addresses with HTTP-01 or TLS-ALPN-01"
+                "only names with private addresses can use this API; for a public address, run your ACME client on the machine that holds it (wildcard certificates are not available for names with public addresses)"
             }
             Self::Blocked => "this address is blocked",
         }
@@ -1205,8 +1220,9 @@ mod tests {
                 "x._acme-challenge.10-0-2-2.ipssl.cc",
                 ChallengeError::NotChallenge,
             ),
-            ("_acme-challenge.ipssl.cc", ChallengeError::NoAddress),
-            ("_acme-challenge.www.ipssl.cc", ChallengeError::NoAddress),
+            ("_acme-challenge.ipssl.cc", ChallengeError::FixedAddress),
+            ("_acme-challenge.nested.ipssl.cc", ChallengeError::NoAddress),
+            ("_acme-challenge.www.ipssl.cc", ChallengeError::FixedAddress),
             (
                 "_acme-challenge.198-51-100-10.ipssl.cc",
                 ChallengeError::PublicAddress,
@@ -1235,6 +1251,41 @@ mod tests {
                 .to_string(),
             "_acme-challenge.10-0-2-2.ipssl.cc."
         );
+    }
+
+    #[test]
+    fn challenge_eligibility_follows_the_dns_answer() {
+        let zone = zone_with(
+            r#"
+            [hosts."10-0-2-9"]
+            a = ["8.8.8.8"]
+
+            [hosts."10-0-2-7"]
+            aaaa = ["2001:db8::7"]
+
+            [hosts."10-0-2-8"]
+            txt = ["site-verification=1"]
+            "#,
+        )
+        .unwrap();
+        // DNS answers the configured address, not the one in the name.
+        for name in [
+            "_acme-challenge.10-0-2-9.ipssl.cc",
+            "_acme-challenge.10-0-2-7.ipssl.cc",
+        ] {
+            assert_eq!(
+                zone.challenge_name(name).err(),
+                Some(ChallengeError::FixedAddress),
+                "{name}"
+            );
+        }
+        // These resolve to the private address in their names.
+        for name in [
+            "_acme-challenge.10-0-2-8.ipssl.cc",
+            "_acme-challenge.app.10-0-2-9.ipssl.cc",
+        ] {
+            assert!(zone.challenge_name(name).is_ok(), "{name}");
+        }
     }
 
     #[test]
