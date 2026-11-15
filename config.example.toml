@@ -54,7 +54,9 @@ ipv4_prefix = 24
 ipv6_prefix = 56
 # Never limited, e.g. your monitoring
 exempt = []
-# Most client networks tracked at once (bounds memory)
+# Most client networks tracked at once (bounds memory). Approximate: the
+# table has 32 parts that fill up on their own, each holding max_tracked / 32
+# rounded up, so a few new networks may share one limit a little early.
 max_tracked = 100000
 
 # Prometheus metrics at http://<listen>/metrics. Remove the section to turn

@@ -134,7 +134,12 @@ impl RateLimiter {
                     })
                 })
                 .collect(),
-            shard_capacity: max_tracked / shards,
+            // Rounded up, so the table never holds fewer networks than
+            // configured. The limit is approximate: shards fill up on their
+            // own, so a busy shard can send new networks to the shared
+            // overflow bucket a little before `max_tracked` is reached, and
+            // up to `shards - 1` more networks may be tracked in total.
+            shard_capacity: max_tracked.div_ceil(shards),
             overflow: Mutex::new(Bucket::full(burst, now)),
         }
     }
@@ -352,6 +357,22 @@ mod tests {
         let tracked = rl.tracked();
         assert!(tracked <= SHARDS);
         assert_eq!(allowed, tracked + 1);
+    }
+
+    #[test]
+    fn small_tables_track_as_many_networks_as_configured() {
+        // Room for 63 networks over 32 shards: two in each, not one.
+        let rl = limiter(RateLimitConfig {
+            max_tracked: 63,
+            ..cfg(1, 1, 0)
+        });
+        let now = Instant::now();
+        for a in 0..=255u8 {
+            for b in 0..4u8 {
+                rl.check_at(IpAddr::V4(Ipv4Addr::new(10, a, b, 1)), now);
+            }
+        }
+        assert_eq!(rl.tracked(), 64);
     }
 
     #[test]
