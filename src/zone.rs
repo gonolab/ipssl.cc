@@ -285,12 +285,18 @@ impl Zone {
     /// Parses `fqdn` (the trailing dot is optional) and checks that it can
     /// hold a DNS-01 challenge, see [`Self::check_challenge`].
     pub fn challenge_name(&self, fqdn: &str) -> Result<LowerName, ChallengeError> {
-        let trimmed = fqdn.trim().trim_end_matches('.');
-        if trimmed.is_empty() {
-            return Err(ChallengeError::Invalid);
-        }
-        let name = Name::from_ascii(format!("{trimmed}.")).map_err(|_| ChallengeError::Invalid)?;
+        let name = parse_fqdn(fqdn)?;
         self.check_challenge(&name)?;
+        Ok(LowerName::new(&name))
+    }
+
+    /// Parses `fqdn` like [`Self::challenge_name`], for taking a value down:
+    /// any `_acme-challenge` name in the zone will do. Taking a value down
+    /// publishes nothing, and a value published before its address was
+    /// blocked must still be removable, or it comes back once unblocked.
+    pub fn cleanup_name(&self, fqdn: &str) -> Result<LowerName, ChallengeError> {
+        let name = parse_fqdn(fqdn)?;
+        self.challenge_base(&name)?;
         Ok(LowerName::new(&name))
     }
 
@@ -610,6 +616,15 @@ fn fqdn(name: &str) -> Result<Name> {
     Name::from_ascii(format!("{name}."))
         .map(|n| n.to_lowercase())
         .with_context(|| format!("invalid domain name {name:?}"))
+}
+
+/// Parses a name sent to the challenge API; the trailing dot is optional.
+fn parse_fqdn(fqdn: &str) -> Result<Name, ChallengeError> {
+    let trimmed = fqdn.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return Err(ChallengeError::Invalid);
+    }
+    Name::from_ascii(format!("{trimmed}.")).map_err(|_| ChallengeError::Invalid)
 }
 
 /// `hostmaster@ipssl.cc` -> `hostmaster.ipssl.cc.` (the SOA RNAME format).
@@ -1286,6 +1301,39 @@ mod tests {
         ] {
             assert!(zone.challenge_name(name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn cleanup_names() {
+        let zone = zone_with("[hosts.\"10-0-2-9\"]\na = [\"8.8.8.8\"]").unwrap();
+        // Any challenge name in the zone, whether or not it could take a
+        // value now.
+        for ok in [
+            "_acme-challenge.10-0-2-2.ipssl.cc",
+            "_acme-challenge.203-0-113-10.ipssl.cc.",
+            "_acme-challenge.198-51-100-10.ipssl.cc",
+            "_acme-challenge.10-0-2-9.ipssl.cc",
+            "_acme-challenge.www.ipssl.cc",
+        ] {
+            assert!(zone.cleanup_name(ok).is_ok(), "{ok}");
+        }
+        for (bad, why) in [
+            ("", ChallengeError::Invalid),
+            ("_acme-challenge..ipssl.cc", ChallengeError::Invalid),
+            (
+                "_acme-challenge.10-0-2-2.example.com",
+                ChallengeError::OutsideZone,
+            ),
+            ("10-0-2-2.ipssl.cc", ChallengeError::NotChallenge),
+        ] {
+            assert_eq!(zone.cleanup_name(bad).err(), Some(why), "{bad:?}");
+        }
+        assert_eq!(
+            zone.cleanup_name("_ACME-challenge.203-0-113-10.ipssl.cc")
+                .unwrap()
+                .to_string(),
+            "_acme-challenge.203-0-113-10.ipssl.cc."
+        );
     }
 
     #[test]

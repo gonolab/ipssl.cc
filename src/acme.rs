@@ -228,7 +228,13 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
             r#"expected a JSON body {"fqdn": "...", "value": "..."}"#,
         )
     })?;
-    let name = zone.challenge_name(&body.fqdn).map_err(|e| {
+    // Taking a value down publishes nothing, so cleanup takes any challenge
+    // name in the zone; only present needs one that can take a value now.
+    let name = match route(req) {
+        Ok(Action::Cleanup) => zone.cleanup_name(&body.fqdn),
+        _ => zone.challenge_name(&body.fqdn),
+    };
+    let name = name.map_err(|e| {
         let status = match e {
             ChallengeError::PublicAddress
             | ChallengeError::FixedAddress
