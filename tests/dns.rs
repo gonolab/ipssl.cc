@@ -210,6 +210,30 @@ async fn oversized_udp_answer_is_cleanly_truncated() {
 }
 
 #[tokio::test]
+async fn largest_rrset_still_goes_out_over_tcp() {
+    // 243 of these TXT records are the most that fit in a 65535-byte
+    // message (hickory stops compressing names after 120 of them), so the
+    // zone takes 243 and refuses 244.
+    let config = |count: usize| {
+        let values: Vec<String> = (0..count)
+            .map(|i| format!("\"{i:03}{}\"", "A".repeat(247)))
+            .collect();
+        let text = format!(
+            "{EXAMPLE_CONFIG}\n[hosts.big]\ntxt = [{}]\n",
+            values.join(", ")
+        );
+        Config::parse(&text).unwrap()
+    };
+    assert!(Zone::from_config(&config(244)).is_err());
+
+    let server = start_with(config(243));
+    let resp = over_tcp(server.tcp, &query("big.ipssl.cc.", RecordType::TXT)).await;
+    assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
+    assert!(!resp.metadata.truncation);
+    assert_eq!(resp.answers.len(), 243);
+}
+
+#[tokio::test]
 async fn names_without_records_are_nodata() {
     // Resolvers that minimise queries ask for `1.ipssl.cc` on the way to
     // `10.0.0.1.ipssl.cc`; an NXDOMAIN there would stop them short.

@@ -3,10 +3,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use hickory_server::proto::op::ResponseCode;
 use hickory_server::proto::rr::rdata::{A, AAAA, CAA, MX, NS, SOA, TXT};
 use hickory_server::proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
+use hickory_server::proto::serialize::binary::{BinEncodable, BinEncoder};
 use ipnet::IpNet;
 
 use crate::acme::{CHALLENGE_LABEL, is_private};
@@ -16,6 +17,15 @@ use crate::parse::extract_ip;
 /// `ip.<domain>` answers TXT queries with the address of whoever asked
 /// (usually the user's recursive resolver). Handy for debugging.
 const WHOAMI_LABEL: &str = "ip";
+
+/// Largest TTL resolvers take as given (RFC 2181 section 8): above it the
+/// top bit is set, and many resolvers then treat the TTL as 0. Also the
+/// upper bound of the SOA timers (RFC 1035 section 3.3.13).
+const MAX_TTL: u32 = i32::MAX as u32;
+
+/// Largest DNS message. TCP frames each one with a 16-bit length
+/// (RFC 1035 section 4.2.2), so a bigger answer cannot be sent at all.
+const MAX_MESSAGE: usize = 65_535;
 
 /// The outcome of a lookup, ready to be put into a response message.
 #[derive(Debug)]
@@ -46,10 +56,13 @@ pub struct Zone {
 impl Zone {
     pub fn from_config(cfg: &Config) -> Result<Self> {
         let origin = fqdn(&cfg.domain).context("invalid `domain`")?;
+        // An empty `domain` would make this server claim the whole DNS.
+        ensure!(!origin.is_root(), "`domain` must not be empty");
         ensure!(
             !cfg.nameservers.is_empty(),
             "at least one entry in `nameservers` is required"
         );
+        check_timers(cfg)?;
         let ttl = cfg.ttl.records;
         let mut hosts: HashMap<LowerName, Vec<Record>> = HashMap::new();
 
@@ -74,14 +87,12 @@ impl Zone {
             apex.push(Record::from_rdata(origin.clone(), ttl, RData::NS(NS(name))));
         }
         for issuer in &cfg.caa_issuers {
-            let mut name = Name::from_ascii(issuer)
-                .with_context(|| format!("invalid CAA issuer {issuer:?}"))?;
-            name.set_fqdn(false);
-            let caa = CAA::new_issue(false, Some(name), vec![]);
+            let caa = CAA::new_issue(false, Some(caa_issuer(issuer)?), vec![]);
             apex.push(Record::from_rdata(origin.clone(), ttl, RData::CAA(caa)));
         }
 
         // Addresses for in-zone name servers.
+        let mut in_zone_ns = Vec::new();
         for ns in &cfg.nameservers {
             let name = fqdn(&ns.name)?;
             if !origin.zone_of(&name) {
@@ -104,16 +115,20 @@ impl Zone {
                     RData::AAAA(AAAA(*ip)),
                 ));
             }
+            in_zone_ns.push((ns.name.as_str(), LowerName::new(&name)));
         }
 
         // Fixed hosts from the config.
+        let mut host_labels: HashMap<LowerName, &str> = HashMap::new();
         for (label, host) in &cfg.hosts {
-            let name = if label == "@" {
-                origin.clone()
-            } else {
-                fqdn(&format!("{label}.{}", cfg.domain.trim_end_matches('.')))
-                    .with_context(|| format!("invalid host {label:?}"))?
-            };
+            let name = host_name(label, &cfg.domain, &origin)?;
+            // Owner names ignore case, so `MailAlias` and `mailalias` would
+            // become one name and slip past the per-host checks below.
+            if let Some(other) = host_labels.insert(LowerName::new(&name), label) {
+                bail!(
+                    "hosts {other:?} and {label:?} are the same name (DNS names ignore case); merge them"
+                );
+            }
             let records = hosts.entry(LowerName::new(&name)).or_default();
             for ip in &host.a {
                 records.push(Record::from_rdata(name.clone(), ttl, RData::A(A(*ip))));
@@ -129,22 +144,55 @@ impl Zone {
                 let data = RData::TXT(txt_record(txt));
                 records.push(Record::from_rdata(name.clone(), ttl, data));
             }
-            let null_mx = host.mx.iter().any(|mx| mx.exchange.trim() == ".");
+            let mut exchanges = Vec::with_capacity(host.mx.len());
+            for mx in &host.mx {
+                let exchange = mx.exchange.trim();
+                // Without its final dot, `192.0.2.15.` is an address too.
+                ensure!(
+                    exchange.trim_end_matches('.').parse::<IpAddr>().is_err(),
+                    "host {label:?}: MX exchange must be a host name, not an address: {exchange}"
+                );
+                let target = fqdn(exchange)
+                    .with_context(|| format!("host {label:?}: invalid MX exchange"))?;
+                exchanges.push((mx.preference, target));
+            }
+            // An exchange of `.` is a null MX (RFC 7505).
+            let null_mx = exchanges.iter().any(|(_, target)| target.is_root());
             ensure!(
-                !null_mx || (host.mx.len() == 1 && host.mx[0].preference == 0),
+                !null_mx || (exchanges.len() == 1 && exchanges[0].0 == 0),
                 "host {label:?}: a null MX (exchange \".\") must be the only MX and have preference 0"
             );
-            for mx in &host.mx {
-                ensure!(
-                    mx.exchange.parse::<IpAddr>().is_err(),
-                    "host {label:?}: MX exchange must be a host name, not an address: {}",
-                    mx.exchange
-                );
-                let exchange = fqdn(&mx.exchange)
-                    .with_context(|| format!("host {label:?}: invalid MX exchange"))?;
-                let data = RData::MX(MX::new(mx.preference, exchange));
+            for (preference, exchange) in exchanges {
+                let data = RData::MX(MX::new(preference, exchange));
                 records.push(Record::from_rdata(name.clone(), ttl, data));
             }
+        }
+
+        // An RRset holds each record once (RFC 2181 section 5), even when it
+        // is configured twice, e.g. a name server address repeated under
+        // [hosts].
+        for records in hosts.values_mut() {
+            let mut unique: Vec<Record> = Vec::with_capacity(records.len());
+            for record in records.drain(..) {
+                if !unique.contains(&record) {
+                    unique.push(record);
+                }
+            }
+            *records = unique;
+        }
+
+        // Resolvers can only reach an in-zone name server through the
+        // addresses served here.
+        for (label, name) in &in_zone_ns {
+            ensure!(
+                hosts[name].iter().any(is_address),
+                "name server {label} is inside {} but has no address; give it ipv4 or ipv6",
+                cfg.domain
+            );
+        }
+
+        for records in hosts.values() {
+            check_sizes(records)?;
         }
 
         let origin_lower = LowerName::new(&origin);
@@ -430,6 +478,84 @@ impl Answer {
     }
 }
 
+fn is_address(record: &Record) -> bool {
+    matches!(record.record_type(), RecordType::A | RecordType::AAAA)
+}
+
+/// TTLs and SOA timers are 31-bit numbers on the wire; the timers must
+/// also be positive. The TTLs are `u32` and the timers `i32` in the
+/// config, so a negative timer would go out as a huge unsigned number.
+fn check_timers(cfg: &Config) -> Result<()> {
+    for (setting, value) in [
+        ("ttl.ip", cfg.ttl.ip),
+        ("ttl.records", cfg.ttl.records),
+        ("soa.minimum", cfg.soa.minimum),
+    ] {
+        ensure!(
+            value <= MAX_TTL,
+            "{setting} must be at most {MAX_TTL} seconds"
+        );
+    }
+    for (setting, value) in [
+        ("soa.refresh", cfg.soa.refresh),
+        ("soa.retry", cfg.soa.retry),
+        ("soa.expire", cfg.soa.expire),
+    ] {
+        ensure!(
+            value >= 1,
+            "{setting} must be between 1 and {MAX_TTL} seconds"
+        );
+    }
+    Ok(())
+}
+
+/// Checks that every RRset in `records`, which share one owner, fits in a
+/// DNS message, so it can at least be sent over TCP.
+fn check_sizes(records: &[Record]) -> Result<()> {
+    let mut checked = Vec::new();
+    for record in records {
+        let rtype = record.record_type();
+        if checked.contains(&rtype) {
+            continue;
+        }
+        checked.push(rtype);
+        let rrset: Vec<&Record> = records
+            .iter()
+            .filter(|r| r.record_type() == rtype)
+            .collect();
+        ensure!(
+            response_len(&record.name, &rrset).is_some_and(|len| len <= MAX_MESSAGE),
+            "{}: the {rtype} records do not fit in a DNS message ({MAX_MESSAGE} bytes); make them shorter or fewer",
+            record.name
+        );
+    }
+    Ok(())
+}
+
+/// Size of a response that answers a question for `owner` with `records`:
+/// the header, the question, the records and an OPT record without
+/// options, laid out the way the handler sends it. `None` if a record
+/// cannot be encoded at all.
+fn response_len(owner: &Name, records: &[&Record]) -> Option<usize> {
+    const HEADER_LEN: usize = 12;
+    const OPT_LEN: usize = 11;
+    // The name as the client sent it, then type and class.
+    let question_len = owner.to_bytes().ok()?.len() + 4;
+    let mut buf = Vec::new();
+    let mut encoder = BinEncoder::new(&mut buf);
+    for record in records {
+        // `Record::emit` panics on RDATA longer than its 16-bit length
+        // field, so measure the RDATA on its own first.
+        let mut rdata = Vec::new();
+        record.data.emit(&mut BinEncoder::new(&mut rdata)).ok()?;
+        if rdata.len() > usize::from(u16::MAX) {
+            return None;
+        }
+        record.emit(&mut encoder).ok()?;
+    }
+    Some(HEADER_LEN + question_len + encoder.offset() + OPT_LEN)
+}
+
 /// Maximum length of one DNS character-string (RFC 1035 section 3.3).
 const TXT_CHUNK: usize = 255;
 
@@ -442,8 +568,29 @@ fn txt_record(value: &str) -> TXT {
     TXT::from_bytes(value.as_bytes().chunks(TXT_CHUNK).collect())
 }
 
+/// The owner name of the `[hosts]` key `label`; `@` is the apex.
+fn host_name(label: &str, domain: &str, origin: &Name) -> Result<Name> {
+    if label == "@" {
+        return Ok(origin.clone());
+    }
+    // A `*` label would be served as a literal name, not as a wildcard.
+    ensure!(
+        !label.contains('*'),
+        "host {label:?}: wildcards (`*`) are not supported"
+    );
+    fqdn(&format!("{label}.{}", domain.trim_end_matches('.')))
+        .with_context(|| format!("invalid host {label:?}"))
+}
+
 /// Parses `name` as a fully qualified domain name.
 fn fqdn(name: &str) -> Result<Name> {
+    // hickory decodes `\DDD` escapes as octal where RFC 1035 means decimal
+    // (`\101` would become `A`, not `e`), and no configured name needs
+    // escapes, so take none.
+    ensure!(
+        !name.contains('\\'),
+        "invalid domain name {name:?}: backslashes are not allowed"
+    );
     let name = name.trim_end_matches('.');
     Name::from_ascii(format!("{name}."))
         .map(|n| n.to_lowercase())
@@ -459,12 +606,41 @@ fn email_to_name(email: &str) -> Result<Name> {
         !local.is_empty() && !local.contains('.'),
         "SOA email local part must be non-empty and contain no dots"
     );
+    ensure!(
+        !domain.trim_end_matches('.').is_empty(),
+        "SOA email {email:?} must have a domain after the @"
+    );
     fqdn(&format!("{local}.{domain}"))
+}
+
+/// A CAA `issue` value: an issuer domain name of letters, digits and
+/// inner hyphens (RFC 8659 section 4.2). Generic name parsing would also
+/// take `_` and other bytes, which CAs then read as an empty issuer that
+/// allows nobody. A trailing dot is dropped.
+fn caa_issuer(issuer: &str) -> Result<Name> {
+    let domain = issuer.strip_suffix('.').unwrap_or(issuer);
+    let ldh = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    ensure!(
+        domain.split('.').all(ldh),
+        "invalid CAA issuer {issuer:?}: use a domain name of letters, digits and hyphens, such as letsencrypt.org"
+    );
+    let mut name =
+        Name::from_ascii(domain).with_context(|| format!("invalid CAA issuer {issuer:?}"))?;
+    name.set_fqdn(false);
+    Ok(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HostConfig;
     use std::net::Ipv4Addr;
 
     const CONFIG: &str = r#"
@@ -503,8 +679,12 @@ mod tests {
 
     const CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99));
 
+    fn config() -> Config {
+        Config::parse(CONFIG).unwrap()
+    }
+
     fn zone() -> Zone {
-        Zone::from_config(&Config::parse(CONFIG).unwrap()).unwrap()
+        Zone::from_config(&config()).unwrap()
     }
 
     fn zone_with(extra: &str) -> Result<Zone> {
@@ -656,6 +836,45 @@ mod tests {
     }
 
     #[test]
+    fn in_zone_name_servers_need_an_address() {
+        let mut cfg = config();
+        cfg.nameservers[1].ipv4.clear();
+        let err = Zone::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("ns2.ipssl.cc"), "{err}");
+
+        // An address under [hosts] does as well.
+        cfg.hosts.insert(
+            "ns2".into(),
+            HostConfig {
+                aaaa: vec!["2001:db8::54".parse().unwrap()],
+                ..HostConfig::default()
+            },
+        );
+        let zone = Zone::from_config(&cfg).unwrap();
+        assert_eq!(
+            rdata(&query_zone(&zone, "ns2.ipssl.cc.", RecordType::AAAA)),
+            ["2001:db8::54"]
+        );
+    }
+
+    #[test]
+    fn duplicate_records_are_served_once() {
+        let zone = zone_with(
+            "[hosts.ns1]\na = [\"198.51.100.1\", \"198.51.100.3\"]\n\
+             [hosts.twice]\ntxt = [\"same\", \"same\"]",
+        )
+        .unwrap();
+        assert_eq!(
+            rdata(&query_zone(&zone, "ns1.ipssl.cc.", RecordType::A)),
+            ["198.51.100.1", "198.51.100.3"]
+        );
+        assert_eq!(
+            rdata(&query_zone(&zone, "twice.ipssl.cc.", RecordType::TXT)),
+            ["same"]
+        );
+    }
+
+    #[test]
     fn fixed_hosts() {
         assert_eq!(
             rdata(&query("www.ipssl.cc.", RecordType::A)),
@@ -747,8 +966,12 @@ mod tests {
     fn rejects_bad_mx() {
         for mx in [
             r#"{ preference = 10, exchange = "." }"#,
+            r#"{ preference = 10, exchange = "" }"#,
             r#"{ preference = 0, exchange = "." }, { preference = 10, exchange = "mx.example.net" }"#,
             r#"{ preference = 10, exchange = "192.0.2.25" }"#,
+            r#"{ preference = 10, exchange = "192.0.2.15." }"#,
+            r#"{ preference = 10, exchange = "2001:db8::25." }"#,
+            r#"{ preference = 10, exchange = "mx\\.example.net" }"#,
         ] {
             let err = zone_with(&format!("[hosts.bad]\nmx = [{mx}]")).err();
             assert!(err.is_some(), "accepted {mx}");
@@ -767,6 +990,24 @@ mod tests {
         let lengths: Vec<usize> = txt.txt_data.iter().map(|s| s.len()).collect();
         assert_eq!(lengths, [255, 255, 108]);
         assert_eq!(txt.txt_data.concat(), key.as_bytes());
+    }
+
+    #[test]
+    fn rejects_rrsets_too_big_for_a_message() {
+        let txt = |count: usize| {
+            let values: Vec<String> = (0..count)
+                .map(|i| format!("\"{i:03}{}\"", "A".repeat(247)))
+                .collect();
+            format!("[hosts.big]\ntxt = [{}]", values.join(", "))
+        };
+        // Records that are fine on their own but too big together.
+        let err = zone_with(&txt(300)).err().unwrap();
+        assert!(err.to_string().contains("do not fit"), "{err}");
+        // One record longer than RDATA can be.
+        let huge = format!("[hosts.big]\ntxt = [\"{}\"]", "A".repeat(70_000));
+        assert!(zone_with(&huge).is_err());
+        // Big, but it fits.
+        zone_with(&txt(200)).unwrap();
     }
 
     #[test]
@@ -823,6 +1064,117 @@ mod tests {
             .err()
             .unwrap();
         assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn rejects_the_root_as_domain() {
+        for domain in ["", "."] {
+            let mut cfg = config();
+            cfg.domain = domain.into();
+            assert!(Zone::from_config(&cfg).is_err(), "{domain:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_hosts_that_differ_only_in_case() {
+        let err = zone_with(
+            "[hosts.MailAlias]\nmx = [{ preference = 0, exchange = \".\" }]\n\
+             [hosts.mailalias]\nmx = [{ preference = 20, exchange = \"mail.example.net\" }]",
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("same name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_wildcard_hosts() {
+        for host in ["\"*\"", "\"*.dev\""] {
+            let err = zone_with(&format!("[hosts.{host}]\na = [\"198.51.100.40\"]")).err();
+            assert!(err.is_some(), "accepted {host}");
+        }
+    }
+
+    #[test]
+    fn rejects_backslashes_in_names() {
+        // `\101` would be read as octal and publish `aast`.
+        assert!(zone_with("[hosts.'\\101ast']\na = [\"198.51.100.40\"]").is_err());
+        let mut cfg = config();
+        cfg.domain = r"ipssl\.cc".into();
+        assert!(Zone::from_config(&cfg).is_err());
+        let mut cfg = config();
+        cfg.nameservers[1].name = r"ns2\.ipssl.cc".into();
+        assert!(Zone::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_timers() {
+        let cases: [fn(&mut Config); 6] = [
+            |c| c.ttl.ip = MAX_TTL + 1,
+            |c| c.ttl.records = u32::MAX,
+            |c| c.soa.minimum = MAX_TTL + 1,
+            |c| c.soa.refresh = -1,
+            |c| c.soa.retry = 0,
+            |c| c.soa.expire = i32::MIN,
+        ];
+        for (i, set) in cases.iter().enumerate() {
+            let mut cfg = config();
+            set(&mut cfg);
+            assert!(Zone::from_config(&cfg).is_err(), "case {i}");
+        }
+
+        // The largest values are fine.
+        let mut cfg = config();
+        cfg.ttl.ip = MAX_TTL;
+        cfg.ttl.records = MAX_TTL;
+        cfg.soa.minimum = MAX_TTL;
+        cfg.soa.refresh = i32::MAX;
+        cfg.soa.retry = i32::MAX;
+        cfg.soa.expire = i32::MAX;
+        Zone::from_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn soa_email() {
+        for email in [
+            "ops@",
+            "ops@.",
+            "@ipssl.cc",
+            "ops.dns@example.org",
+            "hostmaster",
+        ] {
+            let mut cfg = config();
+            cfg.soa.email = email.into();
+            assert!(Zone::from_config(&cfg).is_err(), "accepted {email:?}");
+        }
+        let soa = query("ipssl.cc.", RecordType::SOA);
+        let RData::SOA(soa) = &soa.answers[0].data else {
+            panic!("not an SOA record");
+        };
+        assert_eq!(soa.rname.to_string(), "hostmaster.ipssl.cc.");
+    }
+
+    #[test]
+    fn caa_issuers() {
+        for issuer in [
+            "ca_team.example",
+            "-ca.example",
+            "ca-.example",
+            "ca..example",
+            "ca example.org",
+            "",
+            ".",
+        ] {
+            let mut cfg = config();
+            cfg.caa_issuers = vec![issuer.into()];
+            assert!(Zone::from_config(&cfg).is_err(), "accepted {issuer:?}");
+        }
+        let mut cfg = config();
+        cfg.caa_issuers = vec!["letsencrypt.org.".into(), "pki.goog".into()];
+        let zone = Zone::from_config(&cfg).unwrap();
+        assert_eq!(
+            rdata(&query_zone(&zone, "ipssl.cc.", RecordType::CAA)),
+            ["0 issue \"letsencrypt.org\"", "0 issue \"pki.goog\""]
+        );
     }
 
     #[test]
