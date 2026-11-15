@@ -197,7 +197,12 @@ impl RateLimiter {
     }
 
     fn take(&self, bucket: &mut Bucket, now: Instant) -> Verdict {
-        let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
+        // `now` is read before the lock is taken, so a request that waited
+        // for the lock can carry an older time than the last update.
+        // Never move `updated` backward, or the next request would be
+        // credited part of the same interval a second time.
+        let now = now.max(bucket.updated);
+        let elapsed = now.duration_since(bucket.updated).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.rate).min(self.burst);
         bucket.updated = now;
         if bucket.tokens >= 1.0 {
@@ -347,6 +352,26 @@ mod tests {
         let tracked = rl.tracked();
         assert!(tracked <= SHARDS);
         assert_eq!(allowed, tracked + 1);
+    }
+
+    #[test]
+    fn a_late_request_does_not_move_time_backward() {
+        let rl = limiter(cfg(10, 1, 0));
+        let start = Instant::now();
+        let client = ip("192.0.2.1");
+        assert_eq!(rl.check_at(client, start), Verdict::Allow);
+        let t100 = start + Duration::from_millis(100);
+        assert_eq!(rl.check_at(client, t100), Verdict::Allow);
+        // A request stamped earlier that got the lock late.
+        assert_eq!(
+            rl.check_at(client, start + Duration::from_millis(50)),
+            Verdict::Drop
+        );
+        // Only 50 ms since the last token was taken: half a token, not one.
+        let t150 = start + Duration::from_millis(150);
+        assert_eq!(rl.check_at(client, t150), Verdict::Drop);
+        let t250 = start + Duration::from_millis(250);
+        assert_eq!(rl.check_at(client, t250), Verdict::Allow);
     }
 
     #[test]
