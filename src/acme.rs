@@ -23,7 +23,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use hickory_server::proto::rr::LowerName;
 use serde::Deserialize;
 use tokio::task::JoinSet;
@@ -315,16 +315,10 @@ pub struct Api {
 
 impl Api {
     pub fn from_config(cfg: &Config) -> Result<Self> {
+        // Rate limiter settings and every name server's write endpoint.
+        cfg.validate_acme_api()?;
         let acme = cfg.acme.as_ref().context("the [acme] section is missing")?;
-        ensure!(
-            acme.requests_per_minute >= 1 && acme.burst >= 1,
-            "acme.requests_per_minute and acme.burst must be at least 1"
-        );
-        let nodes = acme.node_addrs(&cfg.nameservers);
-        ensure!(
-            !nodes.is_empty(),
-            "no name server to send challenges to: set acme.nodes or give the name servers addresses"
-        );
+        let nodes = acme.node_addrs(&cfg.nameservers)?;
         Ok(Self {
             zone: Zone::from_config(cfg)?,
             limiter: RateLimiter::new(

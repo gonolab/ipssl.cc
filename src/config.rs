@@ -71,7 +71,8 @@ pub struct AcmeConfig {
     #[serde(default = "default_acme_api_listen")]
     pub api_listen: SocketAddr,
     /// Name server write endpoints the API sends every challenge to. Empty
-    /// means each name server's first address on the `listen` port.
+    /// means each name server's first address of the `listen` family on
+    /// the `listen` port, see [`AcmeConfig::node_addrs`].
     #[serde(default)]
     pub nodes: Vec<SocketAddr>,
     /// API requests per minute for each client network.
@@ -83,19 +84,43 @@ pub struct AcmeConfig {
 }
 
 impl AcmeConfig {
-    /// Write endpoints of every name server, as the API reaches them.
-    pub fn node_addrs(&self, nameservers: &[NameServer]) -> Vec<SocketAddr> {
+    /// Write endpoints of every name server, as the API reaches them:
+    /// `nodes` when set, otherwise each name server's first address on the
+    /// `listen` port.
+    ///
+    /// The address has to be of the family `listen` accepts: IPv6 listeners
+    /// are IPv6-only (see [`crate::bind_tcp`]), so `[::]:8053` cannot be
+    /// reached over IPv4, nor `0.0.0.0:8053` over IPv6. A name server with no
+    /// such address, such as one outside the zone (those never have
+    /// addresses here), is an error rather than skipped: the API would
+    /// report success without it while the CA may still ask it.
+    pub fn node_addrs(&self, nameservers: &[NameServer]) -> Result<Vec<SocketAddr>> {
         if !self.nodes.is_empty() {
-            return self.nodes.clone();
+            return Ok(self.nodes.clone());
         }
         let port = self.listen.port();
         nameservers
             .iter()
-            .filter_map(|ns| {
-                let ip = ns.ipv4.first().map(|ip| IpAddr::V4(*ip));
-                ip.or_else(|| ns.ipv6.first().map(|ip| IpAddr::V6(*ip)))
+            .map(|ns| {
+                let ip = if self.listen.is_ipv4() {
+                    ns.ipv4.first().map(|ip| IpAddr::V4(*ip))
+                } else {
+                    ns.ipv6.first().map(|ip| IpAddr::V6(*ip))
+                };
+                let family = if self.listen.is_ipv4() {
+                    "IPv4"
+                } else {
+                    "IPv6"
+                };
+                ip.map(|ip| SocketAddr::new(ip, port)).with_context(|| {
+                    format!(
+                        "name server {} has no {family} address to send challenges to \
+                         (acme.listen is {}); list every name server's write endpoint \
+                         in acme.nodes",
+                        ns.name, self.listen
+                    )
+                })
             })
-            .map(|ip| SocketAddr::new(ip, port))
             .collect()
     }
 }
@@ -293,6 +318,27 @@ impl Config {
         }
         self.check_tcp_overlaps()?;
         self.rate_limit.validate()
+    }
+
+    /// Checks the settings `ipssl-dns --acme-api` uses, for both `--check`
+    /// and start. The zone is checked when the API builds it.
+    pub fn validate_acme_api(&self) -> Result<()> {
+        let acme = self
+            .acme
+            .as_ref()
+            .context("the [acme] section is missing")?;
+        ensure!(
+            acme.requests_per_minute >= 1 && acme.burst >= 1,
+            "acme.requests_per_minute and acme.burst must be at least 1"
+        );
+        // The API groups and tracks clients the way the DNS server does.
+        self.rate_limit.validate_networks()?;
+        let nodes = acme.node_addrs(&self.nameservers)?;
+        ensure!(
+            !nodes.is_empty(),
+            "no name server to send challenges to: set acme.nodes or give the name servers addresses"
+        );
+        Ok(())
     }
 
     /// Fails when two of the TCP listeners the DNS server opens (every
@@ -494,6 +540,8 @@ mod tests {
     fn example_config_is_valid() {
         let config = Config::parse(include_str!("../config.example.toml")).unwrap();
         config.validate().unwrap();
+        let api = format!("{}\n[acme]\n", include_str!("../config.example.toml"));
+        Config::parse(&api).unwrap().validate_acme_api().unwrap();
     }
 
     #[test]
@@ -558,36 +606,86 @@ mod tests {
     }
 
     #[test]
-    fn acme_nodes_default_to_name_servers() {
-        let text = r#"
-            domain = "ipssl.cc"
+    fn acme_api_checks_its_rate_limit() {
+        let config = |settings: &str| {
+            let text = format!(
+                "{MINIMAL}\n[rate_limit]\n{settings}\n[acme]\nnodes = [\"127.0.0.1:8053\"]\n"
+            );
+            Config::parse(&text).unwrap()
+        };
+        config("").validate_acme_api().unwrap();
+        // The API groups clients even when the DNS server's limit is off.
+        for bad in ["max_tracked = 0", "ipv4_prefix = 33", "ipv6_prefix = 129"] {
+            let settings = format!("responses_per_second = 0\n{bad}");
+            assert!(config(&settings).validate_acme_api().is_err(), "{bad}");
+        }
+        let text = format!("{MINIMAL}\n[acme]\nnodes = [\"127.0.0.1:8053\"]\nburst = 0\n");
+        assert!(Config::parse(&text).unwrap().validate_acme_api().is_err());
+        assert!(err(Config::parse(MINIMAL).unwrap().validate_acme_api()).contains("[acme]"));
+    }
 
-            [[nameservers]]
-            name = "ns1.ipssl.cc"
-            ipv4 = ["198.51.100.1"]
-            ipv6 = ["2001:db8::1"]
+    const TWO_NAME_SERVERS: &str = r#"
+        domain = "ipssl.cc"
 
-            [[nameservers]]
-            name = "ns2.ipssl.cc"
-            ipv6 = ["2001:db8::2"]
+        [[nameservers]]
+        name = "ns1.ipssl.cc"
+        ipv4 = ["198.51.100.1"]
+        ipv6 = ["2001:db8::1"]
 
-            [soa]
-            email = "hostmaster@ipssl.cc"
+        [[nameservers]]
+        name = "ns2.ipssl.cc"
+        ipv6 = ["2001:db8::2"]
 
-            [acme]
-            listen = "0.0.0.0:8053"
-        "#;
-        let config = Config::parse(text).unwrap();
+        [soa]
+        email = "hostmaster@ipssl.cc"
+    "#;
+
+    fn nodes(config: &Config) -> Result<Vec<String>> {
         let acme = config.acme.as_ref().unwrap();
-        let nodes: Vec<String> = acme
-            .node_addrs(&config.nameservers)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(nodes, ["198.51.100.1:8053", "[2001:db8::2]:8053"]);
+        let addrs = acme.node_addrs(&config.nameservers)?;
+        Ok(addrs.iter().map(ToString::to_string).collect())
+    }
 
-        let mut explicit = acme.clone();
-        explicit.nodes = vec!["127.0.0.1:9000".parse().unwrap()];
-        assert_eq!(explicit.node_addrs(&config.nameservers).len(), 1);
+    #[test]
+    fn acme_nodes_use_the_family_of_the_listener() {
+        // An IPv6 listener is IPv6-only: use the IPv6 addresses even though
+        // ns1 has an IPv4 one.
+        let text = format!("{TWO_NAME_SERVERS}\n[acme]\nlisten = \"[::]:8053\"\n");
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(
+            nodes(&config).unwrap(),
+            ["[2001:db8::1]:8053", "[2001:db8::2]:8053"]
+        );
+        config.validate_acme_api().unwrap();
+
+        let text = format!("{TWO_NAME_SERVERS}\n[acme]\nlisten = \"0.0.0.0:8053\"\n");
+        let config = Config::parse(&text).unwrap();
+        let error = format!("{:#}", nodes(&config).unwrap_err());
+        assert!(
+            error.contains("ns2.ipssl.cc has no IPv4 address"),
+            "{error}"
+        );
+        assert!(config.validate_acme_api().is_err());
+
+        // Explicit nodes are taken as they are.
+        let text = format!(
+            "{TWO_NAME_SERVERS}\n[acme]\nlisten = \"0.0.0.0:8053\"\nnodes = [\"127.0.0.1:9000\"]\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(nodes(&config).unwrap(), ["127.0.0.1:9000"]);
+        config.validate_acme_api().unwrap();
+    }
+
+    #[test]
+    fn acme_nodes_need_every_name_server() {
+        // Out-of-zone name servers have no addresses in the config, so the
+        // API cannot find their write endpoint on its own.
+        let text = format!(
+            "{TWO_NAME_SERVERS}\n[[nameservers]]\nname = \"ns.example.net\"\n\n[acme]\nlisten = \"[::]:8053\"\n"
+        );
+        let config = Config::parse(&text).unwrap();
+        let error = err(config.validate_acme_api());
+        assert!(error.contains("ns.example.net"), "{error}");
+        assert!(error.contains("acme.nodes"), "{error}");
     }
 }

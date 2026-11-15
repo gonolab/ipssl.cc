@@ -86,7 +86,9 @@ listen = "127.0.0.1:9153"
 # API: keep it on loopback behind the proxy, which sets X-Real-IP
 #api_listen = "127.0.0.1:8054"
 # Name server write endpoints; empty means each name server's first
-# address on the `listen` port
+# address of the `listen` family (IPv4 for 0.0.0.0, IPv6 for [::]) on the
+# `listen` port. List them here when a name server has no such address,
+# e.g. one outside the zone: the API refuses to start without them.
 #nodes = []
 # API requests per client network
 #requests_per_minute = 10
