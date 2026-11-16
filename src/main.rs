@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -64,6 +64,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // SIGHUP kills a process that does not handle it. Take it over before
+    // anything slow, so `systemctl reload` right after the start is never
+    // fatal: a SIGHUP that arrives while the config loads or the sockets
+    // bind is queued and reloads once the server runs.
+    #[cfg(unix)]
+    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .context("installing the SIGHUP handler")?;
+
     let (config, zone) = load(&args.config)?;
     warn_about(&config);
     let limiter = RateLimiter::from_config(&config.rate_limit)?;
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
     }
     #[cfg(unix)]
     tokio::spawn(reload_on_sighup(
+        hangup,
         args.config,
         config.clone(),
         handler.clone(),
@@ -197,14 +206,25 @@ async fn purge_challenges(store: Arc<Challenges>) {
 
 /// Reloads the config on every SIGHUP (`systemctl reload ipssl-dns`).
 /// A config that fails to load or validate is logged and the running one
-/// kept.
+/// kept. `hangup` is installed at the very start of `main`.
 #[cfg(unix)]
-async fn reload_on_sighup(path: PathBuf, running: Config, handler: Handler) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut hangup = signal(SignalKind::hangup()).expect("installing SIGHUP handler");
+async fn reload_on_sighup(
+    mut hangup: tokio::signal::unix::Signal,
+    path: PathBuf,
+    running: Config,
+    handler: Handler,
+) {
+    let running = Arc::new(running);
     while hangup.recv().await.is_some() {
-        let result = reload(&path, &running, &handler);
+        // Reading the file, parsing it and building the zone block, so keep
+        // them off the async workers that answer queries.
+        let task = {
+            let (path, running, handler) = (path.clone(), running.clone(), handler.clone());
+            tokio::task::spawn_blocking(move || reload(&path, &running, &handler))
+        };
+        let result = task
+            .await
+            .unwrap_or_else(|e| Err(anyhow!("reload task failed: {e}")));
         handler.metrics().reload(result.is_ok());
         match result {
             Ok(serial) => info!(serial, "config reloaded"),
