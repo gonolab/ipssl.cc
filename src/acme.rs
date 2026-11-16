@@ -142,13 +142,14 @@ impl Challenges {
         self.lock().purge(Instant::now());
     }
 
-    /// Number of values held, expired ones included until the next purge.
+    /// Number of values being published. Expired values still waiting for
+    /// a purge are left out, as they are from DNS answers.
     pub fn len(&self) -> usize {
-        self.lock().names.values().map(Vec::len).sum()
+        self.len_at(Instant::now())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().names.is_empty()
+        self.len() == 0
     }
 
     fn present_at(&self, name: LowerName, value: &str, now: Instant) -> Result<(), StoreFull> {
@@ -198,6 +199,14 @@ impl Challenges {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn len_at(&self, now: Instant) -> usize {
+        self.lock()
+            .names
+            .values()
+            .map(|entries| entries.iter().filter(|e| e.expires > now).count())
+            .sum()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -538,7 +547,7 @@ mod tests {
         assert_eq!(store.present_at(extra.clone(), VALUE, now), Err(StoreFull));
         // Once the others expire there is room again.
         store.present_at(extra, VALUE, now + LIFETIME).unwrap();
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len_at(now + LIFETIME), 1);
     }
 
     #[test]
@@ -563,4 +572,15 @@ mod tests {
         assert_eq!(store.values_at(&extra, soon), [VALUE]);
     }
 
+    #[test]
+    fn expired_values_are_not_counted() {
+        let store = Challenges::new();
+        let now = Instant::now();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        store.present_at(n.clone(), VALUE, now).unwrap();
+        assert_eq!(store.len_at(now), 1);
+        // Gone from the count as soon as DNS stops serving it, before any purge.
+        assert_eq!(store.len_at(now + LIFETIME), 0);
+        assert!(store.values_at(&n, now + LIFETIME).is_empty());
+    }
 }
