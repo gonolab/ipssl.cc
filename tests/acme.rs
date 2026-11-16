@@ -56,6 +56,51 @@ async fn name_server(writers: &str) -> NameServer {
     }
 }
 
+/// A stand-in for a name server's write endpoint that reads each request
+/// and answers it with `raw`, as it is.
+async fn fake_node(raw: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                // Read the whole request first: closing with unread data
+                // would reset the connection instead.
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !complete(&request) {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = stream.write_all(raw.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Whether `request` holds a whole request with a `Content-Length` body.
+fn complete(request: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(request);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let length = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().to_owned())
+        })
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    body.len() >= length
+}
+
 /// Starts the API, sending changes to `nodes`; returns its address.
 async fn api(nodes: &[SocketAddr], extra: &str) -> SocketAddr {
     let nodes: Vec<String> = nodes.iter().map(|n| format!("\"{n}\"")).collect();
@@ -321,4 +366,19 @@ async fn punycode_names_reach_the_name_servers() {
         .unwrap();
     assert_eq!(status, 200, "{reply}");
     assert_eq!(values(&txt(ns.dns, name).await), [VALUE]);
+}
+
+#[tokio::test]
+async fn api_skips_interim_responses_from_name_servers() {
+    let node = fake_node(
+        "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
+         HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n\
+         {\"ok\":true}",
+    )
+    .await;
+    let api = api(&[node], "").await;
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "{reply}");
 }

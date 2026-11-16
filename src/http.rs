@@ -243,14 +243,37 @@ pub async fn post_json(addr: SocketAddr, path: &str, body: &str) -> io::Result<(
     let mut response = Vec::new();
     let mut limited = (&mut stream).take(MAX_RESPONSE as u64);
     limited.read_to_end(&mut response).await?;
-    let text = String::from_utf8_lossy(&response);
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status = head
-        .split(' ')
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
-    Ok((status, body.to_owned()))
+    parse_response(&String::from_utf8_lossy(&response))
+}
+
+/// Splits a whole response, read until the server closed the connection,
+/// into the final status code and body. Interim responses (1xx, such as
+/// `103 Early Hints`) may come first and are skipped (RFC 9110 section
+/// 15.2).
+fn parse_response(mut text: &str) -> io::Result<(u16, String)> {
+    loop {
+        let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+        let status = status_code(head)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
+        if !(100..200).contains(&status) {
+            return Ok((status, body.to_owned()));
+        }
+        text = body;
+    }
+}
+
+/// The status code in the status line that starts `head`.
+fn status_code(head: &str) -> Option<u16> {
+    let line = head.split("\r\n").next()?;
+    let mut parts = line.split(' ');
+    if !parts.next()?.starts_with("HTTP/1.") {
+        return None;
+    }
+    let code = parts.next()?;
+    if code.len() != 3 {
+        return None;
+    }
+    code.parse().ok().filter(|code| (100..600).contains(code))
 }
 
 #[cfg(test)]
@@ -331,6 +354,25 @@ mod tests {
         let (status, body) = post_json(addr, "/present", r#"{"a":1}"#).await.unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, r#"POST /present application/json {"a":1}"#);
+    }
+
+    #[test]
+    fn client_skips_interim_responses() {
+        let hints = "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n";
+        let last = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
+        let parsed = parse_response(&format!("{hints}HTTP/1.1 100 Continue\r\n\r\n{last}"));
+        assert_eq!(parsed.unwrap(), (200, r#"{"ok":true}"#.to_owned()));
+        assert_eq!(parse_response(last).unwrap().0, 200);
+
+        // Interim responses with no final one, or no HTTP at all.
+        for bad in [
+            hints,
+            "",
+            "SSH-2.0-OpenSSH_9.6\r\n",
+            "HTTP/1.1 20 OK\r\n\r\n",
+        ] {
+            assert!(parse_response(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]
