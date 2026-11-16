@@ -382,3 +382,25 @@ async fn api_skips_interim_responses_from_name_servers() {
         .unwrap();
     assert_eq!(status, 200, "{reply}");
 }
+
+#[tokio::test]
+async fn api_wants_a_name_server_answer_not_just_any_200() {
+    // A port that serves a web page instead of a name server's endpoint.
+    let page = fake_node(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n\
+         <html></html>",
+    )
+    .await;
+    let refused = fake_node(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n\
+         {\"ok\":false}",
+    )
+    .await;
+    for node in [page, refused] {
+        let api = api(&[node], "").await;
+        let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+            .await
+            .unwrap();
+        assert_eq!(status, 502, "{reply}");
+    }
+}

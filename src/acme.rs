@@ -496,18 +496,7 @@ impl Api {
         let mut tasks = JoinSet::new();
         for &addr in &self.nodes {
             let body = body.clone();
-            tasks.spawn(async move {
-                let result = timeout(NODE_TIMEOUT, post_json(addr, action.path(), &body)).await;
-                let problem = match result {
-                    Ok(Ok((200, _))) => return Outcome::Accepted,
-                    // A cap on pending values: the client's to sort out.
-                    Ok(Ok((409, _))) => return Outcome::Rejected,
-                    Ok(Ok((status, _))) => format!("HTTP {status}"),
-                    Ok(Err(e)) => e.to_string(),
-                    Err(_) => "timed out".to_owned(),
-                };
-                Outcome::Failed(format!("{addr} ({problem})"))
-            });
+            tasks.spawn(async move { send(addr, action, &body).await });
         }
         let mut failed = Vec::new();
         let mut rejected = false;
@@ -542,6 +531,31 @@ enum Outcome {
     Rejected,
     /// No usable answer; the text says why, for the log.
     Failed(String),
+}
+
+/// Sends a change to the name server at `addr`.
+async fn send(addr: SocketAddr, action: Action, body: &str) -> Outcome {
+    let problem = match timeout(NODE_TIMEOUT, post_json(addr, action.path(), body)).await {
+        // Only a name server's own answer counts, not any 200: a port
+        // that serves something else must not acknowledge a value.
+        Ok(Ok((200, reply))) if reply_ok(&reply) == Some(true) => return Outcome::Accepted,
+        Ok(Ok((200, _))) => "HTTP 200 without {\"ok\":true}".to_owned(),
+        // A cap on pending values: the client's to sort out.
+        Ok(Ok((409, reply))) if reply_ok(&reply) == Some(false) => return Outcome::Rejected,
+        Ok(Ok((status, _))) => format!("HTTP {status}"),
+        Ok(Err(e)) => e.to_string(),
+        Err(_) => "timed out".to_owned(),
+    };
+    Outcome::Failed(format!("{addr} ({problem})"))
+}
+
+/// The `ok` field of a name server's JSON answer, if it is one.
+fn reply_ok(reply: &str) -> Option<bool> {
+    #[derive(Deserialize)]
+    struct Reply {
+        ok: bool,
+    }
+    serde_json::from_str::<Reply>(reply).ok().map(|r| r.ok)
 }
 
 /// The API's answer when a name server refuses a value over a cap.
