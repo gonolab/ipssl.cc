@@ -46,6 +46,10 @@ const LIFETIME: Duration = Duration::from_secs(600);
 /// Most challenge names held at once. Bounds memory.
 const MAX_NAMES: usize = 10_000;
 
+/// Shortest time between two sweeps of a full store, see
+/// [`Challenges::present`].
+const PURGE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Most values held for one name: a certificate for a name and its
 /// wildcard needs two, and retries may add more. The oldest goes first.
 const MAX_VALUES: usize = 4;
@@ -88,7 +92,14 @@ pub fn is_valid_value(value: &str) -> bool {
 /// Challenge values published on this name server, by name.
 #[derive(Default)]
 pub struct Challenges {
-    names: Mutex<HashMap<LowerName, Vec<Entry>>>,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    names: HashMap<LowerName, Vec<Entry>>,
+    /// When expired values were last swept out of the whole table.
+    last_purge: Option<Instant>,
 }
 
 struct Entry {
@@ -112,7 +123,7 @@ impl Challenges {
 
     /// Removes `value` from `name`, if it is there.
     pub fn cleanup(&self, name: &LowerName, value: &str) {
-        let mut names = self.lock();
+        let names = &mut self.lock().names;
         if let Some(entries) = names.get_mut(name) {
             entries.retain(|e| e.value != value);
             if entries.is_empty() {
@@ -128,27 +139,35 @@ impl Challenges {
 
     /// Forgets expired values.
     pub fn purge(&self) {
-        purge(&mut self.lock(), Instant::now());
+        self.lock().purge(Instant::now());
     }
 
     /// Number of values held, expired ones included until the next purge.
     pub fn len(&self) -> usize {
-        self.lock().values().map(Vec::len).sum()
+        self.lock().names.values().map(Vec::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.lock().names.is_empty()
     }
 
     fn present_at(&self, name: LowerName, value: &str, now: Instant) -> Result<(), StoreFull> {
-        let mut names = self.lock();
-        if !names.contains_key(&name) && names.len() >= MAX_NAMES {
-            purge(&mut names, now);
-            if names.len() >= MAX_NAMES {
+        let mut inner = self.lock();
+        if !inner.names.contains_key(&name) && inner.names.len() >= MAX_NAMES {
+            // A sweep walks the whole table while TXT lookups wait for the
+            // lock, so a store kept full by a flood of new names sweeps at
+            // most once a second, however many writes arrive.
+            if inner
+                .last_purge
+                .is_none_or(|last| now.saturating_duration_since(last) >= PURGE_INTERVAL)
+            {
+                inner.purge(now);
+            }
+            if inner.names.len() >= MAX_NAMES {
                 return Err(StoreFull);
             }
         }
-        let entries = names.entry(name).or_default();
+        let entries = inner.names.entry(name).or_default();
         entries.retain(|e| e.expires > now);
         let expires = now + LIFETIME;
         if let Some(entry) = entries.iter_mut().find(|e| e.value == value) {
@@ -169,6 +188,7 @@ impl Challenges {
 
     fn values_at(&self, name: &LowerName, now: Instant) -> Vec<String> {
         self.lock()
+            .names
             .get(name)
             .map(|entries| {
                 entries
@@ -180,17 +200,20 @@ impl Challenges {
             .unwrap_or_default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<LowerName, Vec<Entry>>> {
+    fn lock(&self) -> MutexGuard<'_, Inner> {
         // A map left half-updated by a panic is still consistent enough.
-        self.names.lock().unwrap_or_else(|e| e.into_inner())
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
-fn purge(names: &mut HashMap<LowerName, Vec<Entry>>, now: Instant) {
-    names.retain(|_, entries| {
-        entries.retain(|e| e.expires > now);
-        !entries.is_empty()
-    });
+impl Inner {
+    fn purge(&mut self, now: Instant) {
+        self.names.retain(|_, entries| {
+            entries.retain(|e| e.expires > now);
+            !entries.is_empty()
+        });
+        self.last_purge = Some(now);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,4 +540,27 @@ mod tests {
         store.present_at(extra, VALUE, now + LIFETIME).unwrap();
         assert_eq!(store.len(), 1);
     }
+
+    #[test]
+    fn full_store_sweeps_at_most_once_a_second() {
+        let store = Challenges::new();
+        let now = Instant::now();
+        for i in 0..MAX_NAMES {
+            let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
+            store.present_at(n, VALUE, now).unwrap();
+        }
+        let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
+        // Just before the others expire: a sweep finds nothing to forget.
+        let swept = now + LIFETIME - Duration::from_millis(500);
+        assert_eq!(store.present_at(extra.clone(), VALUE, swept), Err(StoreFull));
+        // They have expired now, but the last sweep was too recent.
+        let soon = swept + Duration::from_millis(600);
+        assert_eq!(store.present_at(extra.clone(), VALUE, soon), Err(StoreFull));
+        // A second later the store sweeps again and has room.
+        store
+            .present_at(extra.clone(), VALUE, swept + PURGE_INTERVAL)
+            .unwrap();
+        assert_eq!(store.values_at(&extra, soon), [VALUE]);
+    }
+
 }
