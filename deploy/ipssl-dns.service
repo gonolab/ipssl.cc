@@ -6,7 +6,11 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml
-# `systemctl reload ipssl-dns` re-reads the config without a restart
+# `systemctl reload ipssl-dns` re-reads the config without a restart. The
+# check runs first, as the service user, so a config the server would
+# refuse (or cannot read) fails the reload instead of only being logged.
+# Keep its binary and config paths the same as ExecStart.
+ExecReload=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml --check
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=2
