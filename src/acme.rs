@@ -13,6 +13,8 @@
 //!   finds it whichever name server it asks.
 //! - Each name server keeps the values in memory for a few minutes
 //!   ([`Challenges`]) and takes writes only from the API hosts ([`Node`]).
+//!   A value belongs to the client network that presented it, which the
+//!   API sends along; only that network can clean it up.
 //!
 //! Only names with private addresses qualify ([`Zone::check_challenge`]),
 //! and values must look like real challenge digests, so the API cannot be
@@ -50,9 +52,15 @@ const MAX_NAMES: usize = 10_000;
 /// [`Challenges::present`].
 const PURGE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Most values held for one name: a certificate for a name and its
-/// wildcard needs two, and retries may add more. The oldest goes first.
-const MAX_VALUES: usize = 4;
+/// Most values held for one name, from all client networks together.
+/// Values are never pushed out early, so this is also how many pending
+/// values one name can have; 16 TXT records still fit in one 1232-byte
+/// UDP answer.
+const MAX_VALUES: usize = 16;
+
+/// Most values one client network may hold at one name: a certificate for
+/// a name and its wildcard needs two at once.
+const MAX_VALUES_PER_OWNER: usize = 2;
 
 /// Time the API gives each name server to take a change.
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,6 +98,12 @@ pub fn is_valid_value(value: &str) -> bool {
 }
 
 /// Challenge values published on this name server, by name.
+///
+/// Each value belongs to the client network that presented it through the
+/// API (the owner), and only that network can clean it up: values are
+/// public in DNS while a CA validates them, so knowing one proves nothing.
+/// Values are never pushed out before they expire; when a cap is reached,
+/// the new value is refused instead.
 #[derive(Default)]
 pub struct Challenges {
     inner: Mutex<Inner>,
@@ -104,35 +118,66 @@ struct Inner {
 
 struct Entry {
     value: String,
+    /// The client network that presented the value, as the API groups
+    /// clients. `None` for writes from an API that sends no owner.
+    owner: Option<IpAddr>,
     expires: Instant,
 }
 
-/// No room for another challenge name.
-#[derive(Debug, PartialEq, Eq)]
-pub struct StoreFull;
+/// Why a value could not be published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Full {
+    /// No room for another challenge name.
+    Store,
+    /// The name holds [`MAX_VALUES`] values already.
+    Name,
+    /// The owner holds [`MAX_VALUES_PER_OWNER`] values at the name already.
+    Owner,
+}
+
+impl Full {
+    /// The name server's answer to the API.
+    fn response(self) -> Response {
+        match self {
+            Self::Store => error(503, "too many challenges, try again later"),
+            Self::Name => error(
+                409,
+                &format!("this name already holds {MAX_VALUES} pending values"),
+            ),
+            Self::Owner => error(
+                409,
+                &format!(
+                    "this client network already holds {MAX_VALUES_PER_OWNER} pending values at this name"
+                ),
+            ),
+        }
+    }
+}
 
 impl Challenges {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Publishes `value` at `name`, or extends it if it is already there.
-    pub fn present(&self, name: LowerName, value: &str) -> Result<(), StoreFull> {
-        self.present_at(name, value, Instant::now())
+    /// Publishes `value` at `name` for `owner`, or extends it if `owner`
+    /// published it there already.
+    pub fn present(&self, name: LowerName, value: &str, owner: Option<IpAddr>) -> Result<(), Full> {
+        self.present_at(name, value, owner, Instant::now())
     }
 
-    /// Removes `value` from `name`, if it is there.
-    pub fn cleanup(&self, name: &LowerName, value: &str) {
+    /// Removes `value` from `name` if `owner` published it. Anything else
+    /// is left alone, the same value published by another owner included.
+    pub fn cleanup(&self, name: &LowerName, value: &str, owner: Option<IpAddr>) {
         let names = &mut self.lock().names;
         if let Some(entries) = names.get_mut(name) {
-            entries.retain(|e| e.value != value);
+            entries.retain(|e| e.value != value || e.owner != owner);
             if entries.is_empty() {
                 names.remove(name);
             }
         }
     }
 
-    /// The values currently published at `name`.
+    /// The values currently published at `name`, each once.
     pub fn values(&self, name: &LowerName) -> Vec<String> {
         self.values_at(name, Instant::now())
     }
@@ -152,7 +197,13 @@ impl Challenges {
         self.len() == 0
     }
 
-    fn present_at(&self, name: LowerName, value: &str, now: Instant) -> Result<(), StoreFull> {
+    fn present_at(
+        &self,
+        name: LowerName,
+        value: &str,
+        owner: Option<IpAddr>,
+        now: Instant,
+    ) -> Result<(), Full> {
         let mut inner = self.lock();
         if !inner.names.contains_key(&name) && inner.names.len() >= MAX_NAMES {
             // A sweep walks the whole table while TXT lookups wait for the
@@ -165,23 +216,32 @@ impl Challenges {
                 inner.purge(now);
             }
             if inner.names.len() >= MAX_NAMES {
-                return Err(StoreFull);
+                return Err(Full::Store);
             }
         }
         let entries = inner.names.entry(name).or_default();
         entries.retain(|e| e.expires > now);
         let expires = now + LIFETIME;
-        if let Some(entry) = entries.iter_mut().find(|e| e.value == value) {
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.value == value && e.owner == owner)
+        {
             entry.expires = expires;
             return Ok(());
         }
-        if entries.len() >= MAX_VALUES
-            && let Some(oldest) = (0..entries.len()).min_by_key(|&i| entries[i].expires)
+        // Writes without an owner cannot be told apart, so only the cap
+        // for the whole name applies to them.
+        if owner.is_some()
+            && entries.iter().filter(|e| e.owner == owner).count() >= MAX_VALUES_PER_OWNER
         {
-            entries.remove(oldest);
+            return Err(Full::Owner);
+        }
+        if entries.len() >= MAX_VALUES {
+            return Err(Full::Name);
         }
         entries.push(Entry {
             value: value.to_owned(),
+            owner,
             expires,
         });
         Ok(())
@@ -191,13 +251,7 @@ impl Challenges {
         self.lock()
             .names
             .get(name)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|e| e.expires > now)
-                    .map(|e| e.value.clone())
-                    .collect()
-            })
+            .map(|entries| live(entries, now).map(str::to_owned).collect())
             .unwrap_or_default()
     }
 
@@ -205,7 +259,7 @@ impl Challenges {
         self.lock()
             .names
             .values()
-            .map(|entries| entries.iter().filter(|e| e.expires > now).count())
+            .map(|entries| live(entries, now).count())
             .sum()
     }
 
@@ -223,6 +277,21 @@ impl Inner {
         });
         self.last_purge = Some(now);
     }
+}
+
+/// The unexpired values in `entries`, each once: two owners may publish
+/// the same value, and DNS answers carry it once.
+fn live(entries: &[Entry], now: Instant) -> impl Iterator<Item = &str> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(move |&(i, e)| {
+            e.expires > now
+                && !entries[..i]
+                    .iter()
+                    .any(|seen| seen.expires > now && seen.value == e.value)
+        })
+        .map(|(_, e)| e.value.as_str())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +314,16 @@ impl Action {
 struct Body {
     fqdn: String,
     value: String,
+}
+
+/// What the API adds to the body when it forwards a change to the name
+/// servers. Only name servers read it, never the public API.
+#[derive(Deserialize)]
+struct Forwarded {
+    /// The client network the change came from, which owns the value. An
+    /// API from before values had owners leaves it out.
+    #[serde(default)]
+    owner: Option<IpAddr>,
 }
 
 fn route(req: &Request) -> Result<Action, Response> {
@@ -292,6 +371,13 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
     Ok((name, body.value))
 }
 
+/// The owner the API sent with a change, see [`Forwarded`].
+fn owner(req: &Request) -> Result<Option<IpAddr>, Response> {
+    serde_json::from_slice::<Forwarded>(&req.body)
+        .map(|f| f.owner)
+        .map_err(|_| error(400, "owner must be an IP address"))
+}
+
 fn ok() -> Response {
     Response::new(200, JSON, r#"{"ok":true}"#)
 }
@@ -332,14 +418,19 @@ impl Node {
         let (name, value) = parse(&req, &zone).inspect_err(|_| {
             self.handler.metrics().acme_write(false);
         })?;
+        let owner = owner(&req).inspect_err(|_| {
+            self.handler.metrics().acme_write(false);
+        })?;
         match action {
             Action::Present => {
-                if self.store.present(name, &value).is_err() {
+                if let Err(full) = self.store.present(name, &value, owner) {
                     self.handler.metrics().acme_write(false);
-                    return Err(error(503, "too many challenges, try again later"));
+                    return Err(full.response());
                 }
             }
-            Action::Cleanup => self.store.cleanup(&name, &value),
+            // Removing nothing (a value this owner never published, or one
+            // already gone) still succeeds, so cleanup can be retried.
+            Action::Cleanup => self.store.cleanup(&name, &value, owner),
         }
         self.handler.metrics().acme_write(true);
         Ok(ok())
@@ -385,11 +476,20 @@ impl Api {
 
     async fn try_handle(&self, req: Request) -> Result<Response, Response> {
         let action = route(&req)?;
-        if self.limiter.check(client_ip(&req)) != Verdict::Allow {
+        let client = client_ip(&req);
+        if self.limiter.check(client) != Verdict::Allow {
             return Err(error(429, "too many requests, slow down"));
         }
         let (name, value) = parse(&req, &self.zone)?;
-        let body = serde_json::json!({ "fqdn": name.to_string(), "value": value }).to_string();
+        // The value belongs to the client's network, grouped as for rate
+        // limiting, so only that network can clean it up again.
+        let owner = self.limiter.network(client);
+        let body = serde_json::json!({
+            "fqdn": name.to_string(),
+            "value": value,
+            "owner": owner,
+        })
+        .to_string();
 
         let mut tasks = JoinSet::new();
         for &addr in &self.nodes {
@@ -397,21 +497,28 @@ impl Api {
             tasks.spawn(async move {
                 let result = timeout(NODE_TIMEOUT, post_json(addr, action.path(), &body)).await;
                 let problem = match result {
-                    Ok(Ok((200, _))) => return None,
+                    Ok(Ok((200, _))) => return Outcome::Accepted,
+                    // A cap on pending values: the client's to sort out.
+                    Ok(Ok((409, _))) => return Outcome::Rejected,
                     Ok(Ok((status, _))) => format!("HTTP {status}"),
                     Ok(Err(e)) => e.to_string(),
                     Err(_) => "timed out".to_owned(),
                 };
-                Some(format!("{addr} ({problem})"))
+                Outcome::Failed(format!("{addr} ({problem})"))
             });
         }
         let mut failed = Vec::new();
+        let mut rejected = false;
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok(None) => {}
-                Ok(Some(problem)) => failed.push(problem),
+                Ok(Outcome::Accepted) => {}
+                Ok(Outcome::Rejected) => rejected = true,
+                Ok(Outcome::Failed(problem)) => failed.push(problem),
                 Err(e) => failed.push(format!("task failed: {e}")),
             }
+        }
+        if rejected {
+            return Err(error(409, &too_many_values()));
         }
         if failed.is_empty() {
             return Ok(ok());
@@ -424,6 +531,25 @@ impl Api {
             &format!("not every name server took the change: {failed}"),
         ))
     }
+}
+
+/// What one name server did with a change.
+enum Outcome {
+    Accepted,
+    /// Refused because the name holds too many pending values.
+    Rejected,
+    /// No usable answer; the text says why, for the log.
+    Failed(String),
+}
+
+/// The API's answer when a name server refuses a value over a cap.
+fn too_many_values() -> String {
+    format!(
+        "this name already holds as many pending values as allowed \
+         ({MAX_VALUES_PER_OWNER} per client network, {MAX_VALUES} in all); \
+         clean up values you no longer need, or wait up to {} minutes for them to expire",
+        LIFETIME.as_secs() / 60
+    )
 }
 
 /// The client's address: `X-Real-IP` when the request comes through a
@@ -449,6 +575,10 @@ mod tests {
 
     fn name(s: &str) -> LowerName {
         LowerName::new(&Name::from_ascii(s).unwrap())
+    }
+
+    fn owner(s: &str) -> Option<IpAddr> {
+        Some(s.parse().unwrap())
     }
 
     #[test]
@@ -504,35 +634,102 @@ mod tests {
     fn store_publishes_and_expires() {
         let store = Challenges::new();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let me = owner("192.0.2.0");
         let now = Instant::now();
-        store.present_at(n.clone(), VALUE, now).unwrap();
-        store.present_at(n.clone(), "b", now).unwrap();
+        store.present_at(n.clone(), VALUE, me, now).unwrap();
+        store.present_at(n.clone(), "b", me, now).unwrap();
         assert_eq!(store.values_at(&n, now), [VALUE, "b"]);
 
-        store.cleanup(&n, "b");
+        store.cleanup(&n, "b", me);
         assert_eq!(store.values_at(&n, now), [VALUE]);
         assert!(store.values_at(&n, now + LIFETIME).is_empty());
 
         // Presenting again extends the lifetime instead of adding a copy.
         let later = now + LIFETIME / 2;
-        store.present_at(n.clone(), VALUE, later).unwrap();
+        store.present_at(n.clone(), VALUE, me, later).unwrap();
         assert_eq!(store.values_at(&n, now + LIFETIME), [VALUE]);
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len_at(now), 1);
 
-        store.cleanup(&n, VALUE);
+        store.cleanup(&n, VALUE, me);
         assert!(store.is_empty());
     }
 
     #[test]
-    fn store_keeps_the_newest_values() {
+    fn only_the_owner_cleans_up() {
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let (me, other) = (owner("192.0.2.0"), owner("198.51.100.0"));
+        let now = Instant::now();
+        store.present_at(n.clone(), VALUE, me, now).unwrap();
+
+        // Another network, or a write with no owner, removes nothing.
+        store.cleanup(&n, VALUE, other);
+        store.cleanup(&n, VALUE, None);
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+
+        // The same value from two owners is answered once and stays until
+        // both have cleaned it up.
+        store.present_at(n.clone(), VALUE, other, now).unwrap();
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        assert_eq!(store.len_at(now), 1);
+        store.cleanup(&n, VALUE, me);
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        store.cleanup(&n, VALUE, other);
+        assert!(store.values_at(&n, now).is_empty());
+    }
+
+    #[test]
+    fn writes_without_an_owner_belong_to_nobody_else() {
+        // What an API that sends no owner gets: such values are cleaned up
+        // by such writes, and only the cap for the whole name applies.
         let store = Challenges::new();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
         let now = Instant::now();
-        for i in 0..=MAX_VALUES {
-            let at = now + Duration::from_secs(i as u64);
-            store.present_at(n.clone(), &i.to_string(), at).unwrap();
+        for i in 0..MAX_VALUES {
+            store
+                .present_at(n.clone(), &i.to_string(), None, now)
+                .unwrap();
         }
-        assert_eq!(store.values_at(&n, now), ["1", "2", "3", "4"]);
+        assert_eq!(store.present_at(n.clone(), "x", None, now), Err(Full::Name));
+        store.cleanup(&n, "0", owner("192.0.2.0"));
+        assert_eq!(store.len_at(now), MAX_VALUES);
+        store.cleanup(&n, "0", None);
+        assert_eq!(store.len_at(now), MAX_VALUES - 1);
+    }
+
+    #[test]
+    fn live_values_are_never_pushed_out() {
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let me = owner("192.0.2.0");
+        let now = Instant::now();
+        store.present_at(n.clone(), "a", me, now).unwrap();
+        store.present_at(n.clone(), "b", me, now).unwrap();
+        // A third value from the same network is refused...
+        assert_eq!(store.present_at(n.clone(), "c", me, now), Err(Full::Owner));
+        // ...but extending one it holds is fine.
+        store.present_at(n.clone(), "a", me, now).unwrap();
+        assert_eq!(store.values_at(&n, now), ["a", "b"]);
+
+        // Other networks fill the name up to its cap.
+        for i in 1..MAX_VALUES / MAX_VALUES_PER_OWNER {
+            let them = owner(&format!("198.51.{i}.0"));
+            for v in ["a", "b"] {
+                store
+                    .present_at(n.clone(), &format!("{v}{i}"), them, now)
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.len_at(now), MAX_VALUES);
+        let late = owner("203.0.113.0");
+        assert_eq!(store.present_at(n.clone(), "z", late, now), Err(Full::Name));
+        assert_eq!(store.values_at(&n, now)[..2], ["a", "b"]);
+
+        // Once the first ones expire, there is room again.
+        let later = now + LIFETIME;
+        store.present_at(n.clone(), "z", late, later).unwrap();
+        store.present_at(n.clone(), "c", me, later).unwrap();
+        assert_eq!(store.values_at(&n, later), ["z", "c"]);
     }
 
     #[test]
@@ -541,12 +738,17 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, now).unwrap();
+            store.present_at(n, VALUE, None, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
-        assert_eq!(store.present_at(extra.clone(), VALUE, now), Err(StoreFull));
+        assert_eq!(
+            store.present_at(extra.clone(), VALUE, None, now),
+            Err(Full::Store)
+        );
         // Once the others expire there is room again.
-        store.present_at(extra, VALUE, now + LIFETIME).unwrap();
+        store
+            .present_at(extra, VALUE, None, now + LIFETIME)
+            .unwrap();
         assert_eq!(store.len_at(now + LIFETIME), 1);
     }
 
@@ -556,19 +758,18 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, now).unwrap();
+            store.present_at(n, VALUE, None, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
+        let present = |at| store.present_at(extra.clone(), VALUE, None, at);
         // Just before the others expire: a sweep finds nothing to forget.
         let swept = now + LIFETIME - Duration::from_millis(500);
-        assert_eq!(store.present_at(extra.clone(), VALUE, swept), Err(StoreFull));
+        assert_eq!(present(swept), Err(Full::Store));
         // They have expired now, but the last sweep was too recent.
         let soon = swept + Duration::from_millis(600);
-        assert_eq!(store.present_at(extra.clone(), VALUE, soon), Err(StoreFull));
+        assert_eq!(present(soon), Err(Full::Store));
         // A second later the store sweeps again and has room.
-        store
-            .present_at(extra.clone(), VALUE, swept + PURGE_INTERVAL)
-            .unwrap();
+        present(swept + PURGE_INTERVAL).unwrap();
         assert_eq!(store.values_at(&extra, soon), [VALUE]);
     }
 
@@ -577,7 +778,7 @@ mod tests {
         let store = Challenges::new();
         let now = Instant::now();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        store.present_at(n.clone(), VALUE, now).unwrap();
+        store.present_at(n.clone(), VALUE, None, now).unwrap();
         assert_eq!(store.len_at(now), 1);
         // Gone from the count as soon as DNS stops serving it, before any purge.
         assert_eq!(store.len_at(now + LIFETIME), 0);

@@ -8,7 +8,8 @@ use std::time::Duration;
 use hickory_server::Server;
 use hickory_server::proto::op::{Message, Query, ResponseCode};
 use hickory_server::proto::rr::{Name, RData, RecordType};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 
 use ipssl::acme::{Api, Challenges, Node};
@@ -74,6 +75,34 @@ async fn api(nodes: &[SocketAddr], extra: &str) -> SocketAddr {
 
 fn body(fqdn: &str, value: &str) -> String {
     serde_json::json!({ "fqdn": fqdn, "value": value }).to_string()
+}
+
+/// Another valid challenge value, told apart by its first character.
+fn value(first: char) -> String {
+    format!("{first}{}", &VALUE[1..])
+}
+
+/// Sends `body` to the API the way the TLS proxy in front of it does for
+/// a client at `client`; returns the status and the body of the answer.
+async fn post_as(api: SocketAddr, client: &str, path: &str, body: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(api).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: ipssl.cc\r\nX-Real-IP: {client}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, body.to_owned())
+}
+
+async fn sorted_values(dns: SocketAddr) -> Vec<String> {
+    let mut values = values(&txt(dns, NAME).await);
+    values.sort();
+    values
 }
 
 async fn txt(dns: SocketAddr, name: &str) -> Message {
@@ -205,4 +234,79 @@ async fn name_server_only_takes_writes_from_writers() {
         .unwrap();
     assert_eq!(status, 403);
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
+async fn only_the_presenting_network_cleans_up() {
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write], "").await;
+    let request = body(NAME, VALUE);
+    assert_eq!(
+        post_as(api, "192.0.2.10", "/present", &request).await.0,
+        200
+    );
+
+    // Values are public in DNS, so knowing one proves nothing: another
+    // network's cleanup succeeds but removes nothing.
+    let (status, reply) = post_as(api, "198.51.100.7", "/cleanup", &request).await;
+    assert_eq!((status, reply.as_str()), (200, r#"{"ok":true}"#));
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+
+    // The owner is the client's network, as for rate limiting (/24).
+    assert_eq!(
+        post_as(api, "192.0.2.99", "/cleanup", &request).await.0,
+        200
+    );
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
+async fn api_refuses_values_over_the_caps_without_pushing_any_out() {
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write], "").await;
+    for v in ['A', 'B'] {
+        let (status, reply) = post_as(api, "192.0.2.10", "/present", &body(NAME, &value(v))).await;
+        assert_eq!(status, 200, "{reply}");
+    }
+    // A third value from the same network: a clear error, not an eviction.
+    let (status, reply) = post_as(api, "192.0.2.10", "/present", &body(NAME, &value('C'))).await;
+    assert_eq!(status, 409, "{reply}");
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let message = reply["error"].as_str().unwrap();
+    assert!(message.contains("2 per client network"), "{message}");
+    assert_eq!(sorted_values(ns.dns).await, [value('A'), value('B')]);
+
+    // Another network still has room of its own.
+    let (status, _) = post_as(api, "198.51.100.7", "/present", &body(NAME, &value('C'))).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        sorted_values(ns.dns).await,
+        [value('A'), value('B'), value('C')]
+    );
+}
+
+#[tokio::test]
+async fn name_server_takes_writes_with_and_without_an_owner() {
+    // During an upgrade the name servers may meet an API that sends no
+    // owner. Its values belong to no network, so only its own cleanups
+    // (which carry no owner either) remove them.
+    let ns = name_server("127.0.0.1").await;
+    let owned = |owner: &str| {
+        serde_json::json!({ "fqdn": NAME, "value": VALUE, "owner": owner }).to_string()
+    };
+    let write = |path, body: String| async move { post_json(ns.write, path, &body).await.unwrap() };
+
+    assert_eq!(write("/present", body(NAME, VALUE)).await.0, 200);
+    assert_eq!(write("/cleanup", owned("192.0.2.0")).await.0, 200);
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    assert_eq!(write("/cleanup", body(NAME, VALUE)).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    assert_eq!(write("/present", owned("192.0.2.0")).await.0, 200);
+    assert_eq!(write("/cleanup", body(NAME, VALUE)).await.0, 200);
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    assert_eq!(write("/cleanup", owned("192.0.2.0")).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    assert_eq!(write("/present", owned("nobody")).await.0, 400);
 }

@@ -177,7 +177,7 @@ impl RateLimiter {
     }
 
     /// The client's network address, used as the bucket key.
-    fn network(&self, client: IpAddr) -> IpAddr {
+    pub fn network(&self, client: IpAddr) -> IpAddr {
         match client {
             IpAddr::V4(ip) => {
                 let mask = u32::MAX.checked_shl(32 - u32::from(self.ipv4_prefix));
