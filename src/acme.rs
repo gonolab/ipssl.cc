@@ -70,11 +70,19 @@ pub fn is_private(ip: IpAddr) -> bool {
 
 /// Whether `value` looks like a DNS-01 TXT value: the unpadded base64url
 /// SHA-256 digest of a key authorization, always 43 characters.
+///
+/// 43 characters carry 258 bits for the digest's 256, and a canonical
+/// encoding leaves the last two zero (RFC 4648 section 3.5), so the final
+/// character is one of the 16 whose value is a multiple of four. Anything
+/// else is a client-side encoding mistake that would only show up when
+/// the CA fails to validate.
 pub fn is_valid_value(value: &str) -> bool {
+    const LAST: &[u8] = b"AEIMQUYcgkosw048";
     value.len() == 43
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && value.bytes().last().is_some_and(|b| LAST.contains(&b))
 }
 
 /// Challenge values published on this name server, by name.
@@ -246,7 +254,7 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
     if !is_valid_value(&body.value) {
         return Err(error(
             400,
-            "value must be a DNS-01 digest (43 base64url characters)",
+            "value must be a DNS-01 digest: a SHA-256 hash as 43 base64url characters",
         ));
     }
     Ok((name, body.value))
@@ -448,6 +456,16 @@ mod tests {
         assert!(!is_valid_value(&format!("{}=", &VALUE[1..])));
         assert!(!is_valid_value(&format!("{} ", &VALUE[1..])));
         assert!(!is_valid_value("v=spf1 include:example.net ~all"));
+
+        // Only 16 final characters leave the padding bits zero.
+        let stem = &VALUE[..42];
+        let last = |c: char| is_valid_value(&format!("{stem}{c}"));
+        for c in "AEIMQUYcgkosw048".chars() {
+            assert!(last(c), "{c}");
+        }
+        for c in "BNZdhx19-_".chars() {
+            assert!(!last(c), "{c}");
+        }
     }
 
     #[test]
