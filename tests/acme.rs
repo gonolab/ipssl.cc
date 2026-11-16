@@ -310,3 +310,15 @@ async fn name_server_takes_writes_with_and_without_an_owner() {
 
     assert_eq!(write("/present", owned("nobody")).await.0, 400);
 }
+
+#[tokio::test]
+async fn punycode_names_reach_the_name_servers() {
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write], "").await;
+    let name = "_acme-challenge.xn--bcher-kva.10-0-2-2.ipssl.cc.";
+    let (status, reply) = post_json(api, "/present", &body(name, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(values(&txt(ns.dns, name).await), [VALUE]);
+}

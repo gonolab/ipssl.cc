@@ -484,8 +484,10 @@ impl Api {
         // The value belongs to the client's network, grouped as for rate
         // limiting, so only that network can clean it up again.
         let owner = self.limiter.network(client);
+        // The ASCII form: `to_string` turns Punycode labels into Unicode,
+        // which name servers would reject.
         let body = serde_json::json!({
-            "fqdn": name.to_string(),
+            "fqdn": name.to_ascii(),
             "value": value,
             "owner": owner,
         })
