@@ -1,9 +1,10 @@
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -66,14 +67,7 @@ async fn main() -> Result<()> {
     let (config, zone) = load(&args.config)?;
     warn_about(&config);
     let limiter = RateLimiter::from_config(&config.rate_limit)?;
-    let mut listeners = Vec::new();
-    for addr in &config.listen {
-        let udp = ipssl::bind_udp(*addr).with_context(|| format!("binding udp {addr}"))?;
-        let tcp = ipssl::bind_tcp(*addr).with_context(|| format!("binding tcp {addr}"))?;
-        info!(%addr, "listening (udp + tcp)");
-        listeners.push(Listener::Udp(udp));
-        listeners.push(Listener::Tcp(tcp));
-    }
+    let listeners = bind_dns(&config.listen)?;
 
     if limiter.is_none() {
         warn!("UDP rate limiting is off");
@@ -145,6 +139,32 @@ fn warn_about(config: &Config) {
     {
         warn!("acme.writers is empty, so no challenge can be published");
     }
+}
+
+/// Binds UDP and TCP on every DNS address. On a kernel without IPv6,
+/// `[::]` (in the default `listen`) is skipped with a warning; every other
+/// failure is fatal.
+fn bind_dns(addrs: &[SocketAddr]) -> Result<Vec<Listener>> {
+    let mut listeners = Vec::new();
+    for &addr in addrs {
+        let udp = match ipssl::bind_udp(addr) {
+            Ok(socket) => socket,
+            Err(e) if ipssl::ipv6_unavailable(addr, &e) => {
+                warn!(%addr, "not listening: this system has no IPv6 ({e})");
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("binding udp {addr}")),
+        };
+        let tcp = ipssl::bind_tcp(addr).with_context(|| format!("binding tcp {addr}"))?;
+        info!(%addr, "listening (udp + tcp)");
+        listeners.push(Listener::Udp(udp));
+        listeners.push(Listener::Tcp(tcp));
+    }
+    ensure!(
+        !listeners.is_empty(),
+        "no DNS listener: every address in listen was skipped"
+    );
+    Ok(listeners)
 }
 
 /// Serves the DNS-01 challenge API until SIGTERM or Ctrl-C. Config changes

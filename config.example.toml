@@ -13,7 +13,8 @@ domain = "ipssl.cc"
 # port (not 0). They must not overlap each other or the `[metrics]` and
 # `[acme]` listeners (a wildcard such as 0.0.0.0 covers every address of
 # its family). IPv6 addresses are IPv6-only, so 0.0.0.0:53 and [::]:53 can
-# be used together.
+# be used together; on a system without IPv6, [::] is skipped with a
+# warning.
 # On Ubuntu, systemd-resolved holds 127.0.0.53:53, which can make binding
 # 0.0.0.0:53 fail: either disable its stub listener or list the server's
 # public IP here instead.

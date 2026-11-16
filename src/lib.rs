@@ -11,7 +11,7 @@ pub mod zone;
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, ensure};
@@ -137,6 +137,24 @@ async fn supervise<T: RequestHandler>(
     Ok(())
 }
 
+/// Whether binding `addr` failed only because the kernel has no IPv6
+/// (`EAFNOSUPPORT` for the unspecified address `[::]`). The default
+/// `listen` includes `[::]:53`, so a server without IPv6 can skip it and
+/// still serve IPv4. A specific IPv6 address is always an error.
+pub fn ipv6_unavailable(addr: SocketAddr, error: &io::Error) -> bool {
+    addr.ip() == IpAddr::V6(Ipv6Addr::UNSPECIFIED) && is_eafnosupport(error)
+}
+
+#[cfg(unix)]
+fn is_eafnosupport(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EAFNOSUPPORT)
+}
+
+#[cfg(not(unix))]
+fn is_eafnosupport(_error: &io::Error) -> bool {
+    false
+}
+
 /// Binds a UDP socket. IPv6 sockets are IPv6-only, so `0.0.0.0:53` and
 /// `[::]:53` can be listened on side by side.
 pub fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
@@ -209,5 +227,22 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_the_ipv6_wildcard_may_be_skipped() {
+        #[cfg(unix)]
+        let unsupported = io::Error::from_raw_os_error(libc::EAFNOSUPPORT);
+        #[cfg(not(unix))]
+        let unsupported = io::Error::other("no IPv6");
+        let other = io::Error::from(io::ErrorKind::AddrInUse);
+        let any6: SocketAddr = "[::]:53".parse().unwrap();
+        let one6: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let any4: SocketAddr = "0.0.0.0:53".parse().unwrap();
+
+        assert_eq!(ipv6_unavailable(any6, &unsupported), cfg!(unix));
+        assert!(!ipv6_unavailable(any6, &other));
+        assert!(!ipv6_unavailable(one6, &unsupported));
+        assert!(!ipv6_unavailable(any4, &unsupported));
     }
 }

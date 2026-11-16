@@ -549,6 +549,7 @@ dependencies = [
  "clap",
  "hickory-server",
  "ipnet",
+ "libc",
  "serde",
  "serde_json",
  "socket2",
