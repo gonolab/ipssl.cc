@@ -607,8 +607,12 @@ p {
   color: var(--muted);
 }
 
-.copy[data-copied] {
+.copy[data-copied="ok"] {
   color: var(--ok);
+}
+
+.copy[data-copied="fail"] {
+  color: var(--bad);
 }
 
 /* Annotations under the bar. Anchored: thin lines up to the lock and the
@@ -713,6 +717,8 @@ p {
   font-size: 15.5px;
   font-weight: 600;
   line-height: 1.5;
+  /* A long IPv6 address must not widen the page on a phone. */
+  overflow-wrap: anywhere;
 }
 
 .callouts[data-state="error"] .callout-name .callout-title,
@@ -739,6 +745,13 @@ p {
   background: var(--soft);
   color: var(--accent);
   font: 600 11.5px/1.6 var(--mono);
+}
+
+/* Why a CA would refuse this name, under the certificate note. */
+.callout-warn {
+  display: block;
+  margin-top: 4px;
+  color: var(--warn);
 }
 
 .callout-link {
@@ -858,6 +871,11 @@ p {
 
 .trace[data-state="bad"] .trace-path li + li::before {
   background: color-mix(in srgb, var(--bad) 50%, var(--line));
+}
+
+/* An answer with nothing to compare it to: a name without an address. */
+.trace[data-state="info"] .trace-path li + li::before {
+  background: color-mix(in srgb, var(--accent) 45%, var(--line));
 }
 
 @keyframes travel {
@@ -1145,17 +1163,22 @@ p {
 
 .forms .z {
   color: var(--muted);
+  white-space: nowrap;
+}
+
+/* Long names wrap only at the <wbr> the script puts after "-" and ":" and
+   before ".", so the copy button at the end of the row stays in view. */
+.forms td.n {
+  width: 44%;
 }
 
 .forms td.n code {
   font-size: 14px;
   font-weight: 500;
-  white-space: nowrap;
 }
 
 .forms td.r code {
   color: var(--text);
-  white-space: nowrap;
 }
 
 .forms td.note {
@@ -1400,7 +1423,7 @@ p {
   line-height: 1.5;
 }
 
-.snip-foot p[data-kind="other"] {
+.snip-foot p[data-tone="warn"] {
   color: var(--code-warn);
 }
 
@@ -1413,8 +1436,12 @@ p {
   color: #fff;
 }
 
-.copy-dark[data-copied] {
+.copy-dark[data-copied="ok"] {
   color: #34d399;
+}
+
+.copy-dark[data-copied="fail"] {
+  color: #f87171;
 }
 
 /* FAQ */
@@ -1765,6 +1792,7 @@ p {
   .forms td.n {
     grid-column: 1;
     grid-row: 1;
+    width: auto;
   }
 
   .forms td.c {

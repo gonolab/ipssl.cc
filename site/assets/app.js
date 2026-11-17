@@ -118,7 +118,12 @@
     return `${hex.slice(0, best).join(":")}::${hex.slice(best + bestLen).join(":")}`;
   }
 
-  const ipText = (ip) => (ip.v === 4 ? ip.a.join(".") : v6Text(ip.a));
+  /** Address text; an IPv4-mapped address keeps its IPv4 tail (::ffff:10.0.0.1). */
+  const ipText = (ip) => {
+    if (ip.v === 4) return ip.a.join(".");
+    const v4 = mappedV4(ip);
+    return v4 ? `::ffff:${v4.a.join(".")}` : v6Text(ip.a);
+  };
 
   /**
    * IPv6 as one label. A label may not start or end with "-", so a leading
@@ -156,8 +161,20 @@
 
   const nameText = (n) => n.pre + n.addr + n.zone;
 
+  /** The IPv4 address inside ::ffff:0:0/96 (::ffff:192.168.1.10), or null. */
+  const mappedV4 = (ip) =>
+    ip.v === 6 && ip.a.slice(0, 5).every((g) => g === 0) && ip.a[5] === 0xffff
+      ? { v: 4, a: [ip.a[6] >> 8, ip.a[6] & 0xff, ip.a[7] >> 8, ip.a[7] & 0xff] }
+      : null;
+
+  /** fe80::/10, which needs an interface scope that a name cannot carry. */
+  const isLinkLocal6 = (ip) => ip.v === 6 && (ip.a[0] & 0xffc0) === 0xfe80;
+
   /** Where an address can be used: public, private, documentation, other. */
   function kindOf(ip) {
+    // An IPv4-mapped address counts as the IPv4 address inside, as on the server.
+    const v4 = mappedV4(ip);
+    if (v4) return kindOf(v4);
     const a = ip.a;
     if (ip.v === 4) {
       const [x, y, z] = a;
@@ -227,23 +244,34 @@
       empty: "Type an IP address such as 10.0.2.2, or a name such as app.10-0-2-2.ipssl.cc.",
       invalid: "Use digits, letters, dots and dashes, as in 10.0.2.2 or app.10-0-2-2.ipssl.cc.",
       zoneId: "Drop the zone index (%…); a name cannot carry it.",
+      outside: "The final dot ends the name there, and it is not under ipssl.cc. Drop the dot to put it in front of .ipssl.cc.",
+      hyphen: "A label, the part between two dots, cannot start or end with a dash.",
+      labelLong: "A label, the part between two dots, can be at most 63 characters long.",
+      nameLong: "With .ipssl.cc, the whole name can be at most 253 characters long.",
       found: "{name} resolves to {ip}.",
       "name.resolves": "Resolves to {ip}",
       "name.pending": "Press Enter to turn it into a name",
       "name.noneTitle": "No IP address in this name",
-      "name.none": "ipssl.cc answers NXDOMAIN for it. Put an address in it, such as app.10-0-2-2.ipssl.cc.",
+      "name.none": "Put one in, as in app.10-0-2-2.ipssl.cc, and the name resolves to that address.",
       "name.errorTitle": "Not an IP address or a hostname",
+      "name.badTitle": "Not a valid hostname",
+      "name.outsideTitle": "Not a name under ipssl.cc",
       "name.emptyTitle": "Type an IP address",
       "kind.public": "Public address. No DNS server of your own, nothing to register.",
       "kind.private": "Private address. Nothing to set up, though some routers block answers like this one.",
+      "kind.linklocal": "Link-local address. Most systems and browsers cannot reach it by name, since a name carries no interface scope. Use a ULA (fd00::/8) or a global address.",
       "kind.doc": "Documentation address, reserved for examples.",
       "kind.other": "Not a public unicast address.",
       "cert.public": "Run one command on the server at {ip}, and Let's Encrypt or any other CA issues it.",
-      "cert.doc": "Run one command on the server that owns the address, and any CA issues it.",
+      "cert.doc": "{ip} is an example address, reserved for documentation, so no CA validates it. Type your server's public address instead.",
       "cert.private": "A CA cannot reach {ip}, so ipssl.cc proves the name through DNS for you. Get it from any machine.",
+      "cert.tooLong": "This name is too long for a DNS-01 challenge: with _acme-challenge. in front, it passes 253 characters. Keep it to 237.",
       "cert.other": "No CA issues certificates for {ip}.",
       "cert.none": "Put an IP address in the name to get a certificate for it.",
+      "le.labels": "Let's Encrypt refuses names with more than 10 labels, and this one has {n}.",
+      "le.rldh": "Let's Encrypt refuses labels with -- as the third and fourth characters, such as {label}.",
       "ai.prompt": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} a hostname under ipssl.cc and an SSL certificate for it.",
+      "ai.promptName": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} the hostname {name} and an SSL certificate for it.",
       "ai.promptNoIp": "Read https://ipssl.cc/llms.txt, then give my machine a hostname under ipssl.cc and an SSL certificate for it.",
       "forms.caption": "Every way to write {ip}",
       "anat.label": "Your label, optional",
@@ -260,12 +288,14 @@
       "form.v6words": "Words in front of an IPv6 address go in their own label",
       "form.v6full": "Every group written out",
       "note.public": "Run it on the server at {ip}.",
-      "note.doc": "Run it on the server that owns the address.",
+      "note.doc": "Example only: no CA validates {ip}. Type your server's public IP above.",
       "note.publicEx": "Example name. Type a public IP above to use yours.",
       "note.private": "Run it on any machine with internet access.",
       "note.privateEx": "Example name. Type a private IP above to use yours.",
+      "note.tooLong": "Example name. Yours is too long for a DNS-01 challenge; keep it to 237 characters.",
       copy: "Copy",
       copied: "Copied",
+      copyFailed: "Could not copy. Select the text and copy it yourself.",
       copyName: "Copy {name}",
       copyPrompt: "Copy prompt",
       copyCmd: "Copy command",
@@ -273,9 +303,11 @@
       checking: "Asking Cloudflare DNS…",
       match: "Resolves correctly",
       mismatch: "Expected {want}",
+      mismatchOnly: "Expected only {want}",
       nx: "NXDOMAIN: the name does not exist.",
       nodata: "No {type} record for this name.",
-      error: "Could not reach Cloudflare DNS. Try dig +short {name} instead.",
+      rcode: "DNS error {rcode}: Cloudflare DNS got no answer for this name.",
+      error: "Could not reach Cloudflare DNS. Try dig +short {type} {name} instead.",
       ttl: "TTL {ttl}s",
     },
     zh: {
@@ -286,23 +318,34 @@
       empty: "输入一个 IP 地址，比如 10.0.2.2，或者一个域名，比如 app.10-0-2-2.ipssl.cc。",
       invalid: "只能用数字、字母、点和横杠，比如 10.0.2.2 或 app.10-0-2-2.ipssl.cc。",
       zoneId: "去掉接口标识（%…），域名里放不下它。",
+      outside: "末尾的点表示名字到此结束，而它不在 ipssl.cc 下。去掉这个点，它就会接在 .ipssl.cc 前面。",
+      hyphen: "标签（两个点之间的部分）不能以横杠开头或结尾。",
+      labelLong: "标签（两个点之间的部分）最长 63 个字符。",
+      nameLong: "加上 .ipssl.cc，整个名字最长 253 个字符。",
       found: "{name} 解析到 {ip}。",
       "name.resolves": "解析到 {ip}",
       "name.pending": "按回车把它变成域名",
       "name.noneTitle": "这个名字里没有 IP 地址",
-      "name.none": "ipssl.cc 会返回 NXDOMAIN。在名字里放一个地址，比如 app.10-0-2-2.ipssl.cc。",
+      "name.none": "放一个进去，比如 app.10-0-2-2.ipssl.cc，名字就会解析到这个地址。",
       "name.errorTitle": "这不是 IP 地址，也不是域名",
+      "name.badTitle": "这不是有效的域名",
+      "name.outsideTitle": "这不是 ipssl.cc 下的名字",
       "name.emptyTitle": "输入一个 IP 地址",
       "kind.public": "公网地址。不用自己搭 DNS，也不用注册。",
       "kind.private": "私有地址。不用任何设置，但有些路由器会拦截这类应答。",
+      "kind.linklocal": "链路本地地址。域名带不了网卡标识，多数系统和浏览器无法通过域名访问它。请改用 ULA（fd00::/8）或全局地址。",
       "kind.doc": "文档示例地址，只用于举例。",
       "kind.other": "不是公网单播地址。",
       "cert.public": "在 {ip} 这台服务器上运行一条命令，Let's Encrypt 等任意 CA 都能签发。",
-      "cert.doc": "在拥有这个地址的服务器上运行一条命令，任意 CA 都能签发。",
+      "cert.doc": "{ip} 是文档专用的示例地址，没有 CA 会验证它。请换成你服务器的公网地址。",
       "cert.private": "CA 访问不到 {ip}，由 ipssl.cc 通过 DNS 替你完成验证，在任意机器上都能申请。",
+      "cert.tooLong": "这个名字太长，做不了 DNS-01 验证：前面加上 _acme-challenge. 后超过 253 个字符。请控制在 237 个字符以内。",
       "cert.other": "{ip} 这类地址申请不到证书。",
       "cert.none": "名字里要有 IP 地址，才能为它申请证书。",
+      "le.labels": "Let's Encrypt 不接受超过 10 级标签的名字，这个名字有 {n} 级。",
+      "le.rldh": "Let's Encrypt 不接受第 3、4 个字符是 -- 的标签，比如 {label}。",
       "ai.prompt": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
+      "ai.promptName": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配上域名 {name}，并为它申请 SSL 证书。",
       "ai.promptNoIp": "请阅读 https://ipssl.cc/llms.txt，然后给我的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
       "forms.caption": "{ip} 的所有写法",
       "anat.label": "可选前缀",
@@ -319,12 +362,14 @@
       "form.v6words": "IPv6 地址前面的词要单独放一级标签",
       "form.v6full": "每一组都完整写出",
       "note.public": "在 {ip} 这台服务器上运行。",
-      "note.doc": "在拥有这个地址的服务器上运行。",
+      "note.doc": "仅作示例：没有 CA 会验证 {ip}。请在上面输入你服务器的公网 IP。",
       "note.publicEx": "示例域名。在上面输入公网 IP，就会换成你的。",
       "note.private": "在任意一台能上网的机器上运行。",
       "note.privateEx": "示例域名。在上面输入内网 IP，就会换成你的。",
+      "note.tooLong": "示例域名。你的名字太长，做不了 DNS-01 验证，请控制在 237 个字符以内。",
       copy: "复制",
       copied: "已复制",
+      copyFailed: "复制失败，请手动选中文字复制。",
       copyName: "复制 {name}",
       copyPrompt: "复制提示词",
       copyCmd: "复制命令",
@@ -332,9 +377,11 @@
       checking: "正在查询 Cloudflare DNS…",
       match: "解析正确",
       mismatch: "预期是 {want}",
+      mismatchOnly: "预期只有 {want}",
       nx: "NXDOMAIN：这个名字不存在。",
       nodata: "这个名字没有 {type} 记录。",
-      error: "连不上 Cloudflare DNS，可以改用 dig +short {name} 查询。",
+      rcode: "DNS 错误 {rcode}：Cloudflare DNS 没拿到这个名字的应答。",
+      error: "连不上 Cloudflare DNS，可以改用 dig +short {type} {name} 查询。",
       ttl: "TTL {ttl} 秒",
     },
   };
@@ -439,7 +486,10 @@
 
   let lang = "en";
   let family = 4; // address family shown in the names section
-  let current = null; // { ip, kind, names, query } for the address in the bar
+  let reading = { state: "empty" }; // what readInput made of the bar
+  let current = null; // { ip, kind, query } for the address in the bar
+  let target = null; // { name, ip } for the live check; ip is null for a name without one
+  let result = null; // the live check, kept as data so a language switch can redraw it
   let checkSeq = 0;
 
   const t = (key, vars = {}) =>
@@ -452,9 +502,17 @@
   const ICON_CHECK = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5 9.5 17 19 7.5"/></svg>';
   const ICON_X = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7 7 17"/></svg>';
 
+  const MAX_NAME = 253; // DNS limit for a whole name, without the final dot
+  const MAX_LABEL = 63;
+  // A DNS-01 challenge lives at _acme-challenge.<name>, which must fit too.
+  const MAX_DNS01_NAME = MAX_NAME - "_acme-challenge.".length;
+
   /** Reads the bar: an IP address, or a hostname to run through the parser. */
   function readInput(raw) {
-    const s = raw.trim().toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+    let s = raw.trim().toLowerCase().replace(/^\[|\]$/g, "");
+    // A final dot makes the name absolute: it must already end in the zone.
+    const absolute = s.endsWith(".");
+    if (absolute) s = s.slice(0, -1);
     if (!s) return { state: "empty" };
     if (s.includes(":")) {
       if (s.includes("%")) return { state: "error", msg: "zoneId" };
@@ -466,10 +524,27 @@
       if (a) return { state: "ip", ip: { v: 4, a } };
     }
     if (!/^[a-z0-9.-]+$/.test(s) || s.split(".").some((l) => l === "")) return { state: "error", msg: "invalid" };
-    const name = s.endsWith(`.${ZONE}`) ? s : `${s}.${ZONE}`;
-    const labels = s === ZONE ? [] : s.endsWith(`.${ZONE}`) ? s.slice(0, -ZONE.length - 1).split(".") : s.split(".");
+    const inZone = s === ZONE || s.endsWith(`.${ZONE}`);
+    if (absolute && !inZone) return { state: "error", msg: "outside", title: "name.outsideTitle" };
+    const name = inZone ? s : `${s}.${ZONE}`;
+    const labels = s === ZONE ? [] : inZone ? s.slice(0, -ZONE.length - 1).split(".") : s.split(".");
+    // Hostname rules: letters, digits and inner dashes, 63 per label, 253 in all.
+    if (labels.some((l) => l.startsWith("-") || l.endsWith("-"))) return { state: "error", msg: "hyphen", title: "name.badTitle" };
+    if (labels.some((l) => l.length > MAX_LABEL)) return { state: "error", msg: "labelLong", title: "name.badTitle" };
+    if (name.length > MAX_NAME) return { state: "error", msg: "nameLong", title: "name.badTitle" };
     const ip = extractIp(labels);
     return ip ? { state: "name", ip, name, labels } : { state: "none", name, labels };
+  }
+
+  /** Why Let's Encrypt would refuse `name` though DNS answers for it. */
+  function leProblems(name) {
+    const labels = name.split(".");
+    const out = [];
+    if (labels.length > 10) out.push(t("le.labels", { n: labels.length }));
+    // "ab--" is reserved for encodings; only punycode's "xn--" is allowed.
+    const reserved = labels.find((l) => l.length >= 4 && l.slice(2, 4) === "--" && !l.startsWith("xn--"));
+    if (reserved) out.push(t("le.rldh", { label: reserved }));
+    return out;
   }
 
   // ---------------------------------------------------------------------
@@ -499,6 +574,8 @@
 
   const badge = (ip) => `<strong>IPv${ip.v}</strong>`;
 
+  const warn = (s) => `<span class="callout-warn">${escapeHtml(s)}</span>`;
+
   /** The two annotations under the bar and the prompt for an AI agent. */
   function renderCallouts(r) {
     let title;
@@ -506,33 +583,44 @@
     let cert;
     if (r.state === "ip" || r.state === "name") {
       const ip = ipText(r.ip);
-      const kind = kindOf(r.ip);
+      const { kind, query } = current;
       if (r.state === "ip") {
         title = escapeHtml(t("name.pending"));
-        text = badge(r.ip) + escapeHtml(t("found", { name: nameText(namesFor(r.ip)[0]), ip }));
+        text = badge(r.ip) + escapeHtml(t("found", { name: query, ip }));
       } else {
         title = escapeHtml(t("name.resolves", { ip }));
-        text = badge(r.ip) + escapeHtml(t(`kind.${kind}`));
+        text = badge(r.ip) + escapeHtml(t(isLinkLocal6(r.ip) ? "kind.linklocal" : `kind.${kind}`));
       }
-      cert = t(`cert.${kind}`, { ip });
+      if (kind === "private" && query.length > MAX_DNS01_NAME) {
+        cert = warn(t("cert.tooLong"));
+      } else {
+        cert = escapeHtml(t(`cert.${kind}`, { ip }));
+        if (kind === "public" || kind === "private") cert += leProblems(query).map(warn).join("");
+      }
     } else if (r.state === "none") {
       title = escapeHtml(t("name.noneTitle"));
       text = escapeHtml(t("name.none"));
-      cert = t("cert.none");
+      cert = escapeHtml(t("cert.none"));
     } else if (r.state === "error") {
-      title = escapeHtml(t("name.errorTitle"));
+      title = escapeHtml(t(r.title || "name.errorTitle"));
       text = escapeHtml(t(r.msg));
-      cert = t("cert.none");
+      cert = escapeHtml(t("cert.none"));
     } else {
       title = escapeHtml(t("name.emptyTitle"));
       text = escapeHtml(t("empty"));
-      cert = t("cert.none");
+      cert = escapeHtml(t("cert.none"));
     }
     nameTitle.innerHTML = title;
     nameTextEl.innerHTML = text;
-    certText.textContent = cert;
+    certText.innerHTML = cert;
     callouts.dataset.state = r.state;
-    aiPrompt.textContent = r.ip ? t("ai.prompt", { ip: ipText(r.ip) }) : t("ai.promptNoIp");
+    // A typed name goes into the prompt whole, so the agent keeps its labels.
+    aiPrompt.textContent =
+      r.state === "name"
+        ? t("ai.promptName", { ip: ipText(r.ip), name: r.name })
+        : r.ip
+          ? t("ai.prompt", { ip: ipText(r.ip) })
+          : t("ai.promptNoIp");
   }
 
   /** The forms table: every way to write the address, each one copyable. */
@@ -561,13 +649,17 @@
       ];
       if (full !== label) rows.push(["", full, "", "form.v6full"]);
     }
-    const resolved = escapeHtml(ipText(ip));
+    // Long names wrap where a reader expects it: after "-" and ":", before
+    // "." and before the zone, which stays whole. The copy button stays in view.
+    const wrap = (s) => escapeHtml(s).replace(/([-:]+)/g, "$1<wbr>").replace(/\./g, "<wbr>.");
+    // An IPv4 answer is short enough to keep whole; IPv6 may break after ":".
+    const resolved = ip.v === 6 ? wrap(ipText(ip)) : escapeHtml(ipText(ip));
     formsBody.innerHTML = rows
       .map(([pre, addr, post, note]) => {
         const name = pre + addr + post + z;
         // Notes come from the string tables above, never from the input.
         const noteHtml = note ? STR[lang][note] ?? STR.en[note] : "";
-        return `<tr><td class="n"><code>${escapeHtml(pre)}<span class="a">${escapeHtml(addr)}</span>${escapeHtml(post)}<span class="z">${z}</span></code></td><td class="r"><code>${resolved}</code></td><td class="note">${noteHtml}</td><td class="c"><button class="copy" type="button" data-copy="${escapeHtml(name)}" aria-label="${escapeHtml(t("copyName", { name }))}">${ICON_COPY}</button></td></tr>`;
+        return `<tr><td class="n"><code>${wrap(pre)}<span class="a">${wrap(addr)}</span>${wrap(post)}<wbr><span class="z">${z}</span></code></td><td class="r"><code>${resolved}</code></td><td class="note">${noteHtml}</td><td class="c"><button class="copy" type="button" data-copy="${escapeHtml(name)}" aria-label="${escapeHtml(t("copyName", { name }))}">${ICON_COPY}</button></td></tr>`;
       })
       .join("");
     $("#forms-caption").textContent = t("forms.caption", { ip: ipText(ip) });
@@ -581,20 +673,29 @@
     const rec = namesFor(ip)[0];
 
     const name = current ? current.query : nameText(rec);
-    const publicHere = current && (kind === "public" || kind === "doc");
-    const privateHere = current && kind === "private";
+    const publicHere = Boolean(current) && kind === "public";
+    // A documentation address may fill the example, but it is nobody's address.
+    const docHere = Boolean(current) && kind === "doc";
+    const tooLong = Boolean(current) && kind === "private" && name.length > MAX_DNS01_NAME;
+    const privateHere = Boolean(current) && kind === "private" && !tooLong;
     document.querySelectorAll('.host-slot[data-path="public"]').forEach((el) => {
-      el.textContent = publicHere ? name : "203-0-113-10.ipssl.cc";
+      el.textContent = publicHere || docHere ? name : "203-0-113-10.ipssl.cc";
     });
     document.querySelectorAll('.host-slot[data-path="private"]').forEach((el) => {
       el.textContent = privateHere ? name : "192-168-1-10.ipssl.cc";
     });
-    $("#path-public").classList.toggle("is-yours", Boolean(publicHere));
-    $("#path-private").classList.toggle("is-yours", Boolean(privateHere));
-    $("#note-public").textContent = publicHere
-      ? t(kind === "doc" ? "note.doc" : "note.public", { ip: ipText(ip) })
-      : t("note.publicEx");
-    $("#note-private").textContent = privateHere ? t("note.private") : t("note.privateEx");
+    $("#path-public").classList.toggle("is-yours", publicHere);
+    $("#path-private").classList.toggle("is-yours", privateHere);
+    const notePublic = $("#note-public");
+    notePublic.textContent = publicHere
+      ? t("note.public", { ip: ipText(ip) })
+      : docHere
+        ? t("note.doc", { ip: ipText(ip) })
+        : t("note.publicEx");
+    notePublic.dataset.tone = docHere ? "warn" : "";
+    const notePrivate = $("#note-private");
+    notePrivate.textContent = privateHere ? t("note.private") : tooLong ? t("note.tooLong") : t("note.privateEx");
+    notePrivate.dataset.tone = tooLong ? "warn" : "";
     document.querySelectorAll(".ip-slot").forEach((el) => {
       el.textContent = privateHere ? ipText(ip) : "192.168.1.10";
     });
@@ -648,26 +749,32 @@
     }
   }
 
-  /** Re-renders the page; `fromBar` when the address bar itself changed. */
-  function update(fromBar = false) {
+  /** The bar changed: read it again, drop the earlier check, redraw. */
+  function update() {
     const r = readInput(input.value);
-    current = r.ip
-      ? { ip: r.ip, kind: kindOf(r.ip), names: namesFor(r.ip), query: r.state === "name" ? r.name : nameText(namesFor(r.ip)[0]) }
-      : null;
-    if (fromBar && current) family = current.ip.v;
-    input.toggleAttribute("aria-invalid", r.state === "error");
+    reading = r;
+    current = r.ip ? { ip: r.ip, kind: kindOf(r.ip), query: r.state === "name" ? r.name : nameText(namesFor(r.ip)[0]) } : null;
+    // A name without an address can still be looked up; it just has no expected answer.
+    target = current ? { name: current.query, ip: current.ip } : r.state === "none" ? { name: r.name, ip: null } : null;
+    if (current) family = current.ip.v;
+    // A new input makes an earlier check stale, and one still running is dropped.
+    checkSeq++;
+    result = null;
+    render();
+  }
+
+  /** Draws the page from the state above, in the current language. */
+  function render() {
+    const r = reading;
+    input.setAttribute("aria-invalid", r.state === "error" ? "true" : "false");
     bar.dataset.kind = current ? current.kind : "none";
     renderDisplay(r);
     renderCallouts(r);
     renderElsewhere();
-    checkBtn.disabled = !current;
-    barCopy.disabled = !current;
-    barCopy.setAttribute("aria-label", current ? t("copyName", { name: current.query }) : t("copy"));
-    // A new input makes an earlier check result stale.
-    checkSeq++;
-    trace.hidden = true;
-    trace.dataset.state = "idle";
-    answer.textContent = "";
+    checkBtn.disabled = !target || result?.phase === "run";
+    barCopy.disabled = !target;
+    barCopy.setAttribute("aria-label", target ? t("copyName", { name: target.name }) : t("copy"));
+    renderAnswer();
     placeCallouts();
   }
 
@@ -676,7 +783,7 @@
     const r = readInput(input.value);
     if (r.state !== "ip") return false;
     input.value = nameText(namesFor(r.ip)[0]);
-    update(true);
+    update();
     // Replay the settle animation on the new name.
     delete bar.dataset.rewrite;
     void bar.offsetWidth;
@@ -687,91 +794,149 @@
   // ---------------------------------------------------------------------
   // Live check over DNS-over-HTTPS (JSON API). Only the name is sent.
 
+  const RCODES = { 1: "FORMERR", 2: "SERVFAIL", 4: "NOTIMP", 5: "REFUSED" };
+
+  /**
+   * The name to ask for. A name with an address gets a random label of its
+   * own in front (x3k9q2.192-168-1-10.ipssl.cc). Words in front of the
+   * address do not change the answer, but no resolver has this name cached,
+   * so Cloudflare has to ask ns1–4 and the check proves they answer. The
+   * label starts with "x", so it never reads as an address itself.
+   */
+  function queryName(name, ip) {
+    if (!ip) return name;
+    const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const label = `x${[...crypto.getRandomValues(new Uint8Array(5))].map((b) => abc[b % abc.length]).join("")}`;
+    const q = `${label}.${name}`;
+    return q.length <= MAX_NAME ? q : name;
+  }
+
   async function check() {
-    if (!current) return;
+    if (!target) return;
     const seq = ++checkSeq;
-    const name = current.query;
-    const type = current.ip.v === 4 ? "A" : "AAAA";
-    const want = ipText(current.ip);
-    trace.hidden = false;
-    trace.dataset.state = "run";
-    answer.dataset.state = "";
-    answer.textContent = t("checking");
+    const { name, ip } = target;
+    const type = ip && ip.v === 6 ? "AAAA" : "A";
+    const want = ip ? ipText(ip) : null;
+    result = { phase: "run" };
+    renderAnswer();
     checkBtn.disabled = true;
 
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), CHECK_TIMEOUT_MS);
+    let next;
     try {
-      const url = `${DOH}?name=${encodeURIComponent(name)}&type=${type}`;
+      const url = `${DOH}?name=${encodeURIComponent(queryName(name, ip))}&type=${type}`;
       const res = await fetch(url, { headers: { accept: "application/dns-json" }, signal: ctl.signal, cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
-      if (seq !== checkSeq) return;
       const code = type === "A" ? 1 : 28;
       const records = (body.Answer || []).filter((rr) => rr.type === code);
       if (body.Status === 3) {
-        finish("bad", escapeHtml(t("nx")));
+        next = { phase: "bad", kind: "nx" };
+      } else if (body.Status !== 0) {
+        next = { phase: "bad", kind: "rcode", rcode: RCODES[body.Status] ?? `RCODE ${body.Status}` };
       } else if (!records.length) {
-        finish("bad", escapeHtml(t("nodata", { type })));
+        // An empty answer is what a name without an address should get.
+        next = { phase: want ? "bad" : "info", kind: "nodata", type };
       } else {
         const norm = (d) => (type === "A" ? d : ipText({ v: 6, a: parseV6(d, true) || [] }));
         const got = records.map((rr) => norm(rr.data));
-        const ok = got.includes(want);
-        const shown = got.map((g) => `<code>${type} ${escapeHtml(g)}</code>`).join(" ");
-        const verdict = ok
-          ? `<span class="verdict">${ICON_CHECK}${escapeHtml(t("match"))}</span>`
-          : `<span class="verdict">${ICON_X}${escapeHtml(t("mismatch", { want }))}</span>`;
-        finish(ok ? "ok" : "bad", `${shown}<span>${escapeHtml(t("ttl", { ttl: records[0].TTL }))}</span>${verdict}`);
+        // Every address must be the expected one: a client may pick any of them.
+        const ok = want ? got.every((g) => g === want) : null;
+        next = { phase: want ? (ok ? "ok" : "bad") : "info", kind: "records", type, got, ttl: records[0].TTL, want, ok };
       }
-    } catch (err) {
-      if (seq === checkSeq) finish("bad", escapeHtml(t("error", { name })));
+    } catch {
+      next = { phase: "bad", kind: "error", type, name };
     } finally {
       clearTimeout(timer);
-      if (seq === checkSeq) checkBtn.disabled = false;
     }
+    // A newer input or check has taken over; this answer is for an old name.
+    if (seq !== checkSeq) return;
+    result = next;
+    renderAnswer();
+    checkBtn.disabled = false;
+  }
 
-    function finish(state, html) {
-      trace.dataset.state = state;
-      answer.dataset.state = state;
-      answer.innerHTML = html;
-    }
+  /** The check's path and answer, drawn from `result`. */
+  function renderAnswer() {
+    trace.hidden = !result;
+    trace.dataset.state = result ? result.phase : "idle";
+    answer.dataset.state = result && result.phase !== "run" ? result.phase : "";
+    answer.innerHTML = result ? answerHtml(result) : "";
+  }
+
+  function answerHtml(res) {
+    if (res.phase === "run") return escapeHtml(t("checking"));
+    if (res.kind === "nx") return escapeHtml(t("nx"));
+    if (res.kind === "rcode") return escapeHtml(t("rcode", { rcode: res.rcode }));
+    if (res.kind === "nodata") return escapeHtml(t("nodata", { type: res.type }));
+    if (res.kind === "error") return escapeHtml(t("error", { type: res.type, name: res.name }));
+    const shown = res.got.map((g) => `<code>${res.type} ${escapeHtml(g)}</code>`).join(" ");
+    const ttl = `<span>${escapeHtml(t("ttl", { ttl: res.ttl }))}</span>`;
+    if (!res.want) return shown + ttl;
+    const verdict = res.ok
+      ? `${ICON_CHECK}${escapeHtml(t("match"))}`
+      : `${ICON_X}${escapeHtml(t(res.got.includes(res.want) ? "mismatchOnly" : "mismatch", { want: res.want }))}`;
+    return `${shown}${ttl}<span class="verdict">${verdict}</span>`;
   }
 
   // ---------------------------------------------------------------------
   // Copy buttons
 
+  /** Fallback for browsers without the async clipboard API; true if it copied. */
+  function legacyCopy(text) {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.select();
+    let ok = false;
+    try {
+      ok = document.execCommand("copy");
+    } catch {
+      ok = false;
+    }
+    area.remove();
+    return ok;
+  }
+
+  const copyTimers = new WeakMap();
+
+  /** Copies, then shows on the button whether it worked. */
   async function copyText(text, btn) {
+    let ok = true;
     try {
       await navigator.clipboard.writeText(text);
     } catch {
-      // Fallback for browsers without the async clipboard API.
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.setAttribute("readonly", "");
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.append(area);
-      area.select();
-      try {
-        document.execCommand("copy");
-      } catch {
-        /* nothing else to try */
-      }
-      area.remove();
+      ok = legacyCopy(text);
     }
-    const label = btn.getAttribute("aria-label");
-    btn.dataset.copied = "";
-    btn.innerHTML = ICON_CHECK;
-    btn.setAttribute("aria-label", t("copied"));
-    setTimeout(() => {
-      delete btn.dataset.copied;
-      btn.innerHTML = ICON_COPY;
-      btn.setAttribute("aria-label", label);
-    }, 1400);
+    // Keep the button's own label across quick repeated clicks.
+    if (!copyTimers.has(btn)) btn.dataset.label = btn.getAttribute("aria-label") ?? "";
+    clearTimeout(copyTimers.get(btn));
+    btn.dataset.copied = ok ? "ok" : "fail";
+    btn.innerHTML = ok ? ICON_CHECK : ICON_X;
+    btn.setAttribute("aria-label", t(ok ? "copied" : "copyFailed"));
+    if (ok) btn.removeAttribute("title");
+    else btn.title = t("copyFailed");
+    copyTimers.set(
+      btn,
+      setTimeout(
+        () => {
+          copyTimers.delete(btn);
+          delete btn.dataset.copied;
+          btn.innerHTML = ICON_COPY;
+          btn.setAttribute("aria-label", btn.dataset.label);
+          btn.removeAttribute("title");
+        },
+        ok ? 1400 : 3200,
+      ),
+    );
   }
 
   barCopy.addEventListener("click", () => {
-    if (current) copyText(current.query, barCopy);
+    if (target) copyText(target.name, barCopy);
   });
 
   $("#ai-copy").addEventListener("click", (e) => copyText(aiPrompt.textContent, e.currentTarget));
@@ -897,7 +1062,8 @@
         /* storage may be blocked; the choice just won't be remembered */
       }
     }
-    update();
+    // Only the words change: a check result, or one still running, stays.
+    render();
   }
 
   langBtn.addEventListener("click", () => setLang(lang === "zh" ? "en" : "zh", true));
@@ -905,13 +1071,13 @@
   // ---------------------------------------------------------------------
   // Wire up
 
-  input.addEventListener("input", () => update(true));
+  input.addEventListener("input", update);
   input.addEventListener("blur", commit);
   input.addEventListener("keydown", (e) => {
-    if (e.key !== "Enter") return;
+    if (e.key !== "Enter" || e.isComposing) return;
     e.preventDefault();
-    commit();
-    check();
+    // Enter turns a typed address into its name; on a name, it runs the check.
+    if (!commit()) check();
   });
   checkBtn.addEventListener("click", () => {
     commit();
@@ -938,5 +1104,6 @@
   } catch {
     /* ignore */
   }
+  update();
   setLang(saved === "zh" ? "zh" : "en", false);
 })();
