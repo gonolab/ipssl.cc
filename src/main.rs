@@ -173,18 +173,38 @@ fn bind_dns(addrs: &[SocketAddr]) -> Result<Vec<Listener>> {
     Ok(listeners)
 }
 
-/// Serves the DNS-01 challenge API until SIGTERM or Ctrl-C. Config changes
-/// need a restart.
+/// Serves the DNS-01 challenge API, and its metrics with a `[metrics]`
+/// section, until SIGTERM or Ctrl-C. Config changes need a restart.
 async fn run_acme_api(config: &Config, api: Api) -> Result<()> {
     let acme = config.acme.as_ref().expect("checked by Api::from_config");
     let addr = acme.api_listen;
     let listener = ipssl::bind_tcp(addr).with_context(|| format!("binding acme api {addr}"))?;
     info!(%addr, nodes = ?api.nodes(), "serving the DNS-01 challenge API");
     let api = Arc::new(api);
-    let server = tokio::spawn(api.serve(listener));
+    let mut tasks = vec![tokio::spawn(api.clone().serve(listener))];
+
+    if let Some(metrics) = &config.metrics {
+        let addr = metrics.listen;
+        // Not fatal, unlike in the DNS server: a host running both from one
+        // config has the DNS server on this address already, and the API
+        // works without metrics.
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                info!(%addr, "serving API metrics at /metrics");
+                tasks.push(tokio::spawn(ipssl::http::serve_metrics(
+                    listener,
+                    move || api.render_metrics(),
+                )));
+            }
+            Err(error) => warn!(%addr, %error, "cannot serve API metrics; running without them"),
+        }
+    }
+
     shutdown_signal().await;
     info!("shutting down");
-    server.abort();
+    for task in tasks {
+        task.abort();
+    }
     Ok(())
 }
 

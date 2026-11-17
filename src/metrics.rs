@@ -1,9 +1,11 @@
-//! Counters exposed in the Prometheus text format.
+//! Counters exposed in the Prometheus text format: [`Metrics`] for the DNS
+//! server, [`ApiMetrics`] for the DNS-01 challenge API.
 //!
 //! Plain atomics with fixed label sets: cheap to update on every query,
 //! and no label can grow without bound.
 
 use std::fmt::Write;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -90,11 +92,8 @@ impl Default for Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        let started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
         Self {
-            started,
+            started: now(),
             queries: Default::default(),
             responses: Default::default(),
             send_errors: AtomicU64::new(0),
@@ -278,29 +277,161 @@ impl Metrics {
         );
         writeln!(out, "ipssl_zone_serial {}", gauges.zone_serial).unwrap();
 
+        process(&mut out, self.started);
+        out
+    }
+}
+
+/// API endpoints counted on their own; every other path is `other`.
+const ENDPOINTS: [(&str, &str); 2] = [("/present", "present"), ("/cleanup", "cleanup")];
+const ENDPOINT_LABELS: usize = ENDPOINTS.len() + 1;
+
+/// Statuses the API answers with, counted on their own; anything else is
+/// `other`.
+const STATUSES: [u16; 11] = [200, 400, 403, 404, 405, 409, 411, 413, 429, 502, 503];
+const STATUS_LABELS: usize = STATUSES.len() + 1;
+
+/// What one name server did with a change the API sent it.
+#[derive(Debug, Clone, Copy)]
+pub enum NodeWrite {
+    /// Answered `{"ok":true}`.
+    Accepted,
+    /// Refused the value over a cap on pending values.
+    Rejected,
+    /// No usable answer: down, too slow, or some other reply.
+    Failed,
+}
+
+/// Metrics of the DNS-01 challenge API (`ipssl-dns --acme-api`).
+pub struct ApiMetrics {
+    started: f64,
+    /// By endpoint, then status.
+    requests: [[AtomicU64; STATUS_LABELS]; ENDPOINT_LABELS],
+    /// For each name server endpoint: accepted, rejected, failed.
+    node_writes: Vec<(String, [AtomicU64; 3])>,
+}
+
+impl ApiMetrics {
+    /// Metrics for an API that sends changes to `nodes`; the name servers
+    /// are told apart by their position in it.
+    pub fn new(nodes: &[SocketAddr]) -> Self {
+        Self {
+            started: now(),
+            requests: Default::default(),
+            node_writes: nodes
+                .iter()
+                .map(|node| (node.to_string(), Default::default()))
+                .collect(),
+        }
+    }
+
+    /// Counts a response to a request for `path`.
+    pub fn request(&self, path: &str, status: u16) {
+        let endpoint = ENDPOINTS
+            .iter()
+            .position(|(known, _)| *known == path)
+            .unwrap_or(ENDPOINTS.len());
+        let status = STATUSES
+            .iter()
+            .position(|known| *known == status)
+            .unwrap_or(STATUSES.len());
+        inc(&self.requests[endpoint][status]);
+    }
+
+    /// Counts a change sent to the `node`-th name server.
+    pub fn node_write(&self, node: usize, result: NodeWrite) {
+        if let Some((_, counts)) = self.node_writes.get(node) {
+            inc(&counts[result as usize]);
+        }
+    }
+
+    /// The Prometheus text exposition. `rate_limit_tracked` is the number
+    /// of client networks the API's rate limiter tracks.
+    pub fn render(&self, rate_limit_tracked: usize) -> String {
+        let mut out = String::with_capacity(4096);
+
         header(
             &mut out,
-            "ipssl_build_info",
+            "ipssl_acme_api_requests_total",
+            "counter",
+            "DNS-01 challenge API responses, by endpoint and status.",
+        );
+        let endpoints = ENDPOINTS.iter().map(|(_, l)| *l).chain(["other"]);
+        for (e, endpoint) in endpoints.enumerate() {
+            let statuses = STATUSES.iter().map(u16::to_string).chain(["other".into()]);
+            for (s, status) in statuses.enumerate() {
+                let value = load(&self.requests[e][s]);
+                writeln!(
+                    out,
+                    "ipssl_acme_api_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}} {value}"
+                )
+                .unwrap();
+            }
+        }
+
+        header(
+            &mut out,
+            "ipssl_acme_api_node_writes_total",
+            "counter",
+            "Changes the API sent to each name server, by result: accepted, rejected over a cap on pending values, or failed.",
+        );
+        for (node, counts) in &self.node_writes {
+            for (i, result) in ["accepted", "rejected", "failed"].iter().enumerate() {
+                let value = load(&counts[i]);
+                writeln!(
+                    out,
+                    "ipssl_acme_api_node_writes_total{{node=\"{node}\",result=\"{result}\"}} {value}"
+                )
+                .unwrap();
+            }
+        }
+
+        header(
+            &mut out,
+            "ipssl_rate_limit_tracked_networks",
             "gauge",
-            "Always 1; the version is in the label.",
+            "Client networks currently tracked by the rate limiter.",
         );
         writeln!(
             out,
-            "ipssl_build_info{{version=\"{}\"}} 1",
-            env!("CARGO_PKG_VERSION")
+            "ipssl_rate_limit_tracked_networks {rate_limit_tracked}"
         )
         .unwrap();
 
-        header(
-            &mut out,
-            "process_start_time_seconds",
-            "gauge",
-            "Start time of the process since the Unix epoch, in seconds.",
-        );
-        writeln!(out, "process_start_time_seconds {:.3}", self.started).unwrap();
-
+        process(&mut out, self.started);
         out
     }
+}
+
+/// The series every process exports: version and start time.
+fn process(out: &mut String, started: f64) {
+    header(
+        out,
+        "ipssl_build_info",
+        "gauge",
+        "Always 1; the version is in the label.",
+    );
+    writeln!(
+        out,
+        "ipssl_build_info{{version=\"{}\"}} 1",
+        env!("CARGO_PKG_VERSION")
+    )
+    .unwrap();
+
+    header(
+        out,
+        "process_start_time_seconds",
+        "gauge",
+        "Start time of the process since the Unix epoch, in seconds.",
+    );
+    writeln!(out, "process_start_time_seconds {started:.3}").unwrap();
+}
+
+/// Seconds since the Unix epoch.
+fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 fn inc(counter: &AtomicU64) {
@@ -386,6 +517,56 @@ mod tests {
     #[test]
     fn every_series_has_help_and_type() {
         let text = Metrics::new().render(&GAUGES);
+        for sample in text.lines().filter(|l| !l.starts_with('#')) {
+            let name = sample.split(['{', ' ']).next().unwrap();
+            assert!(text.contains(&format!("# HELP {name} ")), "{name}");
+            assert!(text.contains(&format!("# TYPE {name} ")), "{name}");
+        }
+    }
+
+    #[test]
+    fn api_counts_and_renders() {
+        let nodes = [
+            "198.51.100.1:8053".parse().unwrap(),
+            "[2001:db8::2]:8053".parse().unwrap(),
+        ];
+        let m = ApiMetrics::new(&nodes);
+        m.request("/present", 200);
+        m.request("/present", 200);
+        m.request("/cleanup", 429);
+        m.request("/present", 502);
+        m.request("/delete", 404);
+        m.request("", 418);
+        m.node_write(0, NodeWrite::Accepted);
+        m.node_write(1, NodeWrite::Failed);
+        m.node_write(1, NodeWrite::Failed);
+        m.node_write(2, NodeWrite::Failed);
+
+        let text = m.render(5);
+        let value = |series: &str| line(&text, series).rsplit(' ').next().unwrap().to_owned();
+        let requests = |endpoint: &str, status: &str| {
+            value(&format!(
+                r#"ipssl_acme_api_requests_total{{endpoint="{endpoint}",status="{status}"}}"#
+            ))
+        };
+        assert_eq!(requests("present", "200"), "2");
+        assert_eq!(requests("cleanup", "429"), "1");
+        assert_eq!(requests("present", "502"), "1");
+        assert_eq!(requests("other", "404"), "1");
+        assert_eq!(requests("other", "other"), "1");
+        assert_eq!(requests("cleanup", "200"), "0");
+        let writes = |node: &str, result: &str| {
+            value(&format!(
+                r#"ipssl_acme_api_node_writes_total{{node="{node}",result="{result}"}}"#
+            ))
+        };
+        assert_eq!(writes("198.51.100.1:8053", "accepted"), "1");
+        assert_eq!(writes("[2001:db8::2]:8053", "failed"), "2");
+        assert_eq!(writes("[2001:db8::2]:8053", "rejected"), "0");
+        assert_eq!(value("ipssl_rate_limit_tracked_networks"), "5");
+        assert!(text.contains("\nipssl_build_info{version="));
+        assert!(!text.contains("ipssl_dns_"));
+
         for sample in text.lines().filter(|l| !l.starts_with('#')) {
             let name = sample.split(['{', ' ']).next().unwrap();
             assert!(text.contains(&format!("# HELP {name} ")), "{name}");

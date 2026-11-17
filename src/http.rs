@@ -108,10 +108,15 @@ where
     Server::new(listener).serve(handler).await
 }
 
+/// Called with the request path (empty when the request could not be
+/// read) and the status of every response.
+type Observe = dyn Fn(&str, u16) + Send + Sync;
+
 /// An HTTP server on one listener.
 pub struct Server {
     listener: TcpListener,
     allow: Box<dyn Fn(IpAddr) -> bool + Send + Sync>,
+    observe: Arc<Observe>,
 }
 
 impl Server {
@@ -119,7 +124,15 @@ impl Server {
         Self {
             listener,
             allow: Box::new(|_| true),
+            observe: Arc::new(|_, _| {}),
         }
+    }
+
+    /// Calls `observe` with the path and status of every response, the
+    /// server's own (malformed requests, `503` when busy) included.
+    pub fn observe(mut self, observe: impl Fn(&str, u16) + Send + Sync + 'static) -> Self {
+        self.observe = Arc::new(observe);
+        self
     }
 
     /// Serves only peers that `allow` accepts. Connections from anyone
@@ -153,11 +166,12 @@ impl Server {
             if !(self.allow)(peer.ip()) {
                 continue;
             }
+            let observe = self.observe.clone();
             if let Ok(permit) = permits.clone().try_acquire_owned() {
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    connection(stream, peer, DEADLINE, &*handler).await;
+                    connection(stream, peer, DEADLINE, &*handler, &*observe).await;
                 });
             } else if let Ok(permit) = refusals.clone().try_acquire_owned() {
                 // Every slot is busy. Still read the request and say so:
@@ -165,7 +179,7 @@ impl Server {
                 // to the proxy in front, which then makes up its own error.
                 tokio::spawn(async move {
                     let _permit = permit;
-                    connection(stream, peer, REFUSAL_DEADLINE, &busy).await;
+                    connection(stream, peer, REFUSAL_DEADLINE, &busy, &*observe).await;
                 });
             }
         }
@@ -173,12 +187,17 @@ impl Server {
 }
 
 /// Serves one connection, giving up after `deadline`.
-async fn connection<H, F>(stream: TcpStream, peer: SocketAddr, deadline: Duration, handler: &H)
-where
+async fn connection<H, F>(
+    stream: TcpStream,
+    peer: SocketAddr,
+    deadline: Duration,
+    handler: &H,
+    observe: &Observe,
+) where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    match timeout(deadline, respond(stream, peer, handler)).await {
+    match timeout(deadline, respond(stream, peer, handler, observe)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => debug!(%error, "http: connection failed"),
         Err(_) => debug!("http: connection timed out"),
@@ -190,15 +209,24 @@ fn busy(_: Request) -> std::future::Ready<Response> {
     std::future::ready(Response::text(503, "busy, try again shortly"))
 }
 
-async fn respond<H, F>(mut stream: TcpStream, peer: SocketAddr, handler: &H) -> io::Result<()>
+async fn respond<H, F>(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    handler: &H,
+    observe: &Observe,
+) -> io::Result<()>
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    let response = match read_request(&mut stream, peer).await? {
-        Ok(request) => handler(request).await,
-        Err(response) => response,
+    let (path, response) = match read_request(&mut stream, peer).await? {
+        Ok(request) => {
+            let path = request.path.clone();
+            (path, handler(request).await)
+        }
+        Err(response) => (String::new(), response),
     };
+    observe(&path, response.status);
     write_response(&mut stream, &response).await
 }
 
@@ -464,6 +492,33 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         assert!(served);
+    }
+
+    #[tokio::test]
+    async fn every_response_is_observed() {
+        use std::sync::Mutex;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = seen.clone();
+        let server = Server::new(listener)
+            .observe(move |path, status| log.lock().unwrap().push((path.to_owned(), status)));
+        tokio::spawn(server.serve(|req: Request| {
+            let status = if req.path == "/ok" { 200 } else { 404 };
+            std::future::ready(Response::text(status, "-"))
+        }));
+        request(addr, "GET /ok?x=1 HTTP/1.1\r\n\r\n").await;
+        request(addr, "GET /nope HTTP/1.1\r\n\r\n").await;
+        request(addr, "POST /ok HTTP/1.1\r\nContent-Length: x\r\n\r\n").await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("/ok".to_owned(), 200),
+                ("/nope".to_owned(), 404),
+                (String::new(), 400)
+            ]
+        );
     }
 
     #[tokio::test]

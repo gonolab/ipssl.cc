@@ -99,6 +99,11 @@ fn complete(request: &[u8]) -> bool {
 
 /// Starts the API, sending changes to `nodes`; returns its address.
 async fn api(nodes: &[SocketAddr], extra: &str) -> SocketAddr {
+    api_with_metrics(nodes, extra).await.0
+}
+
+/// Like [`api`], but also returns the API itself for its metrics.
+async fn api_with_metrics(nodes: &[SocketAddr], extra: &str) -> (SocketAddr, Arc<Api>) {
     let nodes: Vec<String> = nodes.iter().map(|n| format!("\"{n}\"")).collect();
     let text = format!(
         "{EXAMPLE_CONFIG}\n[acme]\nnodes = [{}]\n{extra}\n",
@@ -107,8 +112,8 @@ async fn api(nodes: &[SocketAddr], extra: &str) -> SocketAddr {
     let api = Arc::new(Api::from_config(&Config::parse(&text).unwrap()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(api.serve(listener));
-    addr
+    tokio::spawn(api.clone().serve(listener));
+    (addr, api)
 }
 
 fn body(fqdn: &str, value: &str) -> String {
@@ -469,4 +474,45 @@ async fn api_wants_a_name_server_answer_not_just_any_200() {
             .unwrap();
         assert_eq!(status, 502, "{reply}");
     }
+}
+
+#[tokio::test]
+async fn api_counts_requests_and_name_server_writes() {
+    let ns = name_server("127.0.0.1").await;
+    let down = TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let (api, handle) =
+        api_with_metrics(&[ns.write, down], "requests_per_minute = 1\nburst = 2").await;
+    let request = body(NAME, VALUE);
+    assert_eq!(post_json(api, "/present", &request).await.unwrap().0, 502);
+    assert_eq!(post_json(api, "/cleanup", &request).await.unwrap().0, 502);
+    assert_eq!(post_json(api, "/present", &request).await.unwrap().0, 429);
+    assert_eq!(post_json(api, "/delete", &request).await.unwrap().0, 404);
+
+    let metrics = handle.render_metrics();
+    let requests = |endpoint: &str, status: u16| {
+        let series =
+            format!(r#"ipssl_acme_api_requests_total{{endpoint="{endpoint}",status="{status}"}}"#);
+        metric(&metrics, &series)
+    };
+    assert_eq!(requests("present", 502), 1);
+    assert_eq!(requests("cleanup", 502), 1);
+    assert_eq!(requests("present", 429), 1);
+    assert_eq!(requests("other", 404), 1);
+    assert_eq!(requests("present", 200), 0);
+
+    let writes = |node: SocketAddr, result: &str| {
+        let series =
+            format!(r#"ipssl_acme_api_node_writes_total{{node="{node}",result="{result}"}}"#);
+        metric(&metrics, &series)
+    };
+    // The present, taking it back after the other name server failed,
+    // and the cleanup.
+    assert_eq!(writes(ns.write, "accepted"), 3);
+    assert_eq!(writes(down, "failed"), 2);
+    assert_eq!(writes(down, "accepted"), 0);
+    assert_eq!(metric(&metrics, "ipssl_rate_limit_tracked_networks"), 1);
 }

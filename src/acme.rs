@@ -29,14 +29,13 @@ use anyhow::{Context, Result};
 use hickory_server::proto::rr::LowerName;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::warn;
 
 use crate::config::Config;
 use crate::handler::Handler;
 use crate::http::{Request, Response, Server, post_json};
-use crate::metrics::AcmeWrite;
+use crate::metrics::{AcmeWrite, ApiMetrics, NodeWrite};
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{ChallengeError, Zone};
 
@@ -477,6 +476,7 @@ pub struct Api {
     zone: Zone,
     limiter: RateLimiter,
     nodes: Vec<SocketAddr>,
+    metrics: ApiMetrics,
 }
 
 impl Api {
@@ -494,6 +494,7 @@ impl Api {
                 cfg.rate_limit.ipv6_prefix,
                 cfg.rate_limit.max_tracked,
             ),
+            metrics: ApiMetrics::new(&nodes),
             nodes,
         })
     }
@@ -505,12 +506,19 @@ impl Api {
 
     /// Serves the API on `listener` until the task is dropped.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        let counter = self.clone();
         Server::new(listener)
+            .observe(move |path, status| counter.metrics.request(path, status))
             .serve(move |req| {
                 let api = self.clone();
                 async move { api.handle(req).await }
             })
             .await
+    }
+
+    /// The API's metrics in the Prometheus text format.
+    pub fn render_metrics(&self) -> String {
+        self.metrics.render(self.limiter.tracked())
     }
 
     pub async fn handle(&self, req: Request) -> Response {
@@ -538,20 +546,15 @@ impl Api {
         })
         .to_string();
 
-        let mut tasks = JoinSet::new();
-        for &addr in &self.nodes {
-            let body = body.clone();
-            tasks.spawn(async move { (addr, send(addr, action, &body, NODE_TIMEOUT).await) });
-        }
+        let all = 0..self.nodes.len();
         let mut accepted = Vec::new();
         let mut failed = Vec::new();
         let mut rejected = false;
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok((addr, Outcome::Accepted)) => accepted.push(addr),
-                Ok((_, Outcome::Rejected)) => rejected = true,
-                Ok((_, Outcome::Failed(problem))) => failed.push(problem),
-                Err(e) => failed.push(format!("task failed: {e}")),
+        for (node, outcome) in self.send(all, action, &body, NODE_TIMEOUT).await {
+            match outcome {
+                Outcome::Accepted => accepted.push(node),
+                Outcome::Rejected => rejected = true,
+                Outcome::Failed(problem) => failed.push(problem),
             }
         }
         if !rejected && failed.is_empty() {
@@ -571,7 +574,7 @@ impl Api {
         // servers that took it should not keep serving it. Waiting for
         // this means a retry right after the error cannot be undone by it.
         if action == Action::Present && !accepted.is_empty() {
-            roll_back(&accepted, &body).await;
+            self.roll_back(accepted, &body).await;
         }
         if rejected {
             return Err(error(409, &too_many_values()));
@@ -587,20 +590,49 @@ impl Api {
             ),
         ))
     }
-}
 
-/// Cleans up a value presented with `body` on the name servers at
-/// `nodes`, as far as they answer in time. Failures are only logged:
-/// the value expires there on its own.
-async fn roll_back(nodes: &[SocketAddr], body: &str) {
-    let mut tasks = JoinSet::new();
-    for &addr in nodes {
-        let body = body.to_owned();
-        tasks.spawn(async move { send(addr, Action::Cleanup, &body, ROLLBACK_TIMEOUT).await });
+    /// Sends a change to the name servers numbered `nodes`, all at once,
+    /// waiting at most `limit` for each, and counts what they did with it.
+    async fn send(
+        &self,
+        nodes: impl IntoIterator<Item = usize>,
+        action: Action,
+        body: &str,
+        limit: Duration,
+    ) -> Vec<(usize, Outcome)> {
+        let tasks: Vec<_> = nodes
+            .into_iter()
+            .map(|node| {
+                let addr = self.nodes[node];
+                let body = body.to_owned();
+                (
+                    node,
+                    tokio::spawn(async move { send(addr, action, &body, limit).await }),
+                )
+            })
+            .collect();
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        for (node, task) in tasks {
+            let outcome = task.await.unwrap_or_else(|e| {
+                Outcome::Failed(format!("{} (task failed: {e})", self.nodes[node]))
+            });
+            self.metrics.node_write(node, outcome.kind());
+            outcomes.push((node, outcome));
+        }
+        outcomes
     }
-    while let Some(joined) = tasks.join_next().await {
-        if let Ok(Outcome::Failed(problem)) = joined {
-            warn!(%problem, "acme: could not take back a value after a failed change");
+
+    /// Cleans up a value presented with `body` on the name servers
+    /// numbered `nodes`, as far as they answer in time. Failures are only
+    /// logged: the value expires there on its own.
+    async fn roll_back(&self, nodes: Vec<usize>, body: &str) {
+        for (_, outcome) in self
+            .send(nodes, Action::Cleanup, body, ROLLBACK_TIMEOUT)
+            .await
+        {
+            if let Outcome::Failed(problem) = outcome {
+                warn!(%problem, "acme: could not take back a value after a failed change");
+            }
         }
     }
 }
@@ -612,6 +644,16 @@ enum Outcome {
     Rejected,
     /// No usable answer; the text says why, for the log.
     Failed(String),
+}
+
+impl Outcome {
+    fn kind(&self) -> NodeWrite {
+        match self {
+            Self::Accepted => NodeWrite::Accepted,
+            Self::Rejected => NodeWrite::Rejected,
+            Self::Failed(_) => NodeWrite::Failed,
+        }
+    }
 }
 
 /// Sends a change to the name server at `addr`, waiting at most `limit`.
