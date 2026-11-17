@@ -3,11 +3,12 @@
 //!
 //! One request per connection, a cap on concurrent connections, size
 //! limits and a deadline for each request. Bodies need a `Content-Length`;
-//! chunked encoding is not supported.
+//! chunked encoding is not supported. A server can be limited to some
+//! peers, which are then checked before anything else happens.
 
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,15 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
-/// Connections served at once; more are closed right away.
+/// Connections served at once.
 const MAX_CONNECTIONS: usize = 16;
+
+/// Connections answered `503` while all [`MAX_CONNECTIONS`] are busy;
+/// past that, new connections are closed right away.
+const MAX_REFUSALS: usize = 16;
+
+/// Time a connection turned away with `503` has to send its request.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Largest request head we read.
 const MAX_HEAD: usize = 8 * 1024;
@@ -91,37 +99,95 @@ where
 }
 
 /// Answers every request on `listener` with `handler` until the task is
-/// dropped.
+/// dropped. See [`Server`] for more options.
 pub async fn serve<H, F>(listener: TcpListener, handler: H)
 where
     H: Fn(Request) -> F + Send + Sync + 'static,
     F: Future<Output = Response> + Send + 'static,
 {
-    let handler = Arc::new(handler);
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                // Usually out of file descriptors; back off instead of spinning.
-                warn!(%error, "http: accept failed");
-                sleep(Duration::from_millis(100)).await;
+    Server::new(listener).serve(handler).await
+}
+
+/// An HTTP server on one listener.
+pub struct Server {
+    listener: TcpListener,
+    allow: Box<dyn Fn(IpAddr) -> bool + Send + Sync>,
+}
+
+impl Server {
+    pub fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            allow: Box::new(|_| true),
+        }
+    }
+
+    /// Serves only peers that `allow` accepts. Connections from anyone
+    /// else are closed as soon as they are accepted, before they take a
+    /// slot or are read, so they cannot crowd out the peers that may
+    /// connect.
+    pub fn allow(mut self, allow: impl Fn(IpAddr) -> bool + Send + Sync + 'static) -> Self {
+        self.allow = Box::new(allow);
+        self
+    }
+
+    /// Answers every request with `handler` until the task is dropped.
+    pub async fn serve<H, F>(self, handler: H)
+    where
+        H: Fn(Request) -> F + Send + Sync + 'static,
+        F: Future<Output = Response> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let refusals = Arc::new(Semaphore::new(MAX_REFUSALS));
+        loop {
+            let (stream, peer) = match self.listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    // Usually out of file descriptors; back off instead of spinning.
+                    warn!(%error, "http: accept failed");
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if !(self.allow)(peer.ip()) {
                 continue;
             }
-        };
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            continue;
-        };
-        let handler = handler.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            match timeout(DEADLINE, respond(stream, peer, &*handler)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => debug!(%error, "http: connection failed"),
-                Err(_) => debug!("http: connection timed out"),
+            if let Ok(permit) = permits.clone().try_acquire_owned() {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    connection(stream, peer, DEADLINE, &*handler).await;
+                });
+            } else if let Ok(permit) = refusals.clone().try_acquire_owned() {
+                // Every slot is busy. Still read the request and say so:
+                // a closed connection looks like a crash to the client, or
+                // to the proxy in front, which then makes up its own error.
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    connection(stream, peer, REFUSAL_DEADLINE, &busy).await;
+                });
             }
-        });
+        }
     }
+}
+
+/// Serves one connection, giving up after `deadline`.
+async fn connection<H, F>(stream: TcpStream, peer: SocketAddr, deadline: Duration, handler: &H)
+where
+    H: Fn(Request) -> F,
+    F: Future<Output = Response>,
+{
+    match timeout(deadline, respond(stream, peer, handler)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => debug!(%error, "http: connection failed"),
+        Err(_) => debug!("http: connection timed out"),
+    }
+}
+
+/// The answer while every slot is taken.
+fn busy(_: Request) -> std::future::Ready<Response> {
+    std::future::ready(Response::text(503, "busy, try again shortly"))
 }
 
 async fn respond<H, F>(mut stream: TcpStream, peer: SocketAddr, handler: &H) -> io::Result<()>
@@ -372,6 +438,51 @@ mod tests {
             "HTTP/1.1 20 OK\r\n\r\n",
         ] {
             assert!(parse_response(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn busy_server_answers_503() {
+        let addr = start().await;
+        // Connections that send nothing hold every slot until the deadline.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        let response = request(addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+
+        // A freed slot serves again.
+        drop(idle.pop());
+        let mut served = false;
+        for _ in 0..50 {
+            let response = request(addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
+            if response.starts_with("HTTP/1.1 200 ") {
+                served = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(served);
+    }
+
+    #[tokio::test]
+    async fn peers_not_allowed_are_closed_unread() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            Server::new(listener)
+                .allow(|_| false)
+                .serve(|_: Request| std::future::ready(Response::text(200, "served"))),
+        );
+        // Even more connections than there are slots get nothing at all.
+        for _ in 0..=MAX_CONNECTIONS + MAX_REFUSALS {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await;
+            let mut response = Vec::new();
+            // A clean close or a reset, depending on timing; never an answer.
+            let _ = stream.read_to_end(&mut response).await;
+            assert!(response.is_empty(), "{response:?}");
         }
     }
 

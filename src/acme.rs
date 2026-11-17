@@ -28,13 +28,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use hickory_server::proto::rr::LowerName;
 use serde::Deserialize;
+use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::warn;
 
 use crate::config::Config;
 use crate::handler::Handler;
-use crate::http::{Request, Response, post_json};
+use crate::http::{Request, Response, Server, post_json};
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{ChallengeError, Zone};
 
@@ -410,12 +411,32 @@ impl Node {
         }
     }
 
+    /// Takes writes on `listener` until the task is dropped. Connections
+    /// from anyone but the writers are closed before they are read, so
+    /// they cannot hold the slots the API needs.
+    pub async fn serve(self, listener: TcpListener) {
+        let node = Arc::new(self);
+        let filter = node.clone();
+        Server::new(listener)
+            .allow(move |ip| filter.allows(ip))
+            .serve(move |req| {
+                let node = node.clone();
+                async move { node.handle(req).await }
+            })
+            .await
+    }
+
     pub async fn handle(&self, req: Request) -> Response {
         self.try_handle(req).unwrap_or_else(|response| response)
     }
 
+    /// Whether `ip` may write challenges.
+    fn allows(&self, ip: IpAddr) -> bool {
+        self.writers.contains(&ip.to_canonical())
+    }
+
     fn try_handle(&self, req: Request) -> Result<Response, Response> {
-        if !self.writers.contains(&req.peer.ip().to_canonical()) {
+        if !self.allows(req.peer.ip()) {
             return Err(error(403, "not allowed to write challenges"));
         }
         let action = route(&req)?;
@@ -471,6 +492,16 @@ impl Api {
     /// The name server endpoints every change goes to.
     pub fn nodes(&self) -> &[SocketAddr] {
         &self.nodes
+    }
+
+    /// Serves the API on `listener` until the task is dropped.
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        Server::new(listener)
+            .serve(move |req| {
+                let api = self.clone();
+                async move { api.handle(req).await }
+            })
+            .await
     }
 
     pub async fn handle(&self, req: Request) -> Response {

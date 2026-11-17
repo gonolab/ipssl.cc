@@ -41,11 +41,7 @@ async fn name_server(writers: &str) -> NameServer {
         .split_whitespace()
         .map(|w| w.parse().unwrap())
         .collect();
-    let node = Arc::new(Node::new(handler.clone(), store, &writers));
-    tokio::spawn(ipssl::http::serve(listener, move |req| {
-        let node = node.clone();
-        async move { node.handle(req).await }
-    }));
+    tokio::spawn(Node::new(handler.clone(), store, &writers).serve(listener));
 
     let udp = ipssl::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     NameServer {
@@ -111,10 +107,7 @@ async fn api(nodes: &[SocketAddr], extra: &str) -> SocketAddr {
     let api = Arc::new(Api::from_config(&Config::parse(&text).unwrap()).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(ipssl::http::serve(listener, move |req| {
-        let api = api.clone();
-        async move { api.handle(req).await }
-    }));
+    tokio::spawn(api.serve(listener));
     addr
 }
 
@@ -303,10 +296,11 @@ async fn api_is_rate_limited() {
 #[tokio::test]
 async fn name_server_only_takes_writes_from_writers() {
     let ns = name_server("192.0.2.1").await;
-    let (status, _) = post_json(ns.write, "/present", &body(NAME, VALUE))
-        .await
-        .unwrap();
-    assert_eq!(status, 403);
+    // Anyone else is cut off before the request is read: no answer at all.
+    for _ in 0..40 {
+        let result = post_json(ns.write, "/present", &body(NAME, VALUE)).await;
+        assert!(result.is_err(), "{result:?}");
+    }
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
 }
 

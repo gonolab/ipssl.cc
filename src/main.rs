@@ -89,11 +89,8 @@ async fn main() -> Result<()> {
         let store = Arc::new(Challenges::new());
         handler = handler.with_challenges(store.clone());
         tokio::spawn(purge_challenges(store.clone()));
-        let node = Arc::new(Node::new(handler.clone(), store, &acme.writers));
-        tokio::spawn(ipssl::http::serve(listener, move |req| {
-            let node = node.clone();
-            async move { node.handle(req).await }
-        }));
+        let node = Node::new(handler.clone(), store, &acme.writers);
+        tokio::spawn(node.serve(listener));
     }
 
     if let Some(metrics) = &config.metrics {
@@ -184,10 +181,7 @@ async fn run_acme_api(config: &Config, api: Api) -> Result<()> {
     let listener = ipssl::bind_tcp(addr).with_context(|| format!("binding acme api {addr}"))?;
     info!(%addr, nodes = ?api.nodes(), "serving the DNS-01 challenge API");
     let api = Arc::new(api);
-    let server = tokio::spawn(ipssl::http::serve(listener, move |req| {
-        let api = api.clone();
-        async move { api.handle(req).await }
-    }));
+    let server = tokio::spawn(api.serve(listener));
     shutdown_signal().await;
     info!("shutting down");
     server.abort();
