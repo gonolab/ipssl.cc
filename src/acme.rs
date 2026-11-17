@@ -65,6 +65,11 @@ const MAX_VALUES_PER_OWNER: usize = 2;
 /// Time the API gives each name server to take a change.
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Time the API gives a name server to drop a value again after the
+/// change failed elsewhere. Short, so the answer still beats the HTTP
+/// server's deadline: the name server took the change a moment ago.
+const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 const JSON: &str = "application/json";
 
 /// Whether `ip` is an address no public CA can reach: private, shared
@@ -498,11 +503,12 @@ impl Api {
             let body = body.clone();
             tasks.spawn(async move { (addr, send(addr, action, &body, NODE_TIMEOUT).await) });
         }
+        let mut accepted = Vec::new();
         let mut failed = Vec::new();
         let mut rejected = false;
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok((_, Outcome::Accepted)) => {}
+                Ok((addr, Outcome::Accepted)) => accepted.push(addr),
                 Ok((_, Outcome::Rejected)) => rejected = true,
                 Ok((_, Outcome::Failed(problem))) => failed.push(problem),
                 Err(e) => failed.push(format!("task failed: {e}")),
@@ -514,7 +520,18 @@ impl Api {
         if !failed.is_empty() {
             failed.sort();
             let failed = failed.join(", ");
-            warn!(action = action.path(), fqdn = %name, %failed, "acme: a name server did not take the change");
+            warn!(
+                action = action.path(),
+                fqdn = %name,
+                %failed,
+                "acme: a name server did not take the change"
+            );
+        }
+        // The client is told the value was not published, so the name
+        // servers that took it should not keep serving it. Waiting for
+        // this means a retry right after the error cannot be undone by it.
+        if action == Action::Present && !accepted.is_empty() {
+            roll_back(&accepted, &body).await;
         }
         if rejected {
             return Err(error(409, &too_many_values()));
@@ -529,6 +546,22 @@ impl Api {
                 self.nodes.len()
             ),
         ))
+    }
+}
+
+/// Cleans up a value presented with `body` on the name servers at
+/// `nodes`, as far as they answer in time. Failures are only logged:
+/// the value expires there on its own.
+async fn roll_back(nodes: &[SocketAddr], body: &str) {
+    let mut tasks = JoinSet::new();
+    for &addr in nodes {
+        let body = body.to_owned();
+        tasks.spawn(async move { send(addr, Action::Cleanup, &body, ROLLBACK_TIMEOUT).await });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(Outcome::Failed(problem)) = joined {
+            warn!(%problem, "acme: could not take back a value after a failed change");
+        }
     }
 }
 

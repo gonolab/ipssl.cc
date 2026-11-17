@@ -263,6 +263,30 @@ async fn api_reports_a_name_server_that_is_down() {
     assert!(message.starts_with("1 of 2 name servers "), "{message}");
     assert!(!message.contains(&down.port().to_string()), "{message}");
     assert!(!message.contains("127.0.0.1"), "{message}");
+
+    // The name server that took the value dropped it again, so it does
+    // not serve a value the client was told is not there.
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_value_is_taken_back_where_it_was_taken() {
+    // One name server is at the cap for this network (another one lost
+    // its values in a restart, say), so the change is refused there.
+    let full = name_server("127.0.0.1").await;
+    let empty = name_server("127.0.0.1").await;
+    for v in ['A', 'B'] {
+        let request = serde_json::json!({ "fqdn": NAME, "value": value(v), "owner": "192.0.2.0" });
+        let (status, _) = post_json(full.write, "/present", &request.to_string())
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+    }
+    let api = api(&[full.write, empty.write], "").await;
+    let (status, reply) = post_as(api, "192.0.2.10", "/present", &body(NAME, &value('C'))).await;
+    assert_eq!(status, 409, "{reply}");
+    assert!(txt(empty.dns, NAME).await.answers.is_empty());
+    assert_eq!(sorted_values(full.dns).await, [value('A'), value('B')]);
 }
 
 #[tokio::test]
