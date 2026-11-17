@@ -275,17 +275,36 @@ curl -s http://127.0.0.1:9153/metrics
 | Metric | Meaning |
 |---|---|
 | `ipssl_dns_queries_total{protocol, qtype}` | Requests received |
-| `ipssl_dns_responses_total{rcode}` | Responses sent |
-| `ipssl_dns_send_errors_total` | Responses that could not be sent |
+| `ipssl_dns_responses_total{rcode}` | Responses handed to hickory to send |
+| `ipssl_dns_send_errors_total` | Responses hickory would not take for sending |
 | `ipssl_dns_truncated_total` | UDP answers too large for the client's buffer, sent truncated so it retries over TCP |
 | `ipssl_dns_rate_limited_total{action}` | UDP responses dropped (`drop`) or sent truncated (`slip`) by rate limiting |
 | `ipssl_rate_limit_tracked_networks` | Client networks the rate limiter is tracking |
 | `ipssl_config_reloads_total{result}` | Config reloads that succeeded or failed |
-| `ipssl_acme_challenges` | DNS-01 challenge values being served (with `[acme]` only) |
-| `ipssl_acme_writes_total{result}` | Challenge writes from the API, `accepted` or `rejected` (with `[acme]` only) |
+| `ipssl_acme_challenges` | DNS-01 challenge values being served; an expired value drops out at once (with `[acme]` only) |
+| `ipssl_acme_writes_total{result}` | Challenge writes: `accepted`, `rejected` (wrong path or method, a body that holds no valid challenge, or a value over a cap) or `forbidden` (a connection from an address not in `writers`, closed before it is read) (with `[acme]` only) |
 | `ipssl_zone_serial` | SOA serial being served; compare across servers to check they run the same config |
 | `ipssl_build_info{version}` | Version of the running binary |
 | `process_start_time_seconds` | When the process started |
+
+What the DNS counters leave out:
+
+- hickory answers some UDP packets it cannot decode with FORMERR itself, before the server sees them. Those replies are not counted as requests or responses, and rate limiting does not apply to them.
+- A response counts in `ipssl_dns_responses_total` once it is handed to hickory. If sending a UDP response fails after that, hickory only logs it, so it is not in `ipssl_dns_send_errors_total`.
+
+`forbidden` counts port scanners that reach the write port too, so expect a trickle. When the API host's outgoing address stops matching `writers`, every write from the API lands there instead of in `accepted`, and as `failed` in the API's own metrics below.
+
+The DNS-01 challenge API (`ipssl-dns --acme-api`) serves its own metrics at `[metrics].listen`:
+
+| Metric | Meaning |
+|---|---|
+| `ipssl_acme_api_requests_total{endpoint, status}` | Responses by endpoint (`present`, `cleanup` or `other`) and status: `200`, `400`, `403` (a name with a public or blocked address), `404`, `405`, `409` (over a cap on pending values), `411`, `413`, `429` (rate limited), `502` (a name server did not take the change), `503` (every connection slot busy) or `other` |
+| `ipssl_acme_api_node_writes_total{node, result}` | Changes sent to each name server: `accepted`, `rejected` (over a cap on pending values) or `failed` (down, too slow, or an answer that is not the name server's `{"ok":true}`) |
+| `ipssl_rate_limit_tracked_networks` | Client networks the API's rate limiter is tracking |
+| `ipssl_build_info{version}` | Version of the running binary |
+| `process_start_time_seconds` | When the process started |
+
+On a host that runs both the DNS server and the API, the two cannot share a `[metrics].listen` address, so give the API a config file of its own (and point `ipssl-acme-api.service` at it). With one shared config, whichever starts second cannot listen there: the API then runs without metrics and logs a warning, but the DNS server does not start.
 
 ## Website
 
