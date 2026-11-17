@@ -11,11 +11,14 @@ Use this file to give a machine a hostname and an HTTPS certificate. Work in thi
 - Words may go before or after the address, joined with `-` (`app-192-168-1-10.ipssl.cc`, `192-168-1-10-app.ipssl.cc`), or in their own labels (`api.app.192-168-1-10.ipssl.cc`). Words in front of an IPv6 address must be in their own label.
 - Also accepted: dotted `192.168.1.10.ipssl.cc` and eight hex digits `c0a8010a.ipssl.cc`. Prefer the dashed one-label form: it is the easiest to get certificates for.
 - When a name holds more than one address, the rightmost one wins. Octets with leading zeros (`010`) are rejected.
+- For a name that will get a certificate: at most 10 labels in all (Let's Encrypt's limit; `ipssl.cc` counts as two), no `--` as the third and fourth characters of a label (`ab--1` is refused, `xn--` is fine), and for DNS-01 at most 237 characters, so that `_acme-challenge.` in front still fits in 253.
+- Common private names such as `192-168-1-10.ipssl.cc` share Let's Encrypt's per-name limit with everyone (see Limits): add a label of the user's own, such as `myname-192-168-1-10.ipssl.cc`.
+- Avoid link-local IPv6 (fe80::/10): a name carries no interface scope, so most systems and browsers cannot reach such an address by name. Use a ULA (fd00::/8) or a global address.
 
 ## 2. Check it resolves
 
-- `dig +short 192-168-1-10.ipssl.cc` should print `192.168.1.10`. An IPv4 name has no AAAA record and an IPv6 name has no A record.
-- If a private address does not resolve on the user's network, the router probably has DNS rebinding protection (OpenWrt, pfSense, dnsmasq, Fritz!Box). Allowlist `ipssl.cc` there, or use a public resolver such as 1.1.1.1 or 8.8.8.8.
+- `dig +short A 192-168-1-10.ipssl.cc` should print `192.168.1.10`; for IPv6 ask for AAAA: `dig +short AAAA 2001-db8--1.ipssl.cc`. An IPv4 name has no AAAA record and an IPv6 name has no A record.
+- If a private address does not resolve on the user's network, the router probably has DNS rebinding protection (OpenWrt, pfSense, dnsmasq, Fritz!Box). Allowlist only the names in use (dnsmasq: `rebind-domain-ok=/192-168-1-10.ipssl.cc/`), or all of `ipssl.cc`, or use a public resolver such as 1.1.1.1 or 8.8.8.8.
 
 ## 3. Get the certificate
 
@@ -23,11 +26,15 @@ Decide by the address.
 
 ### Public address: on the machine itself
 
-The CA connects to the address, so run the ACME client on that machine, with port 80 (HTTP-01) or 443 (TLS-ALPN-01) reachable from the internet:
+The CA connects to the address, so run the ACME client on that machine, with port 80 (HTTP-01) or 443 (TLS-ALPN-01) reachable from the internet. `203.0.113.10` below is a documentation address that no CA validates; use the machine's real public address. Renewal needs port 80 again, so pick the command by what holds it:
 
-- certbot: `sudo certbot certonly --standalone -d 203-0-113-10.ipssl.cc`
-- acme.sh: `acme.sh --issue --standalone -d 203-0-113-10.ipssl.cc`
-- Caddy: put `203-0-113-10.ipssl.cc` in the Caddyfile; Caddy gets the certificate by itself.
+- Nothing on port 80:
+  - certbot: `sudo certbot certonly --standalone -d 203-0-113-10.ipssl.cc`
+  - acme.sh: `acme.sh --issue --server letsencrypt --standalone -d 203-0-113-10.ipssl.cc`
+- nginx already on port 80, serving `/var/www/html` (use its real root), reloaded after each renewal:
+  - certbot: `sudo certbot certonly --webroot -w /var/www/html -d 203-0-113-10.ipssl.cc --deploy-hook "systemctl reload nginx"`, or `sudo certbot --nginx -d 203-0-113-10.ipssl.cc` to let certbot edit the nginx config itself.
+  - acme.sh: `acme.sh --issue --server letsencrypt -w /var/www/html -d 203-0-113-10.ipssl.cc`, then `acme.sh --install-cert -d 203-0-113-10.ipssl.cc --key-file /etc/nginx/ipssl.key --fullchain-file /etc/nginx/ipssl.crt --reloadcmd "systemctl reload nginx"`.
+- Caddy: put `203-0-113-10.ipssl.cc` in the Caddyfile; Caddy gets and renews the certificate by itself.
 
 The DNS API below refuses names with public addresses.
 
@@ -35,14 +42,15 @@ The DNS API below refuses names with public addresses.
 
 Private means 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, fc00::/7, fe80::/10 or ::1. A CA cannot reach these, so the ACME client publishes the DNS-01 challenge through the API and ipssl.cc answers it in DNS. The client can run on any machine with internet access, not only the one at the address.
 
-- lego, or Traefik with the `httpreq` DNS provider:
-  `HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego --email you@example.com --dns httpreq --domains 192-168-1-10.ipssl.cc run`
-- certbot, with the hook script:
-  `curl -fsSLO https://ipssl.cc/acme/ipssl-certbot-hook.sh`
-  `sudo certbot certonly --manual --preferred-challenges dns --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" -d 192-168-1-10.ipssl.cc`
-- acme.sh, with the DNS API plugin:
+- lego v5, or Traefik with the `httpreq` DNS provider:
+  `HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run --dns httpreq --dns.propagation.disable-ans --email YOUR_EMAIL -d 192-168-1-10.ipssl.cc`
+  Replace `YOUR_EMAIL` with the user's address. `--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API only answers once all four name servers hold the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`.
+- certbot, with the hook script saved where only root can change it, since renewal runs it as root:
+  `sudo curl -fsSL -o /usr/local/bin/ipssl-certbot-hook.sh https://ipssl.cc/acme/ipssl-certbot-hook.sh`
+  `sudo certbot certonly --manual --preferred-challenges dns --manual-auth-hook "sh /usr/local/bin/ipssl-certbot-hook.sh present" --manual-cleanup-hook "sh /usr/local/bin/ipssl-certbot-hook.sh cleanup" -d 192-168-1-10.ipssl.cc`
+- acme.sh, with the DNS API plugin (`--server letsencrypt`, because a fresh acme.sh defaults to ZeroSSL, which needs an account email first):
   `curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh https://ipssl.cc/acme/dns_ipssl.sh`
-  `acme.sh --issue --dns dns_ipssl -d 192-168-1-10.ipssl.cc`
+  `acme.sh --issue --server letsencrypt --dns dns_ipssl -d 192-168-1-10.ipssl.cc`
 - Wildcards work too: add `*.192-168-1-10.ipssl.cc` as a second name.
 
 The API, for other clients:
@@ -55,12 +63,18 @@ The API, for other clients:
 ## 4. Use it
 
 - Point the service (nginx, Caddy, a dev server) at the certificate and key, and open it as `https://192-168-1-10.ipssl.cc`. The certificate is for the hostname, so `https://192.168.1.10` still shows a warning.
-- Renew before expiry with the same client; certbot and acme.sh set up renewal on their own.
+- Renew before expiry with the same client; certbot and acme.sh set up renewal on their own, lego needs a scheduled job of its own.
+- A running service keeps the old certificate until it reloads: add `--deploy-hook "systemctl reload nginx"` to certbot, or install the certificate with `acme.sh --install-cert -d 192-168-1-10.ipssl.cc --key-file /etc/nginx/ipssl.key --fullchain-file /etc/nginx/ipssl.crt --reloadcmd "systemctl reload nginx"` (use the service's own reload command).
 
 ## Limits
 
 - Every name under ipssl.cc shares Let's Encrypt's rate limit for the domain. Do not request new certificates in loops; keep one until it is due for renewal, or use ZeroSSL or Google Trust Services.
-- A certificate for a private address encrypts the connection but does not prove whose machine it is: anyone can get one for the same name.
+- Let's Encrypt also allows 5 certificates per 7 days for the exact same set of names, shared by everyone who uses that name. Give common private names a label of the user's own (`myname-192-168-1-10.ipssl.cc`).
+- A certificate for a private address encrypts the connection but does not prove whose machine it is: anyone can get one for the same name, and anyone who can validate a name can also revoke its certificates.
+- After a public IP changes hands, its previous holder may still hold, or for a while obtain, certificates for its name.
+- Issued certificates appear in public Certificate Transparency logs, so the names in them, labels and addresses included, are searchable.
+- Never set cookies with `Domain=ipssl.cc`: other people's names under ipssl.cc can set those cookies too. Use host-only cookies or the `__Host-` prefix.
+- The same name on different networks is the same browser origin: localStorage, IndexedDB, service workers and saved passwords carry over from one to the other.
 - There is no wildcard certificate for all of ipssl.cc to download.
 - Report abuse to abuse@ipssl.cc.
 

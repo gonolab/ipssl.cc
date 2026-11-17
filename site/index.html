@@ -176,15 +176,20 @@
             <span class="yours" data-i18n="path.yours">Your address</span>
           </div>
           <p class="path-sub" data-i18n="path.public.s">On the server itself</p>
-          <p class="path-text" data-i18n="path.public.d">The name resolves to your server, so the CA connects to it to check. Run one command on that server. <span class="term">HTTP-01 or TLS-ALPN-01</span></p>
-          <div class="code-panel">
+          <p class="path-text" data-i18n="path.public.d">The name resolves to your server, so the CA connects to it to check. Run the command on that server. <span class="term">HTTP-01 or TLS-ALPN-01</span></p>
+          <div class="code-panel" data-mode="free">
             <div class="tabs" role="tablist" aria-label="ACME client for a public address">
               <button role="tab" type="button" id="tab-pub-certbot" aria-controls="snip-pub-certbot" aria-selected="true">certbot</button>
               <button role="tab" type="button" id="tab-pub-acme" aria-controls="snip-pub-acme" aria-selected="false" tabindex="-1">acme.sh</button>
               <button role="tab" type="button" id="tab-pub-caddy" aria-controls="snip-pub-caddy" aria-selected="false" tabindex="-1">Caddy</button>
             </div>
-            <div class="snip" role="tabpanel" id="snip-pub-certbot" aria-labelledby="tab-pub-certbot" tabindex="0"><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \</span><span class="ln">    -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre></div>
-            <div class="snip" role="tabpanel" id="snip-pub-acme" aria-labelledby="tab-pub-acme" tabindex="0" hidden><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --standalone \</span><span class="ln">    -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre></div>
+            <div class="modes" role="group" aria-label="What is on port 80">
+              <span class="modes-label" aria-hidden="true" data-i18n="mode.label">Port 80</span>
+              <button type="button" data-mode="free" aria-pressed="true" data-i18n="mode.free">Free</button>
+              <button type="button" data-mode="nginx" aria-pressed="false" data-i18n="mode.nginx">Used by nginx</button>
+            </div>
+            <div class="snip" role="tabpanel" id="snip-pub-certbot" aria-labelledby="tab-pub-certbot" tabindex="0"><pre data-mode="free"><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --standalone \</span><span class="ln">    -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre><pre data-mode="nginx" hidden><code><span class="ln"><span class="comment"># -w: nginx's web root on port 80</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --webroot \</span><span class="ln">    -w /var/www/html -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span> \</span><span class="ln">    --deploy-hook "systemctl reload nginx"</span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pub-acme" aria-labelledby="tab-pub-acme" tabindex="0" hidden><pre data-mode="free"><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --server letsencrypt \</span><span class="ln">    --standalone -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span></code></pre><pre data-mode="nginx" hidden><code><span class="ln"><span class="comment"># -w: nginx's web root on port 80</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --server letsencrypt \</span><span class="ln">    -w /var/www/html -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --install-cert -d <span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span> \</span><span class="ln">    --key-file /etc/nginx/ipssl.key \</span><span class="ln">    --fullchain-file /etc/nginx/ipssl.crt \</span><span class="ln">    --reloadcmd "systemctl reload nginx"</span></code></pre></div>
             <div class="snip" role="tabpanel" id="snip-pub-caddy" aria-labelledby="tab-pub-caddy" tabindex="0" hidden><pre><code><span class="ln"><span class="comment"># Caddyfile</span></span><span class="ln"><span class="host-slot" data-path="public">203-0-113-10.ipssl.cc</span> {</span><span class="ln">    reverse_proxy localhost:8080</span><span class="ln">}</span></code></pre></div>
             <div class="snip-foot">
               <p class="snip-note" id="note-public">Example name. Type a public IP above to use yours.</p>
@@ -206,9 +211,9 @@
               <button role="tab" type="button" id="tab-pri-acme" aria-controls="snip-pri-acme" aria-selected="false" tabindex="-1">acme.sh</button>
               <button role="tab" type="button" id="tab-pri-lego" aria-controls="snip-pri-lego" aria-selected="false" tabindex="-1">lego</button>
             </div>
-            <div class="snip" role="tabpanel" id="snip-pri-certbot" aria-labelledby="tab-pri-certbot" tabindex="0"><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>curl -fsSLO https://ipssl.cc/acme/ipssl-certbot-hook.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --manual --preferred-challenges dns \</span><span class="ln">    --manual-auth-hook "sh $PWD/ipssl-certbot-hook.sh present" \</span><span class="ln">    --manual-cleanup-hook "sh $PWD/ipssl-certbot-hook.sh cleanup" \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
-            <div class="snip" role="tabpanel" id="snip-pri-acme" aria-labelledby="tab-pri-acme" tabindex="0" hidden><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh \</span><span class="ln">    https://ipssl.cc/acme/dns_ipssl.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --dns dns_ipssl \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
-            <div class="snip" role="tabpanel" id="snip-pri-lego" aria-labelledby="tab-pri-lego" tabindex="0" hidden><pre><code><span class="ln"><span class="comment"># lego, and Traefik with the httpreq provider</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego \</span><span class="ln">    --email you@example.com --dns httpreq \</span><span class="ln">    --domains <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span> run</span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pri-certbot" aria-labelledby="tab-pri-certbot" tabindex="0"><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo curl -fsSL -o /usr/local/bin/ipssl-certbot-hook.sh \</span><span class="ln">    https://ipssl.cc/acme/ipssl-certbot-hook.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>sudo certbot certonly --manual --preferred-challenges dns \</span><span class="ln">    --manual-auth-hook \</span><span class="ln">      "sh /usr/local/bin/ipssl-certbot-hook.sh present" \</span><span class="ln">    --manual-cleanup-hook \</span><span class="ln">      "sh /usr/local/bin/ipssl-certbot-hook.sh cleanup" \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pri-acme" aria-labelledby="tab-pri-acme" tabindex="0" hidden><pre><code><span class="ln"><span class="prompt" aria-hidden="true">$ </span>curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh \</span><span class="ln">    https://ipssl.cc/acme/dns_ipssl.sh</span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>acme.sh --issue --server letsencrypt --dns dns_ipssl \</span><span class="ln">    -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
+            <div class="snip" role="tabpanel" id="snip-pri-lego" aria-labelledby="tab-pri-lego" tabindex="0" hidden><pre><code><span class="ln"><span class="comment"># lego v5, or Traefik with the httpreq provider</span></span><span class="ln"><span class="prompt" aria-hidden="true">$ </span>HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run \</span><span class="ln">    --dns httpreq --dns.propagation.disable-ans \</span><span class="ln">    --email <span class="ph">YOUR_EMAIL</span> -d <span class="host-slot" data-path="private">192-168-1-10.ipssl.cc</span></span></code></pre></div>
             <div class="snip-foot">
               <p class="snip-note" id="note-private">Run it on any machine with internet access.</p>
               <button class="copy copy-dark" type="button" data-copy-snip aria-label="Copy command"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg></button>
@@ -223,12 +228,24 @@
           <dd data-i18n="certs.f1.d">The zone publishes no CAA record, so Let's Encrypt, ZeroSSL, Google Trust Services and others can all issue.</dd>
         </div>
         <div>
+          <dt data-i18n="certs.f3.t">One shared limit</dt>
+          <dd data-i18n="certs.f3.d">Every name under ipssl.cc counts toward Let's Encrypt's limit for the domain, and the exact same set of names gets 5 certificates per 7 days, shared by everyone. Give a common name a label of your own, such as <code>myname-192-168-1-10.ipssl.cc</code>.</dd>
+        </div>
+        <div>
           <dt data-i18n="certs.f2.t">Encrypted, not identified</dt>
           <dd data-i18n="certs.f2.d">A private address exists on countless networks, so anyone can get a certificate for the same name. It encrypts the connection; it does not prove whose machine you reached.</dd>
         </div>
         <div>
-          <dt data-i18n="certs.f3.t">One shared limit</dt>
-          <dd data-i18n="certs.f3.d">Every name under ipssl.cc counts toward Let's Encrypt's limit for the domain. Keep a certificate until it is due for renewal, or use another CA.</dd>
+          <dt data-i18n="certs.f4.t">Others can revoke</dt>
+          <dd data-i18n="certs.f4.d">Anyone who can validate a name can also revoke its certificates. After a public IP changes hands, its previous holder may still hold, or for a while obtain, certificates for its name.</dd>
+        </div>
+        <div>
+          <dt data-i18n="certs.f5.t">Listed in public logs</dt>
+          <dd data-i18n="certs.f5.d">Every certificate goes into public Certificate Transparency logs, so anyone can search for the names in it, labels and addresses included.</dd>
+        </div>
+        <div>
+          <dt data-i18n="certs.f6.t">Cookies and storage</dt>
+          <dd data-i18n="certs.f6.d">Never set cookies with <code>Domain=ipssl.cc</code>: other people's names can set those too. Use host-only or <code>__Host-</code> cookies. The same name on two networks is one browser origin, so storage, service workers and saved passwords carry over.</dd>
         </div>
       </dl>
     </section>
@@ -246,7 +263,7 @@
         </details>
         <details>
           <summary data-i18n="faq.q1">Why doesn't a private address resolve on my network?</summary>
-          <p data-i18n="faq.a1">Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers that point to private addresses. Allowlist <code>ipssl.cc</code> there, or use a public resolver.</p>
+          <p data-i18n="faq.a1">Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers that point to private addresses. Allowlist only the names you use, such as <code>rebind-domain-ok=/192-168-1-10.ipssl.cc/</code> in dnsmasq, or all of <code>ipssl.cc</code>, or use a public resolver.</p>
         </details>
         <details>
           <summary data-i18n="faq.q2">Can I download a wildcard certificate for ipssl.cc?</summary>
@@ -254,7 +271,7 @@
         </details>
         <details>
           <summary data-i18n="faq.q3">Why isn't ipssl.cc on the Public Suffix List?</summary>
-          <p data-i18n="faq.a3">The list excludes services that resolve an IP address written in a hostname to that address: the same IP can belong to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the list.</p>
+          <p data-i18n="faq.a3">The list excludes services that resolve an IP address written in a hostname to that address: the same IP can belong to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the list, but browsers do: any name here may set cookies for all of <code>ipssl.cc</code>, so keep yours host-only.</p>
         </details>
         <details>
           <summary data-i18n="faq.q4">How do I see where my DNS queries come from?</summary>

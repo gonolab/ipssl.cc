@@ -300,6 +300,7 @@
       copyPrompt: "Copy prompt",
       copyCmd: "Copy command",
       copyInstall: "Copy install command",
+      modes: "What is on port 80",
       checking: "Asking Cloudflare DNS…",
       match: "Resolves correctly",
       mismatch: "Expected {want}",
@@ -374,6 +375,7 @@
       copyPrompt: "复制提示词",
       copyCmd: "复制命令",
       copyInstall: "复制安装命令",
+      modes: "80 端口的情况",
       checking: "正在查询 Cloudflare DNS…",
       match: "解析正确",
       mismatch: "预期是 {want}",
@@ -420,26 +422,35 @@
     "path.yours": "你的地址",
     "path.public.t": "公网地址",
     "path.public.s": "在服务器上直接申请",
-    "path.public.d": "域名解析到你的服务器，CA 会直接连过去验证。在这台服务器上运行一条命令就行。<span class=\"term\">HTTP-01 或 TLS-ALPN-01</span>",
+    "path.public.d": "域名解析到你的服务器，CA 会直接连过去验证。在这台服务器上运行下面的命令就行。<span class=\"term\">HTTP-01 或 TLS-ALPN-01</span>",
     "path.private.t": "内网地址",
     "path.private.s": "通过 DNS，在任意机器上申请",
+    "mode.label": "80 端口",
+    "mode.free": "空闲",
+    "mode.nginx": "nginx 在用",
     "path.private.d": "CA 访问不到 <code class=\"ip-slot\">192.168.1.10</code>，所以由 ACME 客户端把验证信息提交到 <code>https://ipssl.cc/acme</code>，ipssl.cc 在 DNS 里替你应答。<span class=\"term\">DNS-01</span>",
     "certs.f1.t": "任意 CA",
     "certs.f1.d": "这个域没有 CAA 记录，Let's Encrypt、ZeroSSL、Google Trust Services 等都能签发。",
     "certs.f2.t": "能加密，不能证明身份",
     "certs.f2.d": "同一个内网地址存在于无数网络中，任何人都能为同一个名字申请证书。它能加密连接，但不能证明你连上的是谁的机器。",
     "certs.f3.t": "共用一份额度",
-    "certs.f3.d": "ipssl.cc 下的所有名字共用 Let's Encrypt 按域名计算的签发额度。证书到期前不必重复申请，或者换一家 CA。",
+    "certs.f3.d": "ipssl.cc 下的所有名字共用 Let's Encrypt 按域名计算的签发额度；完全相同的一组名字每 7 天只能签 5 张，所有人共用。常见的名字请加上自己的标签，比如 <code>myname-192-168-1-10.ipssl.cc</code>。",
+    "certs.f4.t": "别人也能吊销",
+    "certs.f4.d": "能验证某个名字的人，也能吊销它的证书。公网 IP 换了主人以后，前一任在一段时间内可能仍持有、甚至还能申请这个名字的证书。",
+    "certs.f5.t": "写进公开日志",
+    "certs.f5.d": "签发的每张证书都会写进公开的证书透明度（CT）日志，证书里的名字连同标签和地址，任何人都能搜到。",
+    "certs.f6.t": "Cookie 和存储",
+    "certs.f6.d": "不要用 <code>Domain=ipssl.cc</code> 设置 Cookie：别人的名字也能设置这种 Cookie。请用仅限当前主机（host-only）或带 <code>__Host-</code> 前缀的 Cookie。同一个名字在两个网络里仍是浏览器里的同一个源，本地存储、Service Worker 和保存的密码都会沿用。",
     "faq.title": "常见问题",
     "faq.lead": "没找到答案？到 <a href=\"https://github.com/gonolab/ipssl.cc/issues\">issue 区</a>提问。",
     "faq.q7": "能让 AI 助手帮我配置吗？",
     "faq.a7": "可以。把本页顶部的提示词交给它。<a href=\"/llms.txt\">llms.txt</a> 会告诉它怎么选域名、这个地址适合哪种申请方式，以及具体命令。",
     "faq.q1": "为什么私有地址在我的网络里解析不出来？",
-    "faq.a1": "很多路由器（OpenWrt、pfSense、dnsmasq、Fritz!Box 等）开启了 DNS 重绑定保护，会丢弃指向私有地址的应答。在路由器里把 <code>ipssl.cc</code> 加入白名单，或者改用公共解析器。",
+    "faq.a1": "很多路由器（OpenWrt、pfSense、dnsmasq、Fritz!Box 等）开启了 DNS 重绑定保护，会丢弃指向私有地址的应答。只把用到的名字加入白名单，比如 dnsmasq 里的 <code>rebind-domain-ok=/192-168-1-10.ipssl.cc/</code>，或者放行整个 <code>ipssl.cc</code>，也可以改用公共解析器。",
     "faq.q2": "能下载 ipssl.cc 的通配符证书吗？",
     "faq.a2": "不能。公开私钥违反 CA 的订户协议，而且任何拿到私钥的人都能吊销证书。请自己申请证书，只需要一条命令。",
     "faq.q3": "为什么 ipssl.cc 不在公共后缀列表（PSL）里？",
-    "faq.a3": "PSL 明确不收录把域名里的 IP 解析到该 IP 的服务：同一个 IP 会在不同时间分配给不同的人，不能证明对域名的稳定控制。DNS 解析不依赖 PSL。",
+    "faq.a3": "PSL 明确不收录把域名里的 IP 解析到该 IP 的服务：同一个 IP 会在不同时间分配给不同的人，不能证明对域名的稳定控制。DNS 解析不依赖 PSL，浏览器却依赖：这里的任何名字都能为整个 <code>ipssl.cc</code> 设置 Cookie，所以你的 Cookie 要限定在当前主机。",
     "faq.q4": "怎么查看我的 DNS 查询是从哪里发出的？",
     "faq.a4": "运行 <code>dig +short TXT ip.ipssl.cc</code>，返回的是查询到达我们时的来源地址，通常是你的递归解析器。",
     "faq.q5": "可以给自己的域名部署一套吗？",
@@ -948,7 +959,7 @@
 
   document.querySelectorAll("[data-copy-snip]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      const lines = btn.closest(".code-panel").querySelectorAll(".snip:not([hidden]) .ln");
+      const lines = btn.closest(".code-panel").querySelectorAll(".snip:not([hidden]) pre:not([hidden]) .ln");
       // One line per block; leave out the prompts and the comment lines.
       const text = [...lines]
         .map((ln) =>
@@ -992,8 +1003,26 @@
   // ---------------------------------------------------------------------
   // Tabs, one group per code panel, with arrow-key navigation.
 
-  document.querySelectorAll('.code-panel [role="tablist"]').forEach((list) => {
-    const tabs = [...list.querySelectorAll('[role="tab"]')];
+  document.querySelectorAll(".code-panel").forEach((panel) => {
+    const tabs = [...panel.querySelectorAll('[role="tablist"] [role="tab"]')];
+    // Some clients have one command per situation (port 80 free, or nginx
+    // already on it); the switch picks one, and the copy button copies it.
+    const modes = panel.querySelector(".modes");
+    const showMode = () => {
+      if (!modes) return;
+      const mode = panel.dataset.mode;
+      modes.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === mode)));
+      panel.querySelectorAll("pre[data-mode]").forEach((pre) => {
+        pre.hidden = pre.dataset.mode !== mode;
+      });
+      modes.hidden = !panel.querySelector(".snip:not([hidden]) pre[data-mode]");
+    };
+    modes?.querySelectorAll("[data-mode]").forEach((b) => {
+      b.addEventListener("click", () => {
+        panel.dataset.mode = b.dataset.mode;
+        showMode();
+      });
+    });
     const select = (tab, focus) => {
       tabs.forEach((other) => {
         const on = other === tab;
@@ -1001,8 +1030,10 @@
         other.tabIndex = on ? 0 : -1;
         document.getElementById(other.getAttribute("aria-controls")).hidden = !on;
       });
+      showMode();
       if (focus) tab.focus();
     };
+    showMode();
     tabs.forEach((tab, i) => {
       tab.addEventListener("click", () => select(tab, false));
       tab.addEventListener("keydown", (e) => {
@@ -1055,6 +1086,7 @@
     document.querySelectorAll("[data-copy-snip]").forEach((b) => b.setAttribute("aria-label", t("copyCmd")));
     $("#ai-copy").setAttribute("aria-label", t("copyPrompt"));
     $("#install-copy").setAttribute("aria-label", t("copyInstall"));
+    document.querySelectorAll(".modes").forEach((m) => m.setAttribute("aria-label", t("modes")));
     if (save) {
       try {
         localStorage.setItem("lang", lang);

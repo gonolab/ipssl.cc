@@ -174,6 +174,7 @@ p {
 .lead code,
 .note code,
 .rules code,
+.cert-facts code,
 .faq-list code {
   padding: 1px 6px;
   border-radius: 5px;
@@ -1307,8 +1308,11 @@ p {
   white-space: nowrap;
 }
 
+/* Commands wrap at spaces only, with the hanging indent below, so a long
+   hook path or name never hides behind a scrollbar. */
 .path .snip pre {
   font-size: 13px;
+  white-space: pre-wrap;
 }
 
 .path.is-yours .code-panel {
@@ -1405,6 +1409,55 @@ p {
 
 .snip .host-slot {
   color: var(--code-accent);
+}
+
+/* A value to fill in before running the command. */
+.snip .ph {
+  color: var(--code-warn);
+  white-space: nowrap;
+}
+
+/* What is on port 80: picks one of a client's commands. */
+.modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 24px 0;
+  font: 12.5px/1.4 var(--mono);
+}
+
+.modes[hidden] {
+  display: none;
+}
+
+.modes-label {
+  margin-right: 6px;
+  color: var(--code-muted);
+}
+
+.modes button {
+  padding: 3px 9px;
+  border: 1px solid var(--code-line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--code-muted);
+  font: inherit;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.modes button:hover {
+  color: var(--code-text);
+}
+
+.modes button[aria-pressed="true"] {
+  border-color: transparent;
+  background: rgb(255 255 255 / 0.09);
+  color: #fff;
+}
+
+.modes:not([hidden]) ~ .snip pre {
+  padding-top: 14px;
 }
 
 .snip-foot {
@@ -1666,6 +1719,17 @@ p {
     font-size: 16px;
   }
 
+  /* A long setting such as rebind-domain-ok=/…/ may break rather than
+     widen the page. */
+  .lead code,
+  .note code,
+  .rules code,
+  .cert-facts code,
+  .faq-list code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
   .address {
     margin-top: 36px;
   }
@@ -1703,6 +1767,10 @@ p {
     padding: 18px 16px;
     font-size: 12.5px;
     white-space: pre-wrap;
+  }
+
+  .modes {
+    padding: 12px 16px 0;
   }
 
   .cmd {
