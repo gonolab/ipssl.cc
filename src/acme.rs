@@ -36,6 +36,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::handler::Handler;
 use crate::http::{Request, Response, Server, post_json};
+use crate::metrics::AcmeWrite;
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{ChallengeError, Zone};
 
@@ -418,7 +419,7 @@ impl Node {
         let node = Arc::new(self);
         let filter = node.clone();
         Server::new(listener)
-            .allow(move |ip| filter.allows(ip))
+            .allow(move |ip| filter.admits(ip))
             .serve(move |req| {
                 let node = node.clone();
                 async move { node.handle(req).await }
@@ -430,27 +431,35 @@ impl Node {
         self.try_handle(req).unwrap_or_else(|response| response)
     }
 
-    /// Whether `ip` may write challenges.
-    fn allows(&self, ip: IpAddr) -> bool {
-        self.writers.contains(&ip.to_canonical())
+    /// Whether `ip` may write challenges. Counts those that may not, so a
+    /// change of the API's address shows up in the metrics; scanners
+    /// knocking on the port do too.
+    fn admits(&self, ip: IpAddr) -> bool {
+        let admitted = self.writers.contains(&ip.to_canonical());
+        if !admitted {
+            self.count(AcmeWrite::Forbidden);
+        }
+        admitted
+    }
+
+    fn count(&self, result: AcmeWrite) {
+        self.handler.metrics().acme_write(result);
     }
 
     fn try_handle(&self, req: Request) -> Result<Response, Response> {
-        if !self.allows(req.peer.ip()) {
+        // Already checked in `serve`; this is for callers of `handle`.
+        if !self.admits(req.peer.ip()) {
             return Err(error(403, "not allowed to write challenges"));
         }
-        let action = route(&req)?;
+        let rejected = |_: &Response| self.count(AcmeWrite::Rejected);
+        let action = route(&req).inspect_err(rejected)?;
         let zone = self.handler.zone();
-        let (name, value) = parse(&req, &zone).inspect_err(|_| {
-            self.handler.metrics().acme_write(false);
-        })?;
-        let owner = owner(&req).inspect_err(|_| {
-            self.handler.metrics().acme_write(false);
-        })?;
+        let (name, value) = parse(&req, &zone).inspect_err(rejected)?;
+        let owner = owner(&req).inspect_err(rejected)?;
         match action {
             Action::Present => {
                 if let Err(full) = self.store.present(name, &value, owner) {
-                    self.handler.metrics().acme_write(false);
+                    self.count(AcmeWrite::Rejected);
                     return Err(full.response());
                 }
             }
@@ -458,7 +467,7 @@ impl Node {
             // already gone) still succeeds, so cleanup can be retried.
             Action::Cleanup => self.store.cleanup(&name, &value, owner),
         }
-        self.handler.metrics().acme_write(true);
+        self.count(AcmeWrite::Accepted);
         Ok(ok())
     }
 }

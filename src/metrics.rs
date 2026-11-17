@@ -46,6 +46,18 @@ pub enum Limited {
     Slipped,
 }
 
+/// What a name server did with a DNS-01 challenge write.
+#[derive(Debug, Clone, Copy)]
+pub enum AcmeWrite {
+    /// Published or cleaned up.
+    Accepted,
+    /// Refused: wrong path or method, a body that does not hold a
+    /// challenge, or no room for the value.
+    Rejected,
+    /// A connection from an address not in `acme.writers`, closed unread.
+    Forbidden,
+}
+
 /// Values read at scrape time rather than counted.
 pub struct Gauges {
     pub zone_serial: u32,
@@ -66,8 +78,8 @@ pub struct Metrics {
     rate_limited: [AtomicU64; 2],
     /// Succeeded, failed.
     reloads: [AtomicU64; 2],
-    /// Challenge writes accepted, rejected.
-    acme_writes: [AtomicU64; 2],
+    /// Challenge writes accepted, rejected, forbidden.
+    acme_writes: [AtomicU64; 3],
 }
 
 impl Default for Metrics {
@@ -129,9 +141,9 @@ impl Metrics {
         inc(&self.reloads[usize::from(!ok)]);
     }
 
-    /// Counts a challenge write from the API, accepted or rejected.
-    pub fn acme_write(&self, ok: bool) {
-        inc(&self.acme_writes[usize::from(!ok)]);
+    /// Counts a challenge write.
+    pub fn acme_write(&self, result: AcmeWrite) {
+        inc(&self.acme_writes[result as usize]);
     }
 
     /// The Prometheus text exposition of all metrics.
@@ -246,9 +258,9 @@ impl Metrics {
                 &mut out,
                 "ipssl_acme_writes_total",
                 "counter",
-                "DNS-01 challenge writes from the API, by result.",
+                "DNS-01 challenge writes, by result. forbidden counts connections from addresses not in acme.writers.",
             );
-            for (i, result) in ["accepted", "rejected"].iter().enumerate() {
+            for (i, result) in ["accepted", "rejected", "forbidden"].iter().enumerate() {
                 let value = load(&self.acme_writes[i]);
                 writeln!(
                     out,
@@ -332,7 +344,9 @@ mod tests {
         m.response(ResponseCode::YXDomain);
         m.rate_limited(Limited::Slipped);
         m.reload(false);
-        m.acme_write(true);
+        m.acme_write(AcmeWrite::Accepted);
+        m.acme_write(AcmeWrite::Forbidden);
+        m.acme_write(AcmeWrite::Forbidden);
 
         let text = m.render(&GAUGES);
         let value = |series: &str| line(&text, series).rsplit(' ').next().unwrap().to_owned();
@@ -364,6 +378,8 @@ mod tests {
         assert_eq!(value("ipssl_rate_limit_tracked_networks"), "3");
         assert_eq!(value("ipssl_acme_challenges"), "2");
         assert_eq!(value(r#"ipssl_acme_writes_total{result="accepted"}"#), "1");
+        assert_eq!(value(r#"ipssl_acme_writes_total{result="rejected"}"#), "0");
+        assert_eq!(value(r#"ipssl_acme_writes_total{result="forbidden"}"#), "2");
         assert_eq!(value("ipssl_zone_serial"), "2026110501");
     }
 

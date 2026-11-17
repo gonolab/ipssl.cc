@@ -123,18 +123,33 @@ fn value(first: char) -> String {
 /// Sends `body` to the API the way the TLS proxy in front of it does for
 /// a client at `client`; returns the status and the body of the answer.
 async fn post_as(api: SocketAddr, client: &str, path: &str, body: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect(api).await.unwrap();
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: ipssl.cc\r\nX-Real-IP: {client}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
+    raw(api, &request).await
+}
+
+/// Sends `request` as it is; returns the status and the body of the answer.
+async fn raw(addr: SocketAddr, request: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
     let (head, body) = response.split_once("\r\n\r\n").unwrap();
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
     (status, body.to_owned())
+}
+
+/// The value of one series in `metrics`, which must be there.
+fn metric(metrics: &str, series: &str) -> u64 {
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .unwrap_or_else(|| panic!("no {series} in\n{metrics}"))
+        .parse()
+        .unwrap()
 }
 
 async fn sorted_values(dns: SocketAddr) -> Vec<String> {
@@ -302,6 +317,34 @@ async fn name_server_only_takes_writes_from_writers() {
         assert!(result.is_err(), "{result:?}");
     }
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
+    // Counted, so an API whose address no longer matches stands out.
+    let metrics = ns.handler.render_metrics();
+    assert_eq!(
+        metric(&metrics, r#"ipssl_acme_writes_total{result="forbidden"}"#),
+        40
+    );
+    assert_eq!(
+        metric(&metrics, r#"ipssl_acme_writes_total{result="accepted"}"#),
+        0
+    );
+}
+
+#[tokio::test]
+async fn name_server_counts_every_rejected_write() {
+    let ns = name_server("127.0.0.1").await;
+    let (status, _) = post_json(ns.write, "/delete", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 404);
+    let (status, _) = raw(ns.write, "GET /present HTTP/1.1\r\n\r\n").await;
+    assert_eq!(status, 405);
+    let (status, _) = post_json(ns.write, "/present", "{").await.unwrap();
+    assert_eq!(status, 400);
+    let metrics = ns.handler.render_metrics();
+    assert_eq!(
+        metric(&metrics, r#"ipssl_acme_writes_total{result="rejected"}"#),
+        3
+    );
 }
 
 #[tokio::test]
