@@ -135,9 +135,9 @@ struct Entry {
 pub enum Full {
     /// No room for another challenge name.
     Store,
-    /// The name holds [`MAX_VALUES`] values already.
+    /// The name holds as many values as it may (16).
     Name,
-    /// The owner holds [`MAX_VALUES_PER_OWNER`] values at the name already.
+    /// The owner holds as many values at the name as it may (2).
     Owner,
 }
 
