@@ -257,7 +257,12 @@ async fn api_reports_a_name_server_that_is_down() {
         .await
         .unwrap();
     assert_eq!(status, 502, "{reply}");
-    assert!(reply.contains(&down.to_string()), "{reply}");
+    // How many failed, but not where they are or what went wrong.
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let message = reply["error"].as_str().unwrap();
+    assert!(message.starts_with("1 of 2 name servers "), "{message}");
+    assert!(!message.contains(&down.port().to_string()), "{message}");
+    assert!(!message.contains("127.0.0.1"), "{message}");
 }
 
 #[tokio::test]

@@ -496,30 +496,38 @@ impl Api {
         let mut tasks = JoinSet::new();
         for &addr in &self.nodes {
             let body = body.clone();
-            tasks.spawn(async move { send(addr, action, &body).await });
+            tasks.spawn(async move { (addr, send(addr, action, &body, NODE_TIMEOUT).await) });
         }
         let mut failed = Vec::new();
         let mut rejected = false;
         while let Some(joined) = tasks.join_next().await {
             match joined {
-                Ok(Outcome::Accepted) => {}
-                Ok(Outcome::Rejected) => rejected = true,
-                Ok(Outcome::Failed(problem)) => failed.push(problem),
+                Ok((_, Outcome::Accepted)) => {}
+                Ok((_, Outcome::Rejected)) => rejected = true,
+                Ok((_, Outcome::Failed(problem))) => failed.push(problem),
                 Err(e) => failed.push(format!("task failed: {e}")),
             }
+        }
+        if !rejected && failed.is_empty() {
+            return Ok(ok());
+        }
+        if !failed.is_empty() {
+            failed.sort();
+            let failed = failed.join(", ");
+            warn!(action = action.path(), fqdn = %name, %failed, "acme: a name server did not take the change");
         }
         if rejected {
             return Err(error(409, &too_many_values()));
         }
-        if failed.is_empty() {
-            return Ok(ok());
-        }
-        failed.sort();
-        let failed = failed.join(", ");
-        warn!(action = action.path(), %failed, "acme: a name server did not take the change");
+        // Clients learn how many name servers failed, not which or why:
+        // their addresses and errors stay in the log.
         Err(error(
             502,
-            &format!("not every name server took the change: {failed}"),
+            &format!(
+                "{} of {} name servers did not take the change; try again later",
+                failed.len(),
+                self.nodes.len()
+            ),
         ))
     }
 }
@@ -533,9 +541,9 @@ enum Outcome {
     Failed(String),
 }
 
-/// Sends a change to the name server at `addr`.
-async fn send(addr: SocketAddr, action: Action, body: &str) -> Outcome {
-    let problem = match timeout(NODE_TIMEOUT, post_json(addr, action.path(), body)).await {
+/// Sends a change to the name server at `addr`, waiting at most `limit`.
+async fn send(addr: SocketAddr, action: Action, body: &str, limit: Duration) -> Outcome {
+    let problem = match timeout(limit, post_json(addr, action.path(), body)).await {
         // Only a name server's own answer counts, not any 200: a port
         // that serves something else must not acknowledge a value.
         Ok(Ok((200, reply))) if reply_ok(&reply) == Some(true) => return Outcome::Accepted,
