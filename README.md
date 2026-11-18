@@ -33,15 +33,24 @@ Rules:
 
 ## HTTPS certificates
 
-Get certificates on your own server, the same way as with nip.io and sslip.io. `203-0-113-10.ipssl.cc` resolves to `203.0.113.10`, so an ACME client running on that server (certbot, acme.sh, Caddy and others) passes HTTP-01 or TLS-ALPN-01 validation as usual:
+Get certificates on your own server, the same way as with nip.io and sslip.io. `203-0-113-10.ipssl.cc` resolves to `203.0.113.10`, so an ACME client running on that server (certbot, acme.sh, Caddy and others) passes HTTP-01 or TLS-ALPN-01 validation as usual. With nothing else on port 80:
 
 ```bash
-certbot certonly --standalone -d 203-0-113-10.ipssl.cc
+sudo certbot certonly --standalone -d 203-0-113-10.ipssl.cc
 ```
+
+If nginx already serves port 80, let certbot put the challenge in its document root (use the real one) and reload nginx after each renewal, so it picks up the new certificate:
+
+```bash
+sudo certbot certonly --webroot -w /var/www/html -d 203-0-113-10.ipssl.cc \
+  --deploy-hook "systemctl reload nginx"
+```
+
+Or run `sudo certbot --nginx -d 203-0-113-10.ipssl.cc` to let certbot edit the nginx config itself.
 
 Any ACME CA works: the zone publishes no CAA record that would limit the choice.
 
-This only works for public addresses the CA can reach. Names with private addresses such as `192-168-1-10.ipssl.cc` use DNS-01 instead, see [below](#certificates-for-private-addresses).
+This only works for public addresses the CA can reach, and gives no wildcard certificates: a wildcard needs DNS-01, which ipssl.cc offers only for private addresses. Names with private addresses such as `192-168-1-10.ipssl.cc` use DNS-01, see [below](#certificates-for-private-addresses).
 
 Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for certificates per registered domain. Let's Encrypt raised that limit for `ipssl.cc` in November 2026, but it is still one limit for every user of the service.
 
@@ -49,35 +58,62 @@ Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for cer
 
 A CA cannot reach `10.0.2.2` or `192.168.1.10`, so names with private addresses prove control through DNS instead (DNS-01). Your ACME client publishes the challenge through the ipssl.cc API, and the CA finds it in DNS. This works for every name whose address is private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64/10`), loopback or link-local, IPv4 or IPv6. Wildcards such as `*.10-0-2-2.ipssl.cc` work too.
 
-The API takes `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup` with a JSON body such as `{"fqdn": "_acme-challenge.10-0-2-2.ipssl.cc", "value": "..."}`. That is the format of lego's `httpreq` provider, so lego and Traefik work as they are:
+The API takes `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup` with a JSON body such as `{"fqdn": "_acme-challenge.10-0-2-2.ipssl.cc", "value": "..."}`. That is the format of lego's `httpreq` provider, so lego and Traefik work as they are. With lego v5 (replace `YOUR_EMAIL`):
 
 ```bash
-HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego --email you@example.com --dns httpreq --domains 10-0-2-2.ipssl.cc run
+HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run --dns httpreq --dns.propagation.disable-ans \
+  --email YOUR_EMAIL -d 10-0-2-2.ipssl.cc
 ```
+
+`--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API answers only once every name server holds the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`.
 
 In Traefik, set the environment variable `HTTPREQ_ENDPOINT=https://ipssl.cc/acme` and use `httpreq` as the `dnsChallenge` provider.
 
-certbot, with [`ipssl-certbot-hook.sh`](deploy/acme/ipssl-certbot-hook.sh):
+certbot, with [`ipssl-certbot-hook.sh`](deploy/acme/ipssl-certbot-hook.sh) saved where only root can change it, since renewals run it as root:
 
 ```bash
-certbot certonly --manual --preferred-challenges dns \
-  --manual-auth-hook "sh ipssl-certbot-hook.sh present" \
-  --manual-cleanup-hook "sh ipssl-certbot-hook.sh cleanup" \
+sudo curl -fsSL -o /usr/local/bin/ipssl-certbot-hook.sh https://ipssl.cc/acme/ipssl-certbot-hook.sh
+```
+
+```bash
+sudo certbot certonly --manual --preferred-challenges dns \
+  --manual-auth-hook "sh /usr/local/bin/ipssl-certbot-hook.sh present" \
+  --manual-cleanup-hook "sh /usr/local/bin/ipssl-certbot-hook.sh cleanup" \
   -d 10-0-2-2.ipssl.cc
 ```
 
-acme.sh, with [`dns_ipssl.sh`](deploy/acme/dns_ipssl.sh) copied to `~/.acme.sh/dnsapi/`:
+The hook takes another endpoint from `IPSSL_API`. certbot saves the hook commands for renewal but not the environment, so set the variable inside both commands, as in `--manual-auth-hook "env IPSSL_API=https://acme.example.net/acme sh /usr/local/bin/ipssl-certbot-hook.sh present"`.
+
+acme.sh, with [`dns_ipssl.sh`](deploy/acme/dns_ipssl.sh) in `~/.acme.sh/dnsapi/` (`--server letsencrypt`, because acme.sh defaults to ZeroSSL):
 
 ```bash
-acme.sh --issue --dns dns_ipssl -d 10-0-2-2.ipssl.cc
+curl -fsSL -o ~/.acme.sh/dnsapi/dns_ipssl.sh https://ipssl.cc/acme/dns_ipssl.sh
 ```
+
+```bash
+acme.sh --issue --server letsencrypt --dns dns_ipssl -d 10-0-2-2.ipssl.cc
+```
+
+For another endpoint, set `IPSSL_API` when issuing. acme.sh saves it with that certificate, so its renewals keep using it.
 
 Keep in mind:
 
 - The certificate encrypts the connection, but it does not prove whose machine you reached. `10.0.2.2` exists on countless networks, and anyone can get a certificate for the same name.
 - Names with public addresses are refused: otherwise anyone could get a certificate for someone else's server. Run the ACME client on that server and use HTTP-01 or TLS-ALPN-01.
-- Values must be real DNS-01 digests. They are dropped after 10 minutes, and each client network can make 10 requests a minute.
+- Values must be real DNS-01 digests. They are dropped after 10 minutes.
+- Each client network can make 10 requests a minute, with bursts of 20, which is enough for an order of about 20 names. The certbot hook and the acme.sh plugin wait and retry when the API answers 429.
 - These certificates count toward the same Let's Encrypt limit as every other name under `ipssl.cc`. Keep a certificate until it is due for renewal, or use another CA such as ZeroSSL or Google Trust Services.
+
+## Shared names
+
+Every name under `ipssl.cc` is open to everyone. That matters for certificates and for the sites you serve under these names:
+
+- **Cookies.** Never set cookies with `Domain=ipssl.cc`. Browsers send such cookies to every name under the domain, other people's included, and other people's names can set them for yours. Use host-only cookies (no `Domain` attribute), preferably named with the `__Host-` prefix, which only the host itself can set.
+- **Origins.** The same name on different networks is the same origin to a browser: `https://192-168-1-10.ipssl.cc` at home and at work share cookies, storage and granted permissions, although they are different machines.
+- **Revocation.** Anyone who can validate a name can also revoke its certificates. For a name with a private address, that is anyone.
+- **Certificate Transparency.** Issued certificates appear in public Certificate Transparency logs, so the names in them, labels and addresses included, can be searched.
+- **Duplicate certificates.** Let's Encrypt allows 5 certificates per 7 days for the exact same set of names, and everyone who uses a name shares that limit. Give common private names a label of your own, such as `myname-192-168-1-10.ipssl.cc`.
+- **Changing addresses.** After a public IP address changes hands, its previous holder may still hold certificates for its name, and for a while obtain new ones, since CAs reuse recent validations.
 
 ## Running locally
 
