@@ -21,6 +21,14 @@ CLAUDE.md
 .env.*
 *.pem
 *.key
+# ACME client state with account and certificate keys: Traefik's
+# acme.json, certbot's account private_key.json, and the default
+# directories of lego, certbot and acme.sh when run from the checkout
+acme.json
+private_key.json
+/.lego/
+/letsencrypt/
+/.acme.sh/
 
 # cargo-fuzz build output and crash artifacts (fuzz/corpus stays tracked)
 /fuzz/target/
