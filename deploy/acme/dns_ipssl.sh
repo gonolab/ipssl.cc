@@ -18,6 +18,11 @@ Options:
 
 IPSSL_API_DEFAULT="https://ipssl.cc/acme"
 
+# The API limits each client network (by default 10 requests a minute,
+# with bursts of 20), so an order for many names can hit 429. Requests are
+# retried then for at most this many seconds in all.
+IPSSL_MAX_WAIT=90
+
 # Usage: dns_ipssl_add _acme-challenge.10-0-2-2.ipssl.cc "XKrxpRBosdIKFzxW_CT3KLZNf6q0HG9i01zxXp5CPBs"
 dns_ipssl_add() {
   _ipssl_call present "$1" "$2"
@@ -49,19 +54,46 @@ _ipssl_api() {
 }
 
 _ipssl_call() {
-  action="$1"
-  fulldomain="$2"
-  txtvalue="$3"
-
+  _ipssl_action="$1"
+  _ipssl_body="{\"fqdn\":\"$2\",\"value\":\"$3\"}"
   _ipssl_api
+  _debug body "$_ipssl_body"
 
-  body="{\"fqdn\":\"$fulldomain\",\"value\":\"$txtvalue\"}"
-  _debug body "$body"
-  response="$(_post "$body" "$IPSSL_API/$action" "" "POST" "application/json")"
-  _debug response "$response"
-  if _contains "$response" '"ok":true'; then
-    return 0
-  fi
-  _err "ipssl.cc $action failed: $response"
-  return 1
+  _ipssl_waited=0
+  _ipssl_backoff=6
+  while true; do
+    _ipssl_response="$(_post "$_ipssl_body" "$IPSSL_API/$_ipssl_action" "" "POST" "application/json")"
+    _ipssl_ret="$?"
+    _debug response "$_ipssl_response"
+    if [ "$_ipssl_ret" != "0" ]; then
+      _err "ipssl.cc $_ipssl_action request to $IPSSL_API failed"
+      return 1
+    fi
+    _ipssl_code="$(grep -i '^HTTP' "$HTTP_HEADER" | _tail_n 1 | cut -d ' ' -f 2 | tr -d '\r\n')"
+    _debug code "$_ipssl_code"
+    if [ "$_ipssl_code" = "200" ]; then
+      return 0
+    fi
+    if [ "$_ipssl_code" = "429" ]; then
+      # Wait as long as Retry-After asks, or back off from 6 seconds.
+      _ipssl_delay="$(grep -i '^retry-after:' "$HTTP_HEADER" | _tail_n 1 | cut -d ':' -f 2 | tr -d ' \t\r\n')"
+      case "$_ipssl_delay" in
+        '' | *[!0-9]*)
+          _ipssl_delay="$_ipssl_backoff"
+          _ipssl_backoff="$(_math "$_ipssl_backoff" \* 2)"
+          ;;
+      esac
+      if [ "$_ipssl_delay" -lt 1 ]; then
+        _ipssl_delay=1
+      fi
+      if [ "$(_math "$_ipssl_waited" + "$_ipssl_delay")" -le "$IPSSL_MAX_WAIT" ]; then
+        _info "ipssl.cc rate limit reached, retrying in ${_ipssl_delay}s"
+        _sleep "$_ipssl_delay"
+        _ipssl_waited="$(_math "$_ipssl_waited" + "$_ipssl_delay")"
+        continue
+      fi
+    fi
+    _err "ipssl.cc $_ipssl_action failed (HTTP $_ipssl_code): $_ipssl_response"
+    return 1
+  done
 }
