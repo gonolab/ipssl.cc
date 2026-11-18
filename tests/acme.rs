@@ -377,6 +377,27 @@ async fn only_the_presenting_network_cleans_up() {
 }
 
 #[tokio::test]
+async fn cleanup_works_while_the_address_is_blocked() {
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write], "").await;
+    let request = body(NAME, VALUE);
+    assert_eq!(post_json(api, "/present", &request).await.unwrap().0, 200);
+
+    // The operator blocks the address while the value is still pending.
+    // A present would now be refused, but a cleanup must still go through.
+    let blocked = EXAMPLE_CONFIG.replace("blocklist = []", "blocklist = [\"10.0.2.0/24\"]");
+    ns.handler
+        .set_zone(Zone::from_config(&Config::parse(&blocked).unwrap()).unwrap());
+    let (status, reply) = post_json(api, "/cleanup", &request).await.unwrap();
+    assert_eq!(status, 200, "{reply}");
+
+    // Lifting the block must not bring the old value back.
+    let config = Config::parse(EXAMPLE_CONFIG).unwrap();
+    ns.handler.set_zone(Zone::from_config(&config).unwrap());
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
 async fn api_refuses_values_over_the_caps_without_pushing_any_out() {
     let ns = name_server("127.0.0.1").await;
     let api = api(&[ns.write], "").await;
