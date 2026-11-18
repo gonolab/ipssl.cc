@@ -171,43 +171,50 @@ curl -fsSLO https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/insta
 sudo sh install.sh
 ```
 
-On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then start the service as the script says. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away.
+On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then run the command it prints (`sudo sh install.sh --dns` with the version), which checks the config and starts the service. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away. It refuses to start while the config is still the unchanged example.
 
-Run the script again to upgrade, optionally with a version such as `v0.2.0`. It checks the existing config with the new binary before replacing anything, then restarts the service. For the host running the DNS-01 challenge API, add `--acme-api` (see [step 7](#7-dns-01-challenge-api-optional)).
+Run the script again to upgrade, optionally with a version such as `v0.4.0`. It upgrades every ipssl service enabled on the host, since they share the binary:
+
+- Before replacing anything, it checks the config with the new binary as an unprivileged user, the way the services read it. Keep the config readable by everyone (mode 644).
+- It restarts the services, and puts the previous binary and units back if one does not stay up.
+- It enables a service only when asked to: `--dns` for the name server, `--acme-api` for the DNS-01 challenge API (see [step 7](#7-dns-01-challenge-api-optional)). A service that was disabled stays disabled.
 
 To do it by hand, download a static Linux build from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
 
 ```bash
-VERSION=v0.2.0
+url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/gonolab/ipssl.cc/releases/latest)
+VERSION=${url##*/}                 # the latest release, or set one such as v0.4.0
 TARGET=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl
 BASE=https://github.com/gonolab/ipssl.cc/releases/download/$VERSION
-curl -fLO "$BASE/ipssl-dns-$VERSION-$TARGET.tar.gz"
-curl -fLO "$BASE/SHA256SUMS"
-sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf "ipssl-dns-$VERSION-$TARGET.tar.gz"
-cd "ipssl-dns-$VERSION-$TARGET"
+curl -fLO "$BASE/ipssl-dns-$VERSION-$TARGET.tar.gz" &&
+  curl -fLO "$BASE/SHA256SUMS" &&
+  sha256sum -c --ignore-missing SHA256SUMS &&
+  tar -xzf "ipssl-dns-$VERSION-$TARGET.tar.gz" &&
+  cd "ipssl-dns-$VERSION-$TARGET"
 ```
 
-The archive holds the binary, `config.example.toml`, `ipssl-dns.service`, the README and the license.
+The archive holds the binary, `config.example.toml`, the units `ipssl-dns.service` and `ipssl-acme-api.service`, the DNS-01 hooks and the nginx snippet in `deploy/acme/`, the README and the license.
 
 Or build it yourself with Rust 1.88 or newer. On the server:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 ```
 
-To cross-compile a static Linux binary on macOS:
+To cross-compile static Linux binaries on macOS (or any other host), add the musl targets once:
 
 ```bash
-cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+```
+
+Then build with the linker that comes with Rust. The project is pure Rust with no C dependencies, so it needs nothing else:
+
+```bash
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --locked --release --target x86_64-unknown-linux-musl
 ```
 
 ```bash
-rustup target add x86_64-unknown-linux-musl
-```
-
-```bash
-cargo zigbuild --release --target x86_64-unknown-linux-musl
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld cargo build --locked --release --target aarch64-unknown-linux-musl
 ```
 
 ### 3. Install
@@ -216,25 +223,46 @@ Copy `config.example.toml` to `config.toml` and fill in your servers' addresses.
 
 ```bash
 sudo install -m 755 ipssl-dns /usr/local/bin/
-sudo install -d /etc/ipssl
+sudo mkdir -p /etc/ipssl
 sudo install -m 644 config.toml /etc/ipssl/config.toml
 sudo install -m 644 ipssl-dns.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ipssl-dns
 ```
 
-From a source checkout, the binary is `target/release/ipssl-dns` (or `target/x86_64-unknown-linux-musl/release/ipssl-dns`) and the unit file is `deploy/ipssl-dns.service`.
+The service runs as an unprivileged user, so keep the config readable by everyone (mode 644).
+
+To upgrade by hand, first check the config with the new binary as a regular user, not root, which also shows whether the service can read it: `./ipssl-dns -c /etc/ipssl/config.toml --check`. Then install the binary and the unit as above, and restart the service, since `enable --now` leaves a running one alone:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+```bash
+sudo systemctl restart ipssl-dns
+```
+
+On a host that also runs the challenge API, restart `ipssl-acme-api` too: both use the same binary.
+
+From a source checkout, the binary is `target/release/ipssl-dns` (or `target/<target>/release/ipssl-dns` for a cross build) and the units are `deploy/ipssl-dns.service` and `deploy/ipssl-acme-api.service`.
+
+On a server with more than one address, list each address in `listen` instead of `0.0.0.0:53` and `[::]:53`, for example `["198.51.100.1:53", "[2001:db8::1]:53"]`. A socket bound to the wildcard address can send a UDP reply from another address than the one that was queried, and resolvers ignore such replies.
 
 On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make binding `0.0.0.0:53` fail. Two ways around it:
 
 - List only the server's public IP in `listen`.
-- Or set `DNSStubListener=no` in `/etc/systemd/resolved.conf` and restart systemd-resolved.
+- Or set `DNSStubListener=no` in `/etc/systemd/resolved.conf` and restart systemd-resolved. `/etc/resolv.conf` points at that stub by default, so point it at systemd-resolved's list of upstream servers, or the host can no longer resolve names:
+
+  ```bash
+  sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  ```
 
 ### 4. Registrar setup
 
-1. Create **glue records** first (some registrars call them "child name servers" or host records): `ns1.ipssl.cc` and `ns2.ipssl.cc`, each pointing to one server's IP.
-2. Then set the domain's name servers to `ns1.ipssl.cc` and `ns2.ipssl.cc`.
-3. Once the change has propagated, check it:
+1. If the domain has DNSSEC, remove its DS record at the registrar first, then wait out the record's TTL (check it with `dig +noall +answer DS ipssl.cc` before removing it) before going on. This server does not sign the zone, and resolvers that still hold the DS record would reject its answers.
+2. Create **glue records** (some registrars call them "child name servers" or host records): `ns1.ipssl.cc` and `ns2.ipssl.cc`, each pointing to one server's IP.
+3. Then set the domain's name servers to `ns1.ipssl.cc` and `ns2.ipssl.cc`.
+4. Once the change has propagated, check it:
 
 ```bash
 dig +trace 10-0-0-1.ipssl.cc
@@ -252,11 +280,13 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart.
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart. With `[acme]`, restart the name servers one at a time (see [step 7](#7-dns-01-challenge-api-optional)).
 
 ### 6. Mail for the domain
 
 To receive mail such as `abuse@ipssl.cc`, add the records your mail server asks for under `[hosts]`. Paste DKIM keys in one piece; values over 255 bytes are split automatically.
+
+`[hosts]` takes A, AAAA, TXT and MX records only. Providers that need CNAME records, such as Amazon SES with Easy DKIM, are not supported: pick a DKIM setup that publishes the key in a TXT record.
 
 ```toml
 [hosts."@"]
@@ -282,15 +312,25 @@ This step enables [certificates for private addresses](#certificates-for-private
    writers = ["198.51.100.10"]
    ```
 
-   Open TCP port 8053 to that address only, then restart `ipssl-dns`. The values live in memory only.
+   Open TCP port 8053 to that address only, then restart `ipssl-dns`. The values live in memory only, so a restart drops the challenges in flight: restart the name servers one at a time, and not while a certificate is being issued.
 
-2. On the API host, put the same config at `/etc/ipssl/config.toml` and run the install script in API mode. It installs `ipssl-acme-api.service` instead of the DNS server, checks the config and starts the API:
+   Do this on all name servers at least the zone's negative TTL (`soa.minimum`, 300 seconds by default) before the first DNS-01 issuance: until then they answer `_acme-challenge` names with an empty answer, which resolvers, the CA's included, may still have cached.
+
+2. On the API host, put the same config at `/etc/ipssl/config.toml` and run the install script with `--acme-api`. It installs `ipssl-acme-api.service`, checks the config and starts the API:
 
    ```bash
    sudo sh install.sh --acme-api
    ```
 
-   Run it again to upgrade. Without `--acme-api` the script refuses to touch a host that only runs the API, so it never starts a DNS server there by mistake. The config check lists the name server endpoints the API writes to: by default, each name server's first address on port 8053.
+   Later runs upgrade it, with or without the flag. The script enables a service only when its flag is given, so it never starts a DNS server on the API host by mistake.
+
+   The config check lists the name server endpoints the API writes to, by default an address of each name server on port 8053:
+
+   ```bash
+   ipssl-dns --acme-api -c /etc/ipssl/config.toml --check
+   ```
+
+   When the set of name servers changes, update the API host's config too and restart `ipssl-acme-api`: it reads the config only when it starts.
 
 3. Add the two locations from [`deploy/acme/nginx.conf`](deploy/acme/nginx.conf) to the website's `server` block, so the API is reachable over HTTPS at `/acme`, and reload nginx.
 
