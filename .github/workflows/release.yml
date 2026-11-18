@@ -9,6 +9,13 @@ on:
 permissions:
   contents: read
 
+# One run per tag at a time. If the tag is moved while a run is building,
+# the next run waits, and the older one fails its tag check instead of
+# publishing binaries of the old commit.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -63,6 +70,10 @@ jobs:
           mkdir "$name"
           cp "target/$TARGET/release/ipssl-dns" config.example.toml README.md LICENSE "$name/"
           cp deploy/ipssl-dns.service deploy/ipssl-acme-api.service "$name/"
+          # The DNS-01 hooks and the nginx snippet, at the paths the README
+          # links to.
+          mkdir "$name/deploy"
+          cp -R deploy/acme "$name/deploy/"
           # Smoke test the packaged binary.
           file "$name/ipssl-dns" || true
           "$name/ipssl-dns" --version
@@ -75,9 +86,25 @@ jobs:
           path: ipssl-dns-*.tar.gz
           if-no-files-found: error
 
+  msrv:
+    name: Minimum Rust version
+    # CI checks rust-version on main and pull requests only; a tag may
+    # point at a commit that went through neither.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the rust-version from Cargo.toml
+        run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+
+      - run: cargo check --locked --all-targets
+
   publish:
     name: Publish release
-    needs: build
+    needs: [build, msrv]
     runs-on: ubuntu-24.04
     # The only job that can write: it creates the release.
     permissions:
@@ -92,13 +119,29 @@ jobs:
         working-directory: dist
         run: sha256sum ipssl-dns-*.tar.gz > SHA256SUMS
 
+      - name: Check the tag still points at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # --verify-tag below only checks that the tag exists. Peel
+          # annotated tags down to the commit.
+          obj=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type + " " + .object.sha')
+          while [ "${obj% *}" = tag ]; do
+            obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/${obj#* }" --jq '.object.type + " " + .object.sha')
+          done
+          if [ "${obj#* }" != "$GITHUB_SHA" ]; then
+            echo "::error::tag $GITHUB_REF_NAME now points at ${obj#* }, but this run built $GITHUB_SHA"
+            exit 1
+          fi
+
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           flags=()
-          # Tags like v0.3.0-rc.1 become pre-releases.
-          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          # Tags like v0.3.0-rc.1 become pre-releases. A "-" in build
+          # metadata (after "+", as in v0.3.0+build-1) does not count.
+          case "${GITHUB_REF_NAME%%+*}" in *-*) flags+=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
