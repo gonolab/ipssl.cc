@@ -384,7 +384,7 @@ On a host that runs both the DNS server and the API, the two cannot share a `[me
 
 ## Website
 
-The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. The "Check live" button looks names up through Cloudflare's DNS-over-HTTPS API, and only when clicked.
+The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. Converting a name happens in the browser. The page looks a name up, through Cloudflare's DNS-over-HTTPS API, only when asked to: with the Check button, or a second Enter after the name was converted.
 
 Preview it locally:
 
@@ -392,7 +392,19 @@ Preview it locally:
 python3 -m http.server 4173 --directory site
 ```
 
-To publish, copy the contents of `site/` into the web server's document root, following symlinks (`cp -RL` or `rsync -L`): `site/acme/` links to the hook scripts in `deploy/acme/`, so they are also served at `https://ipssl.cc/acme/`. Bump the `?v=` query on the stylesheet and script links in the HTML files so browsers fetch the new versions.
+To publish, copy the contents of `site/` into the web server's document root, following symlinks: `site/acme/` and `site/install.sh` link to the scripts in `deploy/`, so they are also served at `https://ipssl.cc/acme/` and `https://ipssl.cc/install.sh`. On the web server, with the document root at `/var/www/ipssl.cc`:
+
+```bash
+sudo cp -RL site/. /var/www/ipssl.cc/
+```
+
+Or from another machine:
+
+```bash
+rsync -aL site/ web.example.net:/var/www/ipssl.cc/
+```
+
+Bump the `?v=` query on the stylesheet and script links in the HTML files so browsers fetch the new versions.
 
 ## FAQ
 
@@ -400,21 +412,21 @@ To publish, copy the contents of `site/` into the web server's document root, fo
 
 **Why not hand out a wildcard certificate?** Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key can revoke the certificate. Get a certificate on your own server instead (see [HTTPS certificates](#https-certificates)).
 
-**How do I report abuse?** Email abuse@ipssl.cc or open an issue on GitHub with the name and what it is used for. Names used for abuse can be put on the server's blocklist.
+**How do I report abuse?** Email abuse@ipssl.cc or open an issue on GitHub with the name and what it is used for. The server's blocklist takes IP networks, not names, so blocking an address blocks every name that encodes it.
 
-**Why isn't ipssl.cc on the Public Suffix List?** The PSL explicitly excludes services that resolve an IP address encoded in a hostname to that address: the same IP can be assigned to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the PSL.
+**Why isn't ipssl.cc on the Public Suffix List?** The PSL explicitly excludes services that resolve an IP address encoded in a hostname to that address: the same IP can be assigned to different people over time, so it does not show stable control of a name. DNS resolution does not depend on the PSL, but browsers do: they treat every name under `ipssl.cc` as one site, which is why cookies with `Domain=ipssl.cc` must be avoided (see [Shared names](#shared-names)).
 
 ## Releasing
 
-1. Bump `version` in `Cargo.toml` and commit.
+1. Bump `version` in `Cargo.toml`, then run `cargo check` so `Cargo.lock` records the new version too: the release builds use `--locked` and fail otherwise. Commit both files.
 2. Tag the commit with the same version and push the tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-The [release workflow](.github/workflows/release.yml) checks that the tag matches `Cargo.toml`, runs the tests on x86_64 and aarch64, builds static musl binaries and publishes them with a `SHA256SUMS` file. Tags with a suffix, such as `v0.3.0-rc.1`, become pre-releases.
+The [release workflow](.github/workflows/release.yml) checks that the tag matches `Cargo.toml`, checks the code with the minimum Rust version, runs the tests on x86_64 and aarch64, and builds static musl binaries. It publishes them with a `SHA256SUMS` file only if the tag still points at the commit it built. Tags with a suffix, such as `v0.3.0-rc.1`, become pre-releases; build metadata after a `+` does not count.
 
 ## Roadmap
 
