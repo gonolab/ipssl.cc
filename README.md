@@ -232,7 +232,7 @@ sudo systemctl enable --now ipssl-dns
 
 The service runs as an unprivileged user, so keep the config readable by everyone (mode 644).
 
-To upgrade by hand, first check the config with the new binary as a regular user, not root, which also shows whether the service can read it: `./ipssl-dns -c /etc/ipssl/config.toml --check`. Then install the binary and the unit as above, and restart the service, since `enable --now` leaves a running one alone:
+To upgrade by hand, first check the config with the new binary as a regular user, not root, which also shows whether the service can read it: `./ipssl-dns -c /etc/ipssl/config.toml --check`. Then copy only the binary and the unit into place (the `install` lines for `ipssl-dns` and `ipssl-dns.service` above) and restart the service, since `enable --now` leaves a running one alone:
 
 ```bash
 sudo systemctl daemon-reload
@@ -246,7 +246,7 @@ On a host that also runs the challenge API, restart `ipssl-acme-api` too: both u
 
 From a source checkout, the binary is `target/release/ipssl-dns` (or `target/<target>/release/ipssl-dns` for a cross build) and the units are `deploy/ipssl-dns.service` and `deploy/ipssl-acme-api.service`.
 
-On a server with more than one address, list each address in `listen` instead of `0.0.0.0:53` and `[::]:53`, for example `["198.51.100.1:53", "[2001:db8::1]:53"]`. A socket bound to the wildcard address can send a UDP reply from another address than the one that was queried, and resolvers ignore such replies.
+On a server with more than one address, list each address in `listen` instead of `0.0.0.0:53` and `[::]:53`, for example `["198.51.100.1:53", "[2001:db8::1]:53"]`. A socket bound to the wildcard address can send a UDP reply from a different address than the one queried, and resolvers ignore such replies.
 
 On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make binding `0.0.0.0:53` fail. Two ways around it:
 
@@ -259,7 +259,7 @@ On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make bin
 
 ### 4. Registrar setup
 
-1. If the domain has DNSSEC, remove its DS record at the registrar first, then wait out the record's TTL (check it with `dig +noall +answer DS ipssl.cc` before removing it) before going on. This server does not sign the zone, and resolvers that still hold the DS record would reject its answers.
+1. If the domain has DNSSEC, note the DS record's TTL (`dig +noall +answer DS ipssl.cc`), remove the DS record at the registrar, and wait at least that long before changing the name servers. This server does not sign the zone, and resolvers that still hold the DS record would reject its answers.
 2. Create **glue records** (some registrars call them "child name servers" or host records): `ns1.ipssl.cc` and `ns2.ipssl.cc`, each pointing to one server's IP.
 3. Then set the domain's name servers to `ns1.ipssl.cc` and `ns2.ipssl.cc`.
 4. Once the change has propagated, check it:
