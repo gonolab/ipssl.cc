@@ -103,15 +103,16 @@ impl RateLimiter {
             cfg.ipv4_prefix,
             cfg.ipv6_prefix,
             cfg.max_tracked,
-        );
-        limiter.slip = cfg.slip;
+        )
+        .with_slip(cfg.slip);
         limiter.exempt = cfg.exempt.clone();
         Ok(Some(limiter))
     }
 
-    /// A limiter allowing `rate` requests a second (fractions are fine) and
-    /// bursts of `burst` per client network. Limited requests are dropped:
-    /// it never slips. Arguments must be in range (see
+    /// A limiter allowing `rate` requests a second (fractions are fine, such
+    /// as `1e-6` for a test that must never see a refill) and bursts of
+    /// `burst` per client network. Limited requests are dropped until
+    /// [`Self::with_slip`] says otherwise. Arguments must be in range (see
     /// [`RateLimitConfig::validate_networks`]).
     pub fn new(
         rate: f64,
@@ -143,6 +144,13 @@ impl RateLimiter {
             max_tracked,
             overflow: Mutex::new(Bucket::full(burst, now)),
         }
+    }
+
+    /// Sends every `slip`-th limited response truncated instead of dropping
+    /// it; 0 drops them all.
+    pub fn with_slip(mut self, slip: u32) -> Self {
+        self.slip = slip;
+        self
     }
 
     /// Accounts for one response to `client` and says what to do with it.

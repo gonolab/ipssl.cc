@@ -31,8 +31,14 @@ fn start() -> TestServer {
 }
 
 fn start_with(config: Config) -> TestServer {
-    let handler = Handler::new(Zone::from_config(&config).unwrap())
-        .with_rate_limiter(RateLimiter::from_config(&config.rate_limit).unwrap());
+    let limiter = RateLimiter::from_config(&config.rate_limit).unwrap();
+    start_with_limiter(config, limiter)
+}
+
+/// Starts a server for `config` that limits UDP with `limiter` instead of
+/// the one `config` describes.
+fn start_with_limiter(config: Config, limiter: Option<RateLimiter>) -> TestServer {
+    let handler = Handler::new(Zone::from_config(&config).unwrap()).with_rate_limiter(limiter);
     let udp = ipssl::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let tcp = ipssl::bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
     TestServer {
@@ -480,18 +486,15 @@ async fn set_zone_takes_effect_immediately() {
 
 #[tokio::test]
 async fn udp_is_rate_limited_but_tcp_is_not() {
-    let mut config = Config::parse(EXAMPLE_CONFIG).unwrap();
-    config.rate_limit.responses_per_second = 1;
-    config.rate_limit.burst = 2;
-    config.rate_limit.slip = 2;
-    let server = start_with(config);
+    // A burst of two that refills one token in about 12 days, so however
+    // slowly the queries below are processed, no token comes back.
+    let limiter = RateLimiter::new(1e-6, 2, 24, 56, 1000).with_slip(2);
+    let server = start_with_limiter(Config::parse(EXAMPLE_CONFIG).unwrap(), Some(limiter));
     let req = query("10-0-0-1.ipssl.cc.", RecordType::A);
 
-    // Send all four queries at once, so the bucket gets no time to refill
-    // (one token a second) however slow the machine is: the burst of two
-    // is answered, then responses alternate between dropped and truncated
-    // (slip = 2). Nothing waits for the dropped one; the metrics below
-    // count it.
+    // The burst of two is answered, then responses alternate between
+    // dropped and truncated (slip = 2). Nothing waits for the dropped one;
+    // the metrics below count it.
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let bytes = req.to_vec().unwrap();
     for _ in 0..4 {
