@@ -11,14 +11,13 @@
 //! up again carries no state a new one would not have, so such entries are
 //! forgotten: about once a second, and whenever a new network finds the
 //! table full. New networks share one overflow bucket only while every
-//! network in their part of the table is still active (checked at most
-//! every 100 ms).
+//! tracked network is still active (checked at most every 100 ms).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -26,22 +25,17 @@ use ipnet::IpNet;
 
 use crate::config::RateLimitConfig;
 
-/// Most independently locked parts of the table, to keep lock contention
-/// low on multi-core servers.
+/// Independently locked parts of the table (fewer for tables with fewer
+/// networks), to keep lock contention low on multi-core servers.
 const SHARDS: usize = 32;
-
-/// Smallest share of `max_tracked` per part. A new network can only take
-/// the place of one in its own part, so small tables get fewer parts, each
-/// big enough to hold an idle entry when any part does.
-const NETWORKS_PER_SHARD: usize = 1024;
 
 /// How often a part of the table forgets idle entries while there is room.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Shortest time between two sweeps of one part while the table is full.
-/// A sweep reads every entry of the part, so this bounds the cost when
-/// every tracked network is busy and there is nothing to forget; until
-/// the next sweep, new networks there share the overflow bucket.
+/// Shortest time between two sweeps of one part while the table is full,
+/// and how long new networks share the overflow bucket once no part had
+/// anything to forget. A sweep reads every entry of the part, so this
+/// bounds the cost while every tracked network is busy.
 const FULL_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What to do with a response.
@@ -70,6 +64,11 @@ pub struct RateLimiter {
     /// Networks tracked in all shards together, at most `max_tracked`.
     tracked: AtomicUsize,
     max_tracked: usize,
+    /// When the limiter was made; `quiet_until` counts from here.
+    epoch: Instant,
+    /// Nanoseconds after `epoch` until which a full table is not searched
+    /// for room again, because the last search found none.
+    quiet_until: AtomicU64,
     /// Shared by all networks that arrive while the table is full of active
     /// ones, so flooding it with forged sources gets nobody past the limit.
     overflow: Mutex<Bucket>,
@@ -123,7 +122,7 @@ impl RateLimiter {
     ) -> Self {
         let now = Instant::now();
         let burst = f64::from(burst);
-        let shards = (max_tracked / NETWORKS_PER_SHARD).clamp(1, SHARDS);
+        let shards = SHARDS.min(max_tracked).max(1);
         Self {
             rate,
             burst,
@@ -142,6 +141,8 @@ impl RateLimiter {
                 .collect(),
             tracked: AtomicUsize::new(0),
             max_tracked,
+            epoch: now,
+            quiet_until: AtomicU64::new(0),
             overflow: Mutex::new(Bucket::full(burst, now)),
         }
     }
@@ -182,12 +183,7 @@ impl RateLimiter {
         if now.saturating_duration_since(shard.last_sweep) >= SWEEP_INTERVAL {
             self.sweep(&mut shard, now);
         }
-        let mut reserved = self.reserve();
-        if !reserved && now.saturating_duration_since(shard.last_sweep) >= FULL_SWEEP_INTERVAL {
-            self.sweep(&mut shard, now);
-            reserved = self.reserve();
-        }
-        if reserved {
+        if self.reserve() || self.make_room(index, &mut shard, now) {
             let mut bucket = Bucket::full(self.burst, now);
             let verdict = self.take(&mut bucket, now);
             shard.buckets.insert(network, bucket);
@@ -205,6 +201,49 @@ impl RateLimiter {
                 (n < self.max_tracked).then_some(n + 1)
             })
             .is_ok()
+    }
+
+    /// The table is full: forgets refilled entries until there is room for
+    /// one more network, and takes that room. Starts with `own`, shard
+    /// `index`, which the caller holds, then goes through the others.
+    /// Parts swept less than [`FULL_SWEEP_INTERVAL`] ago are skipped, and
+    /// after a search that found no room, so is the whole search for as
+    /// long.
+    fn make_room(&self, index: usize, own: &mut Shard, now: Instant) -> bool {
+        let since_epoch = now.saturating_duration_since(self.epoch).as_nanos();
+        let since_epoch = u64::try_from(since_epoch).unwrap_or(u64::MAX);
+        if since_epoch < self.quiet_until.load(Ordering::Relaxed) {
+            return false;
+        }
+        let due =
+            |shard: &Shard| now.saturating_duration_since(shard.last_sweep) >= FULL_SWEEP_INTERVAL;
+        if due(own) {
+            self.sweep(own, now);
+            if self.reserve() {
+                return true;
+            }
+        }
+        for offset in 1..self.shards.len() {
+            // Never wait for a shard while holding one: two threads doing
+            // that in opposite order would wait for each other forever. A
+            // shard in use is skipped.
+            let mut other = match self.shards[(index + offset) % self.shards.len()].try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(TryLockError::WouldBlock) => continue,
+            };
+            if due(&other) {
+                self.sweep(&mut other, now);
+                drop(other);
+                if self.reserve() {
+                    return true;
+                }
+            }
+        }
+        let quiet = u64::try_from(FULL_SWEEP_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
+        self.quiet_until
+            .store(since_epoch.saturating_add(quiet), Ordering::Relaxed);
+        false
     }
 
     /// Forgets the networks in `shard` whose buckets have filled up again:
@@ -449,6 +488,94 @@ mod tests {
         assert_eq!(rl.tracked(), 4);
         assert_eq!(rl.check_at(network(0), t2), Verdict::Allow);
         assert_eq!(rl.check_at(network(0), t2), Verdict::Drop);
+    }
+
+    /// Whether `client`'s network has a bucket of its own.
+    fn has_own_bucket(rl: &RateLimiter, client: IpAddr) -> bool {
+        let network = rl.network(client);
+        rl.shards
+            .iter()
+            .any(|shard| lock(shard).buckets.contains_key(&network))
+    }
+
+    fn shard_of(rl: &RateLimiter, client: IpAddr) -> usize {
+        rl.hasher.hash_one(rl.network(client)) as usize % rl.shards.len()
+    }
+
+    #[test]
+    fn room_is_found_in_other_parts_of_the_table() {
+        // As many parts as networks, so the one idle network is almost
+        // never in the new network's part.
+        let rl = limiter(RateLimitConfig {
+            max_tracked: 32,
+            ..cfg(1, 2, 0)
+        });
+        assert_eq!(rl.shards.len(), 32);
+        let t0 = Instant::now() + Duration::from_secs(2);
+        for i in 0..32 {
+            assert_eq!(rl.check_at(network(i), t0), Verdict::Allow);
+        }
+        // All but network 0 stay active.
+        let t1 = t0 + Duration::from_millis(900);
+        for i in 1..32 {
+            assert_eq!(rl.check_at(network(i), t1), Verdict::Allow);
+        }
+        let t2 = t0 + Duration::from_secs(1);
+        let new = (100..)
+            .map(network)
+            .find(|ip| shard_of(&rl, *ip) != shard_of(&rl, network(0)))
+            .unwrap();
+        assert_eq!(rl.check_at(new, t2), Verdict::Allow);
+        assert!(has_own_bucket(&rl, new));
+        assert!(!has_own_bucket(&rl, network(0)));
+        assert_eq!(rl.tracked(), 32);
+        // Now every network is active: one more shares the overflow bucket.
+        assert_eq!(rl.check_at(network(0), t2), Verdict::Allow);
+        assert!(!has_own_bucket(&rl, network(0)));
+    }
+
+    #[test]
+    fn concurrent_checks_keep_the_count_right() {
+        for max_tracked in [40, 1500, 50_000] {
+            // Buckets refill within 2 ms, so networks keep being forgotten
+            // and tracked again while eight threads check at once.
+            let rl = RateLimiter::new(1000.0, 2, 24, 56, max_tracked);
+            let pool = u32::try_from(max_tracked * 3).unwrap();
+            let start = Instant::now();
+            let most = std::thread::scope(|scope| {
+                let threads: Vec<_> = (1..=8u32)
+                    .map(|seed| {
+                        let rl = &rl;
+                        scope.spawn(move || {
+                            let mut x = seed.wrapping_mul(0x9e37_79b9);
+                            let mut most = 0;
+                            while start.elapsed() < Duration::from_millis(300) {
+                                x ^= x << 13;
+                                x ^= x >> 17;
+                                x ^= x << 5;
+                                rl.check(network((x % pool) as usize));
+                                most = most.max(rl.tracked());
+                            }
+                            most
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|t| t.join().unwrap()).max()
+            });
+            assert!(most.unwrap() <= max_tracked, "{max_tracked}");
+            let held: usize = rl.shards.iter().map(|s| lock(s).buckets.len()).sum();
+            assert_eq!(rl.tracked(), held, "{max_tracked}");
+
+            // Once every bucket has filled up again, a whole table of new
+            // networks gets buckets of their own, without the overflow one.
+            let later = Instant::now() + Duration::from_secs(2);
+            let overflow = lock(&rl.overflow).updated;
+            for i in 0..max_tracked {
+                rl.check_at(network(pool as usize + i), later);
+            }
+            assert_eq!(lock(&rl.overflow).updated, overflow, "{max_tracked}");
+            assert_eq!(rl.tracked(), max_tracked, "{max_tracked}");
+        }
     }
 
     #[test]
