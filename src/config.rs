@@ -5,7 +5,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD, HEXLOWER_PERMISSIVE};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer};
@@ -100,6 +100,38 @@ pub struct AcmeConfig {
 
 /// Fewest bytes `acme.key` may have: as many as the SHA-256 output.
 pub const MIN_KEY_BYTES: usize = 32;
+
+/// Shortest run of hex or base64 characters that [`redact_keys`] takes
+/// for a key: an `acme.key` long enough to use is 43 or more, and half of
+/// one in hex is 32.
+const KEY_RUN: usize = 32;
+
+/// `text` with every run of [`KEY_RUN`] or more characters that keys in
+/// hex or base64 are made of replaced by `<redacted>`. Other long runs
+/// (a DKIM key, say) go too, which only makes an error a little vaguer.
+fn redact_keys(text: &str) -> String {
+    let in_key = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_');
+    let mut redacted = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |redacted: &mut String, run: &mut String| {
+        if run.len() >= KEY_RUN {
+            redacted.push_str("<redacted>");
+        } else {
+            redacted.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if in_key(c) {
+            run.push(c);
+        } else {
+            flush(&mut redacted, &mut run);
+            redacted.push(c);
+        }
+    }
+    flush(&mut redacted, &mut run);
+    redacted
+}
 
 /// The secret in `acme.key`, given as hex or base64.
 ///
@@ -389,7 +421,10 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        Ok(toml::from_str(text)?)
+        // A parse error quotes the line it is on, and its message may
+        // quote a value. Either may be acme.key, mistyped or in the wrong
+        // place, which must not end up on the terminal or in the journal.
+        toml::from_str(text).map_err(|e| anyhow!(redact_keys(&e.to_string())))
     }
 
     /// Checks the settings the DNS server would otherwise trip over only
@@ -1021,5 +1056,37 @@ mod tests {
         assert!(warnings(&with_key(HEX_KEY, "")).is_empty());
         let rollout = with_key(HEX_KEY, "allow_unsigned_nodes = true\n");
         assert!(warnings(&rollout)[0].contains("remove it once every name server has acme.key"));
+    }
+
+    #[test]
+    fn parse_errors_never_show_the_key() {
+        let base64 = BASE64.encode(&HEXLOWER_PERMISSIVE.decode(HEX_KEY.as_bytes()).unwrap());
+        for (extra, problem) in [
+            (format!("kye = \"{HEX_KEY}\""), "unknown field `kye`"),
+            (format!("key = {HEX_KEY}"), "line 11"),
+            (format!("key = {base64}"), "line 11"),
+            (
+                format!("key = \"{HEX_KEY}\"\nkey = \"{HEX_KEY}\""),
+                "duplicate key",
+            ),
+            (format!("burst = \"{HEX_KEY}\""), "expected u32"),
+            (format!("key = \"{HEX_KEY}"), "line 11"),
+        ] {
+            let text = format!("{MINIMAL}\n[acme]\n{extra}\n");
+            let error = format!("{:#}", Config::parse(&text).unwrap_err());
+            // Still says what is wrong and where.
+            assert!(error.contains(problem), "{extra}: {error}");
+            assert!(error.contains("<redacted>"), "{extra}: {error}");
+            for secret in [&HEX_KEY[..16], &HEX_KEY[48..], &base64[..16]] {
+                assert!(!error.contains(secret), "{extra}: {error}");
+            }
+        }
+        // Errors without a key are left as they are.
+        let typo = format!("{MINIMAL}\n[acme]\nnodez = []\n");
+        let error = format!("{:#}", Config::parse(&typo).unwrap_err());
+        assert!(
+            error.contains("unknown field `nodez`") && !error.contains("redacted"),
+            "{error}"
+        );
     }
 }
