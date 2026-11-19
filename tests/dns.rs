@@ -442,3 +442,149 @@ async fn udp_is_rate_limited_but_tcp_is_not() {
         );
     }
 }
+
+/// `ipssl-dns --reload`, run against a server in its own process.
+#[cfg(unix)]
+mod reload_helper {
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Output};
+    use std::time::Instant;
+    use std::{fs, thread};
+
+    use super::*;
+
+    /// A port free on 127.0.0.1 for both UDP and TCP, for a server run as its
+    /// own process: its config cannot ask for port 0.
+    fn free_port() -> u16 {
+        loop {
+            let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = udp.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+    }
+
+    /// A server process, killed when dropped.
+    struct Process(Child);
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn soa_serial(resp: &Message) -> u32 {
+        match &resp.answers[0].data {
+            RData::SOA(soa) => soa.serial,
+            other => panic!("not an SOA record: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_helper_reports_the_servers_result() {
+        let bin = env!("CARGO_BIN_EXE_ipssl-dns");
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reload-helper");
+        let _ = fs::remove_dir_all(&dir);
+        let run = dir.join("run");
+        fs::create_dir_all(&run).unwrap();
+        let config = dir.join("config.toml");
+
+        let dns: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let acme = format!("127.0.0.1:{}", free_port());
+        // The config with this serial, plus `extra`.
+        let config_text = |serial: u32, extra: &str| {
+            format!(
+                r#"
+                domain = "ipssl.cc"
+                listen = ["{dns}"]
+
+                [[nameservers]]
+                name = "ns1.ipssl.cc"
+                ipv4 = ["198.51.100.1"]
+
+                [soa]
+                email = "hostmaster@ipssl.cc"
+                serial = {serial}
+
+                {extra}
+                "#
+            )
+        };
+        let with_acme = format!("[acme]\nlisten = \"{acme}\"\nwriters = [\"127.0.0.1\"]");
+        fs::write(&config, config_text(2026110501, &with_acme)).unwrap();
+
+        let log = fs::File::create(dir.join("server.log")).unwrap();
+        let server = Process(
+            Command::new(bin)
+                .arg("-c")
+                .arg(&config)
+                .env("RUNTIME_DIRECTORY", &run)
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let pid = server.0.id().to_string();
+        let status = run.join("reload");
+        let started = Instant::now();
+        while !status.exists() {
+            assert!(started.elapsed() < Duration::from_secs(10), "no status");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let reload = |runtime_dir: &Path| -> Output {
+            Command::new(bin)
+                .arg("-c")
+                .arg(&config)
+                .args(["--reload", &pid])
+                .env("RUNTIME_DIRECTORY", runtime_dir)
+                .output()
+                .unwrap()
+        };
+        let soa = query("ipssl.cc.", RecordType::SOA);
+        assert_eq!(soa_serial(&over_udp(dns, &soa).await), 2026110501);
+
+        // The new zone is served as soon as the reload returns.
+        fs::write(&config, config_text(2026110502, &with_acme)).unwrap();
+        let out = reload(&run);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("reloaded the config serial=2026110502"),
+            "{stdout}"
+        );
+        assert_eq!(soa_serial(&over_udp(dns, &soa).await), 2026110502);
+
+        // A config only the running server refuses: it started with [acme], so
+        // its challenge store would hide this record.
+        let hidden = "[hosts.\"_acme-challenge.10-0-2-2\"]\ntxt = [\"manual\"]";
+        fs::write(&config, config_text(2026110503, hidden)).unwrap();
+        let out = reload(&run);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("keeps its running config"), "{stderr}");
+        assert!(stderr.contains("restart"), "{stderr}");
+        assert_eq!(soa_serial(&over_udp(dns, &soa).await), 2026110502);
+
+        // A config the check refuses never reaches the server.
+        let before = fs::read_to_string(&status).unwrap();
+        fs::write(&config, "domain = ").unwrap();
+        let out = reload(&run);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(fs::read_to_string(&status).unwrap(), before);
+
+        // Nor does one when there is no runtime directory to confirm it in.
+        fs::write(&config, config_text(2026110504, &with_acme)).unwrap();
+        let out = reload(&dir.join("missing"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("RuntimeDirectory"), "{stderr}");
+        assert_eq!(fs::read_to_string(&status).unwrap(), before);
+        assert_eq!(soa_serial(&over_udp(dns, &soa).await), 2026110502);
+    }
+}

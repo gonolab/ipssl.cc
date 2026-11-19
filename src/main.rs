@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -14,7 +14,13 @@ use ipssl::acme::{Api, Challenges, Node};
 use ipssl::config::Config;
 use ipssl::handler::Handler;
 use ipssl::ratelimit::RateLimiter;
+use ipssl::reload::{Reporter, runtime_dir};
 use ipssl::zone::Zone;
+
+/// How long `--reload` waits for the server's result. Well below the 90
+/// seconds systemd gives `ExecReload` by default, so a server that never
+/// answers fails the reload with this program's error, not systemd's.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Authoritative DNS server that answers 10-0-0-1.<domain> with 10.0.0.1.
 #[derive(Parser)]
@@ -32,6 +38,18 @@ struct Args {
     /// DNS server.
     #[arg(long)]
     acme_api: bool,
+
+    /// Check the config like --check, make the DNS server with this process
+    /// id reload it, and wait for the result: exit 0 once it serves the new
+    /// zone, 1 if it kept the running config. For `ExecReload` in the
+    /// systemd unit, which passes $MAINPID.
+    #[arg(
+        long,
+        value_name = "PID",
+        conflicts_with_all = ["check", "acme_api"],
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)),
+    )]
+    reload: Option<u32>,
 }
 
 #[tokio::main]
@@ -66,6 +84,9 @@ async fn main() -> Result<()> {
         warn_about(&config, &zone);
         info!("config OK");
         return Ok(());
+    }
+    if let Some(pid) = args.reload {
+        return reload_server(&args.config, pid).await;
     }
 
     // SIGHUP kills a process that does not handle it. Take it over before
@@ -114,6 +135,7 @@ async fn main() -> Result<()> {
         args.config,
         config.clone(),
         handler.clone(),
+        Arc::new(Reporter::new(runtime_dir())),
     ));
 
     // A listener that stops on its own ends this with an error, and the
@@ -241,27 +263,114 @@ async fn purge_challenges(store: Arc<Challenges>) {
     }
 }
 
+/// `--reload <pid>`: checks the config at `path` the way `--check` does,
+/// sends SIGHUP to the server `pid` and waits until it reports the reload
+/// in its runtime directory (see [`ipssl::reload`]). Fails if the check
+/// fails, if the server keeps its running config, or if it reports nothing
+/// within [`RELOAD_TIMEOUT`].
+#[cfg(unix)]
+async fn reload_server(path: &Path, pid: u32) -> Result<()> {
+    use ipssl::reload::{State, Status, send_hangup};
+
+    // A config the check refuses is not sent: the server would refuse it too.
+    load(path)?;
+    let dir = runtime_dir();
+    ensure!(
+        dir.is_dir(),
+        "{} does not exist, so the reload cannot be confirmed; the service needs RuntimeDirectory=ipssl-dns",
+        dir.display()
+    );
+    let read = || -> Result<Option<Status>> {
+        let status = Status::read(&dir).with_context(|| format!("reading {}", dir.display()))?;
+        // A file left by an earlier process says nothing about this one.
+        Ok(status.filter(|s| s.pid == pid))
+    };
+
+    // Wait for a reload that starts after the SIGHUP. One already running
+    // may have read the file before it was checked here; the server
+    // finishes that one, then starts another for this signal. Either way,
+    // the reload to wait for has a generation past the current one.
+    let before = read()?;
+    let mut reported = before.is_some();
+    let target = before.map_or(0, |s| s.generation) + 1;
+    send_hangup(pid).with_context(|| format!("sending SIGHUP to process {pid}"))?;
+
+    let deadline = tokio::time::Instant::now() + RELOAD_TIMEOUT;
+    loop {
+        if let Some(status) = read()? {
+            reported = true;
+            if status.generation >= target {
+                match status.state {
+                    State::Serving(serial) => {
+                        info!(serial, "the server reloaded the config");
+                        return Ok(());
+                    }
+                    State::Failed(reason) => {
+                        bail!("reload failed, the server keeps its running config: {reason}")
+                    }
+                    State::Reloading => {}
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let secs = RELOAD_TIMEOUT.as_secs();
+            if reported {
+                bail!("process {pid} did not finish the reload within {secs} seconds; see its log");
+            }
+            bail!(
+                "process {pid} reported no reload in {} within {secs} seconds; if it runs an ipssl-dns without reload reports, restart it instead",
+                dir.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_server(_path: &Path, _pid: u32) -> Result<()> {
+    bail!("--reload needs a Unix system")
+}
+
 /// Reloads the config on every SIGHUP (`systemctl reload ipssl-dns`).
 /// A config that fails to load or validate is logged and the running one
-/// kept. `hangup` is installed at the very start of `main`.
+/// kept. `hangup` is installed at the very start of `main`. Every reload
+/// and its outcome go to `reporter` for `--reload`.
 #[cfg(unix)]
 async fn reload_on_sighup(
     mut hangup: tokio::signal::unix::Signal,
     path: PathBuf,
     running: Config,
     handler: Handler,
+    reporter: Arc<Reporter>,
 ) {
+    reporter.started(running.soa.serial);
     let running = Arc::new(running);
     while hangup.recv().await.is_some() {
         // Reading the file, parsing it and building the zone block, so keep
         // them off the async workers that answer queries.
         let task = {
-            let (path, running, handler) = (path.clone(), running.clone(), handler.clone());
-            tokio::task::spawn_blocking(move || reload(&path, &running, &handler))
+            let (path, running, handler, reporter) = (
+                path.clone(),
+                running.clone(),
+                handler.clone(),
+                reporter.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                reporter.reloading();
+                let result = reload(&path, &running, &handler);
+                reporter.finished(result.as_ref().copied().map_err(|e| format!("{e:#}")));
+                result
+            })
         };
-        let result = task
-            .await
-            .unwrap_or_else(|e| Err(anyhow!("reload task failed: {e}")));
+        let result = match task.await {
+            Ok(result) => result,
+            Err(e) => {
+                // The task ended before it could report.
+                let e = anyhow!("reload task failed: {e}");
+                reporter.finished(Err(e.to_string()));
+                Err(e)
+            }
+        };
         handler.metrics().reload(result.is_ok());
         match result {
             Ok(serial) => info!(serial, "config reloaded"),

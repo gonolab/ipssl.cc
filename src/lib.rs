@@ -7,6 +7,7 @@ pub mod http;
 pub mod metrics;
 pub mod parse;
 pub mod ratelimit;
+pub mod reload;
 pub mod zone;
 
 use std::future::Future;

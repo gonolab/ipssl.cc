@@ -6,12 +6,17 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml
-# `systemctl reload ipssl-dns` re-reads the config without a restart. The
-# check runs first, as the service user, so a config the server would
-# refuse (or cannot read) fails the reload instead of only being logged.
+# `systemctl reload ipssl-dns` re-reads the config without a restart and
+# returns once the server has. The helper checks the file first, as the
+# service user, so a config the server would refuse (or cannot read)
+# fails the reload. It then sends SIGHUP and waits for the server's own
+# result in the runtime directory: success once the new zone is served,
+# failure with the server's error if it kept the running config.
 # Keep its binary and config paths the same as ExecStart.
-ExecReload=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml --check
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml --reload $MAINPID
+# /run/ipssl-dns, where the server reports reloads. Writable by the
+# service user despite ProtectSystem=strict; removed when the service stops.
+RuntimeDirectory=ipssl-dns
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
