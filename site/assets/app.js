@@ -341,6 +341,14 @@
       mismatchOnly: "Expected only {want}",
       nx: "NXDOMAIN: the name does not exist.",
       nodata: "No {type} record for this name.",
+      nodataAny: "No A or AAAA record for this name.",
+      otherRecords: "Expected no {type} record",
+      otherStatus: "Expected an empty {type} answer, not {rcode}",
+      childBad: "A fresh lookup got {got}, expected {want}",
+      childEmpty: "A fresh lookup got no {type} record, expected {want}",
+      "src.fresh": "Cloudflare DNS got {ip} fresh from one ipssl.cc name server.",
+      "src.cached": "Cloudflare DNS answered {ip}; this may be cached.",
+      "src.router": "Checked through Cloudflare, not your router.",
       rcode: "DNS error {rcode}: Cloudflare DNS got no answer for this name.",
       error: "Could not reach Cloudflare DNS. Try dig +short {type} {name} instead.",
       ttl: "TTL {ttl}s",
@@ -425,6 +433,14 @@
       mismatchOnly: "预期只有 {want}",
       nx: "NXDOMAIN：这个名字不存在。",
       nodata: "这个名字没有 {type} 记录。",
+      nodataAny: "这个名字没有 A 或 AAAA 记录。",
+      otherRecords: "预期没有 {type} 记录",
+      otherStatus: "{type} 查询预期是空应答，而不是 {rcode}",
+      childBad: "重新查询得到 {got}，预期是 {want}",
+      childEmpty: "重新查询没有得到 {type} 记录，预期是 {want}",
+      "src.fresh": "Cloudflare DNS 从一台 ipssl.cc 域名服务器实时拿到了 {ip}。",
+      "src.cached": "Cloudflare DNS 返回了 {ip}，可能来自缓存。",
+      "src.router": "这次查询走的是 Cloudflare，没有经过你的路由器。",
       rcode: "DNS 错误 {rcode}：Cloudflare DNS 没拿到这个名字的应答。",
       error: "连不上 Cloudflare DNS，可以改用 dig +short {type} {name} 查询。",
       ttl: "TTL {ttl} 秒",
@@ -444,6 +460,7 @@
     "tool.try": "试试",
     "tool.check": "查询",
     "trace.browser": "浏览器",
+    "trace.ns": "ipssl.cc<span class=\"trace-long\"> 域名服务器</span>",
     "call.cert": "正规 SSL 证书",
     "call.how": "查看命令",
     "ai.label": "或者交给 AI 助手",
@@ -892,31 +909,88 @@
   }
 
   // ---------------------------------------------------------------------
-  // Live check over DNS-over-HTTPS (JSON API). Only the name is sent.
+  // Live check over DNS-over-HTTPS (JSON API). Only names are sent.
 
-  const RCODES = { 1: "FORMERR", 2: "SERVFAIL", 4: "NOTIMP", 5: "REFUSED" };
+  const RCODES = { 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED" };
+  const rcodeName = (status) => RCODES[status] ?? `RCODE ${status}`;
 
   /**
-   * The name to ask for. A name with an address gets a random label of its
-   * own in front (x3k9q2.192-168-1-10.ipssl.cc). Words in front of the
-   * address do not change the answer, but no resolver has this name cached,
-   * so Cloudflare has to ask ns1–4 and the check proves they answer. The
-   * label starts with "x", so it never reads as an address itself.
+   * A random name one label below `name` (x3k9q2.192-168-1-10.ipssl.cc).
+   * Words in front of the address do not change the answer, but no resolver
+   * has this name cached, so Cloudflare has to ask an ipssl.cc name server.
+   * That shows the one server it picked answers correctly, not that all of
+   * them do. The label starts with "x", so it never reads as an address
+   * itself. Null when the name has no room for another label.
    */
-  function queryName(name, ip) {
-    if (!ip) return name;
+  function childName(name) {
     const abc = "abcdefghijklmnopqrstuvwxyz0123456789";
     const label = `x${[...crypto.getRandomValues(new Uint8Array(5))].map((b) => abc[b % abc.length]).join("")}`;
     const q = `${label}.${name}`;
-    return q.length <= MAX_NAME ? q : name;
+    return q.length <= MAX_NAME ? q : null;
+  }
+
+  /** One query: the response code and the addresses of `type` in the answer. */
+  async function lookup(name, type, signal) {
+    const url = `${DOH}?name=${encodeURIComponent(name)}&type=${type}`;
+    const res = await fetch(url, { headers: { accept: "application/dns-json" }, signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    const code = type === "A" ? 1 : 28;
+    const records = (body.Answer || []).filter((rr) => rr.type === code);
+    const norm = (d) => {
+      const a = type === "AAAA" && parseV6(d, true);
+      return a ? ipText({ v: 6, a }) : d;
+    };
+    return { status: body.Status, got: records.map((rr) => norm(rr.data)), ttl: records.length ? records[0].TTL : null };
+  }
+
+  /**
+   * A name with an address. It passes only when its own answer of the
+   * expected type is that address alone (a client may pick any address it
+   * gets), the other type has no record, and the random name below it, which
+   * no cache holds, gives the same address.
+   */
+  async function verify(name, ip, signal) {
+    const type = ip.v === 6 ? "AAAA" : "A";
+    const other = ip.v === 6 ? "A" : "AAAA";
+    const want = ipText(ip);
+    // A name too long for another label is asked as it is, and may be cached.
+    const below = childName(name);
+    const [exact, rest, child] = await Promise.all([
+      lookup(name, type, signal),
+      lookup(name, other, signal),
+      below ? lookup(below, type, signal) : null,
+    ]);
+    const only = (r) => r.status === 0 && r.got.length > 0 && r.got.every((g) => g === want);
+    const res = { type, want, fresh: Boolean(below) };
+    if (exact.status === 3) return { ...res, phase: "bad", kind: "nx" };
+    if (exact.status !== 0) return { ...res, phase: "bad", kind: "rcode", rcode: rcodeName(exact.status) };
+    if (!exact.got.length) return { ...res, phase: "bad", kind: "nodata" };
+    const extra = rest.status === 0 ? rest.got.map((g) => [other, g]) : [];
+    const rec = { ...res, kind: "records", shown: [...exact.got.map((g) => [type, g]), ...extra], got: exact.got, ttl: exact.ttl, other };
+    if (!only(exact)) return { ...rec, phase: "bad", why: "mismatch" };
+    if (rest.status !== 0) return { ...rec, phase: "bad", why: "otherStatus", rcode: rcodeName(rest.status) };
+    if (rest.got.length) return { ...rec, phase: "bad", why: "otherRecords" };
+    if (child && !only(child)) return { ...rec, phase: "bad", why: "child", child };
+    return { ...rec, phase: "ok" };
+  }
+
+  /** A name without an address: whatever A and AAAA records it has, as they are. */
+  async function survey(name, signal) {
+    const [a, aaaa] = await Promise.all([lookup(name, "A", signal), lookup(name, "AAAA", signal)]);
+    const res = { type: null, want: null, fresh: false };
+    if (a.status === 3 || aaaa.status === 3) return { ...res, phase: "bad", kind: "nx" };
+    const failed = [a, aaaa].find((r) => r.status !== 0);
+    if (failed) return { ...res, phase: "bad", kind: "rcode", rcode: rcodeName(failed.status) };
+    const shown = [...a.got.map((g) => ["A", g]), ...aaaa.got.map((g) => ["AAAA", g])];
+    if (!shown.length) return { ...res, phase: "info", kind: "nodata" };
+    return { ...res, phase: "info", kind: "records", shown, got: shown.map(([, g]) => g), ttl: (a.got.length ? a : aaaa).ttl };
   }
 
   async function check() {
     if (!target) return;
     const seq = ++checkSeq;
     const { name, ip } = target;
-    const type = ip && ip.v === 6 ? "AAAA" : "A";
-    const want = ip ? ipText(ip) : null;
     result = { phase: "run" };
     renderAnswer();
     checkBtn.disabled = true;
@@ -925,28 +999,11 @@
     const timer = setTimeout(() => ctl.abort(), CHECK_TIMEOUT_MS);
     let next;
     try {
-      const url = `${DOH}?name=${encodeURIComponent(queryName(name, ip))}&type=${type}`;
-      const res = await fetch(url, { headers: { accept: "application/dns-json" }, signal: ctl.signal, cache: "no-store" });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const body = await res.json();
-      const code = type === "A" ? 1 : 28;
-      const records = (body.Answer || []).filter((rr) => rr.type === code);
-      if (body.Status === 3) {
-        next = { phase: "bad", kind: "nx" };
-      } else if (body.Status !== 0) {
-        next = { phase: "bad", kind: "rcode", rcode: RCODES[body.Status] ?? `RCODE ${body.Status}` };
-      } else if (!records.length) {
-        // An empty answer is what a name without an address should get.
-        next = { phase: want ? "bad" : "info", kind: "nodata", type };
-      } else {
-        const norm = (d) => (type === "A" ? d : ipText({ v: 6, a: parseV6(d, true) || [] }));
-        const got = records.map((rr) => norm(rr.data));
-        // Every address must be the expected one: a client may pick any of them.
-        const ok = want ? got.every((g) => g === want) : null;
-        next = { phase: want ? (ok ? "ok" : "bad") : "info", kind: "records", type, got, ttl: records[0].TTL, want, ok };
-      }
+      next = ip ? await verify(name, ip, ctl.signal) : await survey(name, ctl.signal);
     } catch {
-      next = { phase: "bad", kind: "error", type, name };
+      // One query failed; the others have nothing left to add.
+      ctl.abort();
+      next = { phase: "bad", kind: "error", type: ip && ip.v === 6 ? "AAAA" : "A", name };
     } finally {
       clearTimeout(timer);
     }
@@ -961,23 +1018,46 @@
   function renderAnswer() {
     trace.hidden = !result;
     trace.dataset.state = result ? result.phase : "idle";
+    // A cached answer need not have come from a name server just now.
+    if (result && (result.phase === "ok" || result.phase === "info") && !result.fresh) trace.dataset.cached = "";
+    else delete trace.dataset.cached;
     answer.dataset.state = result && result.phase !== "run" ? result.phase : "";
     answer.innerHTML = result ? answerHtml(result) : "";
   }
 
   function answerHtml(res) {
     if (res.phase === "run") return escapeHtml(t("checking"));
-    if (res.kind === "nx") return escapeHtml(t("nx"));
-    if (res.kind === "rcode") return escapeHtml(t("rcode", { rcode: res.rcode }));
-    if (res.kind === "nodata") return escapeHtml(t("nodata", { type: res.type }));
     if (res.kind === "error") return escapeHtml(t("error", { type: res.type, name: res.name }));
-    const shown = res.got.map((g) => `<code>${res.type} ${escapeHtml(g)}</code>`).join(" ");
-    const ttl = `<span>${escapeHtml(t("ttl", { ttl: res.ttl }))}</span>`;
-    if (!res.want) return shown + ttl;
-    const verdict = res.ok
-      ? `${ICON_CHECK}${escapeHtml(t("match"))}`
-      : `${ICON_X}${escapeHtml(t(res.got.includes(res.want) ? "mismatchOnly" : "mismatch", { want: res.want }))}`;
-    return `${shown}${ttl}<span class="verdict">${verdict}</span>`;
+    let html;
+    if (res.kind === "nx") html = escapeHtml(t("nx"));
+    else if (res.kind === "rcode") html = escapeHtml(t("rcode", { rcode: res.rcode }));
+    else if (res.kind === "nodata") html = escapeHtml(res.type ? t("nodata", { type: res.type }) : t("nodataAny"));
+    else {
+      html = res.shown.map(([type, g]) => `<code>${type} ${escapeHtml(g)}</code>`).join(" ");
+      html += `<span>${escapeHtml(t("ttl", { ttl: res.ttl }))}</span>`;
+      if (res.want) html += `<span class="verdict">${res.phase === "ok" ? ICON_CHECK : ICON_X}${escapeHtml(verdictText(res))}</span>`;
+    }
+    return `${html}<span class="source">${escapeHtml(sourceText(res))}</span>`;
+  }
+
+  /** The verdict on a name with an address and records of the expected type. */
+  function verdictText(res) {
+    if (res.phase === "ok") return t("match");
+    if (res.why === "mismatch") return t(res.got.includes(res.want) ? "mismatchOnly" : "mismatch", { want: res.want });
+    if (res.why === "otherStatus") return t("otherStatus", { type: res.other, rcode: res.rcode });
+    if (res.why === "otherRecords") return t("otherRecords", { type: res.other });
+    const c = res.child;
+    if (c.status === 0 && !c.got.length) return t("childEmpty", { type: res.type, want: res.want });
+    const got = c.status !== 0 ? rcodeName(c.status) : c.got.map((g) => `${res.type} ${g}`).join(", ");
+    return t("childBad", { got, want: res.want });
+  }
+
+  /** Where the answer came from, and that the visitor's own network may differ. */
+  function sourceText(res) {
+    const router = t("src.router");
+    if (res.kind !== "records" || res.phase === "bad") return router;
+    const ip = res.want || res.got.join(", ");
+    return sentences([t(res.fresh ? "src.fresh" : "src.cached", { ip }), router]);
   }
 
   // ---------------------------------------------------------------------

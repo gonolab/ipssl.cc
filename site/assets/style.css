@@ -846,7 +846,7 @@ p {
   background-size: 200% 100%;
 }
 
-.trace-path span {
+.trace-path li > span {
   padding: 3px 9px;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -869,7 +869,7 @@ p {
   background: var(--accent);
 }
 
-.trace[data-state="ok"] .trace-path span {
+.trace[data-state="ok"] .trace-path li > span {
   border-color: var(--soft-line);
   color: var(--text);
 }
@@ -881,6 +881,11 @@ p {
 /* An answer with nothing to compare it to: a name without an address. */
 .trace[data-state="info"] .trace-path li + li::before {
   background: color-mix(in srgb, var(--accent) 45%, var(--line));
+}
+
+/* A possibly cached answer may never have reached a name server. */
+.trace[data-cached] .trace-path li:nth-child(3) {
+  opacity: 0.5;
 }
 
 @keyframes travel {
@@ -929,6 +934,13 @@ p {
 
 .answer[data-state="bad"] .verdict {
   color: var(--bad);
+}
+
+/* Where the answer came from, on its own line under it. */
+.answer .source {
+  flex-basis: 100%;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
 
 /* Sections */
@@ -1815,7 +1827,7 @@ p {
     font-size: 11.5px;
   }
 
-  .trace-path span {
+  .trace-path li > span {
     padding: 2px 7px;
   }
 
@@ -1899,6 +1911,13 @@ p {
 
   .cmd {
     padding-left: 14px;
+  }
+}
+
+/* On a phone the last trace node is just "ipssl.cc", so all three fit. */
+@media (max-width: 440px) {
+  .trace-long {
+    display: none;
   }
 }
 
