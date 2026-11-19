@@ -110,6 +110,15 @@ records = 3600
 
 # Fixed records. Keys are relative to `domain`; "@" is the apex. Each host
 # takes `a`, `aaaa`, `txt` and `mx`.
+# - Keys are matched without regard to case, so two keys that differ only
+#   in case are an error. `*` and backslashes are not allowed: there are
+#   no wildcard hosts.
+# - Each address type stands alone: a host without `a` keeps the IPv4
+#   address its name encodes (and one without `aaaa` its IPv6 address), so
+#   a TXT record on "10-0-0-1" leaves its A record alone. A host's own `a`
+#   or `aaaa` records replace the encoded address of that type.
+# - With `[acme]` on, a host whose name can take a DNS-01 challenge (such
+#   as "_acme-challenge.10-0-2-2") is an error: the challenges would hide it.
 # - txt: one record per entry. Values over 255 bytes (RSA DKIM keys) are
 #   split into 255-byte strings automatically; paste them in one piece.
 # - mx: `exchange` is always a full host name, never relative to `domain`.

@@ -26,9 +26,9 @@ app-192-168-1-10.ipssl.cc →  192.168.1.10
 
 Rules:
 
-- When a name contains more than one address, the rightmost one (closest to the zone) wins.
+- When a name contains more than one address, the rightmost one (closest to the zone) wins. A label of eight decimal numbers, such as `10-0-0-1-192-168-1-1`, holds two IPv4 addresses, not one IPv6 address, so it resolves to 192.168.1.1.
 - Numbers with leading zeros (such as `010`) are rejected, so nobody has to guess whether they are octal.
-- An AAAA query for an IPv4 name (and the other way round) returns NODATA, not NXDOMAIN.
+- Every name under `ipssl.cc` exists. A name without an address (such as `app.ipssl.cc`), or an AAAA query for an IPv4 name and the other way round, returns NODATA, not NXDOMAIN. Only names whose address is on the operator's blocklist return NXDOMAIN.
 - A TXT query for `ip.ipssl.cc` returns the address the query came from (usually your recursive resolver). Handy for debugging.
 
 ## HTTPS certificates
@@ -101,6 +101,9 @@ Keep in mind:
 - The certificate encrypts the connection, but it does not prove whose machine you reached. `10.0.2.2` exists on countless networks, and anyone can get a certificate for the same name.
 - Names with public addresses are refused: otherwise anyone could get a certificate for someone else's server. Run the ACME client on that server and use HTTP-01 or TLS-ALPN-01.
 - Values must be real DNS-01 digests. They are dropped after 10 minutes.
+- A name holds at most 16 pending values, and at most 2 from one client network. Over either cap the API answers 409 and keeps the values it has, so clean up after each order (the hooks and plugins do).
+- Only the client network that presented a value can clean it up. A cleanup from another network also answers 200, but removes nothing, since the values are public in DNS anyway.
+- If a name server does not take a value, the API answers 502 and takes the value back from the name servers that did, so a retry starts clean.
 - Each client network can make 10 requests a minute, with bursts of 20, which is enough for an order of about 20 names. The certbot hook and the acme.sh plugin wait and retry when the API answers 429.
 - These certificates count toward the same Let's Encrypt limit as every other name under `ipssl.cc`. Keep a certificate until it is due for renewal, or use another CA such as ZeroSSL or Google Trust Services.
 
@@ -246,6 +249,8 @@ On a host that also runs the challenge API, restart `ipssl-acme-api` too: both u
 
 From a source checkout, the binary is `target/release/ipssl-dns` (or `target/<target>/release/ipssl-dns` for a cross build) and the units are `deploy/ipssl-dns.service` and `deploy/ipssl-acme-api.service`.
 
+If any listener stops serving, the process exits with an error and systemd restarts it. On a host without IPv6, `[::]:53` in `listen` is skipped with a warning; any other address that cannot be bound stops the start.
+
 On a server with more than one address, list each address in `listen` instead of `0.0.0.0:53` and `[::]:53`, for example `["198.51.100.1:53", "[2001:db8::1]:53"]`. A socket bound to the wildcard address can send a UDP reply from a different address than the one queried, and resolvers ignore such replies.
 
 On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make binding `0.0.0.0:53` fail. Two ways around it:
@@ -280,7 +285,7 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. If the file has an error, the server logs it and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart. With `[acme]`, restart the name servers one at a time (see [step 7](#7-dns-01-challenge-api-optional)).
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. `systemctl reload` runs the same check first and fails if the config does not pass. The server itself checks the whole file too, including the sections that need a restart: if anything is wrong, it logs the error, counts a failed reload and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart. With `[acme]`, restart the name servers one at a time (see [step 7](#7-dns-01-challenge-api-optional)).
 
 ### 6. Mail for the domain
 
@@ -312,7 +317,7 @@ This step enables [certificates for private addresses](#certificates-for-private
    writers = ["198.51.100.10"]
    ```
 
-   Open TCP port 8053 to that address only, then restart `ipssl-dns`. The values live in memory only, so a restart drops the challenges in flight: restart the name servers one at a time, and not while a certificate is being issued.
+   Open TCP port 8053 to that address only, then restart `ipssl-dns`. The server also closes connections from other addresses without an answer. The values live in memory only, so a restart drops the challenges in flight: restart the name servers one at a time, and not while a certificate is being issued.
 
    Do this on all name servers at least the zone's negative TTL (`soa.minimum`, 300 seconds by default) before the first DNS-01 issuance: until then they answer `_acme-challenge` names with an empty answer, which resolvers, the CA's included, may still have cached.
 
@@ -324,11 +329,13 @@ This step enables [certificates for private addresses](#certificates-for-private
 
    Later runs upgrade it, with or without the flag. The script enables a service only when its flag is given, so it never starts a DNS server on the API host by mistake.
 
-   The config check lists the name server endpoints the API writes to, by default an address of each name server on port 8053:
+   The config check lists the name server endpoints the API writes to:
 
    ```bash
    ipssl-dns --acme-api -c /etc/ipssl/config.toml --check
    ```
+
+   By default that is each name server's first address of the family `acme.listen` uses (IPv4 for `0.0.0.0:8053`, IPv6 for `[::]:8053`), on the `acme.listen` port. If a name server has no address of that family, for example one outside the zone, list the endpoints in `acme.nodes`: the API refuses to start without them.
 
    When the set of name servers changes, update the API host's config too and restart `ipssl-acme-api`: it reads the config only when it starts.
 
@@ -342,7 +349,7 @@ Tune or turn it off in the `[rate_limit]` section of the config.
 
 ## Monitoring
 
-With a `[metrics]` section in the config, the server serves Prometheus metrics over plain HTTP, by default at `127.0.0.1:9153`. Keep that address private.
+With a `[metrics]` section in the config, the server serves Prometheus metrics over plain HTTP, by default at `127.0.0.1:9153`. Keep that address private. An IPv6 address such as `[::1]:9153` accepts IPv6 connections only.
 
 ```bash
 curl -s http://127.0.0.1:9153/metrics
@@ -384,7 +391,7 @@ On a host that runs both the DNS server and the API, the two cannot share a `[me
 
 ## Website
 
-The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. Converting a name happens in the browser. The page looks a name up, through Cloudflare's DNS-over-HTTPS API, only when asked to: with the Check button, or a second Enter after the name was converted.
+The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. Converting a name happens in the browser. The page looks a name up, through Cloudflare's DNS-over-HTTPS API, only when asked to: with the Check button, or Enter once the box holds a name (Enter on an IP address converts it first). For a name with an address, it asks for the name with a random label in front, which resolves the same, so the answer comes from ipssl.cc and not from Cloudflare's cache.
 
 Preview it locally:
 
