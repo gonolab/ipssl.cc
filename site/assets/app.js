@@ -62,12 +62,21 @@
     return [...head, ...Array(8 - head.length - tail.length).fill(0), ...tail];
   }
 
+  /** Eight dash-separated decimal octets: two IPv4 addresses (10-0-0-1-192-168-1-1). */
+  const twoV4 = (t) => t.length === 8 && allOctets(t) !== null;
+
+  /**
+   * A whole label as IPv6, dashes for colons. Eight decimal octets also make
+   * a full IPv6 address (10:0:0:1:192:168:1:1), but the server reads them as
+   * two IPv4 addresses, and the rightmost one wins, so they are not IPv6.
+   */
+  const dashedV6 = (label) =>
+    label.includes("-") && !twoV4(label.split("-")) ? parseV6(label.replace(/-/g, ":"), false) : null;
+
   /** An address inside one label: dashed IPv6, dashed IPv4 or eight hex digits. */
   function singleLabel(label) {
-    if (label.includes("-")) {
-      const v6 = parseV6(label.replace(/-/g, ":"), false);
-      if (v6) return { v: 6, a: v6 };
-    }
+    const v6 = dashedV6(label);
+    if (v6) return { v: 6, a: v6 };
     const t = label.split("-");
     for (let end = t.length - 1; end >= 0; end--) {
       if (end >= 3) {
@@ -126,6 +135,19 @@
   };
 
   /**
+   * A dashed IPv6 label the server reads back as the same address, and that
+   * a CA accepts. Eight groups that all look like decimal octets
+   * (1-2-3-4-5-6-7-8) would be two IPv4 addresses, and a label with "--" as
+   * its third and fourth characters (fd--1) is refused by Let's Encrypt, so
+   * either one gets its first group written with four digits (0001-2-3-4-5-6-7-8).
+   */
+  function keepV6(label) {
+    const t = label.split("-");
+    if (!twoV4(t) && label.slice(2, 4) !== "--") return label;
+    return t[0].padStart(4, "0") + label.slice(t[0].length);
+  }
+
+  /**
    * IPv6 as one label. A label may not start or end with "-", so a leading
    * or trailing "::" gets an explicit zero group (::1 becomes 0--1).
    */
@@ -133,8 +155,11 @@
     let t = v6Text(a);
     if (t.startsWith("::")) t = `0${t}`;
     if (t.endsWith("::")) t += "0";
-    return t.replace(/:/g, "-");
+    return keepV6(t.replace(/:/g, "-"));
   }
+
+  /** IPv6 as one label with every group written out (2001-db8-0-0-0-0-0-1). */
+  const v6Full = (a) => keepV6(a.map((g) => g.toString(16)).join("-"));
 
   /** Every name the page suggests for an address, recommended first. */
   function namesFor(ip) {
@@ -150,7 +175,7 @@
       ].map((n) => ({ ...n, zone: z }));
     }
     const label = v6Label(ip.a);
-    const full = ip.a.map((g) => g.toString(16)).join("-");
+    const full = v6Full(ip.a);
     const names = [
       { pre: "", addr: label, tag: "rec" },
       { pre: "app.", addr: label, tag: "sub" },
@@ -198,7 +223,7 @@
 
   /** The address inside one label, as [start, stop) offsets, or null. */
   function labelSpan(label) {
-    if (label.includes("-") && parseV6(label.replace(/-/g, ":"), false)) return [0, label.length];
+    if (dashedV6(label)) return [0, label.length];
     const t = label.split("-");
     const offs = [];
     let p = 0;
@@ -653,7 +678,7 @@
       ];
     } else {
       const label = v6Label(ip.a);
-      const full = ip.a.map((g) => g.toString(16)).join("-");
+      const full = v6Full(ip.a);
       rows = [
         ["", label, "", "form.rec"],
         ["app.", label, "", "form.v6words"],

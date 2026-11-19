@@ -7,10 +7,10 @@ Use this file to give a machine a hostname and an HTTPS certificate. Work in thi
 ## 1. Pick the hostname
 
 - Recommended form: the IPv4 address with dashes, in one label: `192.168.1.10` -> `192-168-1-10.ipssl.cc`.
-- IPv6: write `:` as `-` and `::` as `--`: `2001:db8::1` -> `2001-db8--1.ipssl.cc`. An address that starts or ends with `::` gets an explicit zero group: `::1` -> `0--1.ipssl.cc`.
+- IPv6: write `:` as `-` and `::` as `--`: `2001:db8::1` -> `2001-db8--1.ipssl.cc`. An address that starts or ends with `::` gets an explicit zero group: `::1` -> `0--1.ipssl.cc`. When all eight groups would read as decimal numbers from 0 to 255, the label holds two IPv4 addresses instead (`1-2-3-4-5-6-7-8.ipssl.cc` resolves to 5.6.7.8), so write the first group with four digits: `1:2:3:4:5:6:7:8` -> `0001-2-3-4-5-6-7-8.ipssl.cc`. Do the same when `--` would be the third and fourth characters: `fd::1` -> `00fd--1.ipssl.cc`.
 - Words may go before or after the address, joined with `-` (`app-192-168-1-10.ipssl.cc`, `192-168-1-10-app.ipssl.cc`), or in their own labels (`api.app.192-168-1-10.ipssl.cc`). Words in front of an IPv6 address must be in their own label.
 - Also accepted: dotted `192.168.1.10.ipssl.cc` and eight hex digits `c0a8010a.ipssl.cc`. Prefer the dashed one-label form: it is the easiest to get certificates for.
-- When a name holds more than one address, the rightmost one wins. Octets with leading zeros (`010`) are rejected.
+- When a name holds more than one address, the rightmost one wins: `10-0-0-1-192-168-1-1.ipssl.cc` is two IPv4 addresses and resolves to 192.168.1.1. Octets with leading zeros (`010`) are rejected.
 - For a name that will get a certificate: at most 10 labels in all (Let's Encrypt's limit; `ipssl.cc` counts as two), no `--` as the third and fourth characters of a label (`ab--1` is refused, `xn--` is fine), and for DNS-01 at most 237 characters, so that `_acme-challenge.` in front still fits in 253.
 - Common private names such as `192-168-1-10.ipssl.cc` share Let's Encrypt's per-name limit with everyone (see Limits): add a label of the user's own, such as `myname-192-168-1-10.ipssl.cc`.
 - Avoid link-local IPv6 (fe80::/10): a name carries no interface scope, so most systems and browsers cannot reach such an address by name. Use a ULA (fd00::/8) or a global address.
