@@ -793,20 +793,28 @@ fn parse_fqdn(fqdn: &str) -> Result<Name, ChallengeError> {
     Name::from_ascii(format!("{trimmed}.")).map_err(|_| ChallengeError::Invalid)
 }
 
-/// `hostmaster@ipssl.cc` -> `hostmaster.ipssl.cc.` (the SOA RNAME format).
+/// `hostmaster@ipssl.cc` -> `hostmaster.ipssl.cc.`, the SOA RNAME format
+/// (RFC 1035 section 8): the part before the @ becomes one label, so it
+/// may hold dots. `admin.dns@example.test` gives the labels `admin.dns`,
+/// `example` and `test`, written `admin\.dns.example.test.` in zone files.
 fn email_to_name(email: &str) -> Result<Name> {
     let (local, domain) = email
         .split_once('@')
         .with_context(|| format!("SOA email {email:?} must look like user@domain"))?;
+    // Spaces and backslashes would need escapes in every zone file view.
     ensure!(
-        !local.is_empty() && !local.contains('.'),
-        "SOA email local part must be non-empty and contain no dots"
+        (1..=63).contains(&local.len())
+            && local.bytes().all(|b| b.is_ascii_graphic() && b != b'\\'),
+        "SOA email {email:?}: the part before the @ must be 1 to 63 printable ASCII characters, without spaces or backslashes"
     );
     ensure!(
         !domain.trim_end_matches('.').is_empty(),
         "SOA email {email:?} must have a domain after the @"
     );
-    fqdn(&format!("{local}.{domain}"))
+    let domain = fqdn(domain)?;
+    let labels = std::iter::once(local.to_ascii_lowercase().into_bytes())
+        .chain(domain.iter().map(<[u8]>::to_vec));
+    Name::from_labels(labels).with_context(|| format!("SOA email {email:?} is too long"))
 }
 
 /// A CAA `issue` value: an issuer domain name of letters, digits and
@@ -1418,22 +1426,40 @@ mod tests {
 
     #[test]
     fn soa_email() {
+        let long = format!("{}@ipssl.cc", "a".repeat(64));
         for email in [
             "ops@",
             "ops@.",
             "@ipssl.cc",
-            "ops.dns@example.org",
             "hostmaster",
+            "ops team@ipssl.cc",
+            "ops\\.dns@ipssl.cc",
+            "opé@ipssl.cc",
+            &long,
         ] {
             let mut cfg = config();
             cfg.soa.email = email.into();
             assert!(Zone::from_config(&cfg).is_err(), "accepted {email:?}");
         }
-        let soa = query("ipssl.cc.", RecordType::SOA);
-        let RData::SOA(soa) = &soa.answers[0].data else {
-            panic!("not an SOA record");
+        let rname = |zone: &Zone| {
+            let soa = query_zone(zone, "ipssl.cc.", RecordType::SOA);
+            let RData::SOA(soa) = &soa.answers[0].data else {
+                panic!("not an SOA record");
+            };
+            soa.rname.clone()
         };
-        assert_eq!(soa.rname.to_string(), "hostmaster.ipssl.cc.");
+        assert_eq!(rname(&zone()).to_string(), "hostmaster.ipssl.cc.");
+
+        // A dot before the @ stays inside the first label.
+        let mut cfg = config();
+        cfg.soa.email = "Admin.DNS@Example.test".into();
+        let rname = rname(&Zone::from_config(&cfg).unwrap());
+        let labels: Vec<&[u8]> = rname.iter().collect();
+        assert_eq!(labels, [&b"admin.dns"[..], b"example", b"test"]);
+        assert_eq!(
+            rname.to_bytes().unwrap(),
+            b"\x09admin.dns\x07example\x04test\x00"
+        );
     }
 
     #[test]
