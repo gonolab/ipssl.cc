@@ -289,7 +289,9 @@ async fn api_reports_a_name_server_that_is_down() {
 #[tokio::test]
 async fn a_refused_value_is_taken_back_where_it_was_taken() {
     // One name server is at the cap for this network (another one lost
-    // its values in a restart, say), so the change is refused there.
+    // its values in a restart, say), so the change is refused there. The
+    // values came from an API from v0.5.0, which sent the network as the
+    // owner: the cap counts them for the network all the same.
     let full = name_server("127.0.0.1").await;
     let empty = name_server("127.0.0.1").await;
     for v in ['A', 'B'] {
@@ -357,7 +359,7 @@ async fn name_server_counts_every_rejected_write() {
 }
 
 #[tokio::test]
-async fn only_the_presenting_network_cleans_up() {
+async fn only_the_presenting_address_cleans_up() {
     let ns = name_server("127.0.0.1").await;
     let api = api(&[ns.write], "").await;
     let request = body(NAME, VALUE);
@@ -366,17 +368,28 @@ async fn only_the_presenting_network_cleans_up() {
         200
     );
 
-    // Values are public in DNS, so knowing one proves nothing: another
-    // network's cleanup succeeds but removes nothing.
-    let (status, reply) = post_as(api, "198.51.100.7", "/cleanup", &request).await;
-    assert_eq!((status, reply.as_str()), (200, r#"{"ok":true}"#));
-    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
-
-    // The owner is the client's network, as for rate limiting (/24).
+    // Values are public in DNS, so knowing one proves nothing: a cleanup
+    // from another network, or from a neighbour in the same /24 (which
+    // shares a rate limit), succeeds but removes nothing.
+    for other in ["198.51.100.7", "192.0.2.99"] {
+        let (status, reply) = post_as(api, other, "/cleanup", &request).await;
+        assert_eq!((status, reply.as_str()), (200, r#"{"ok":true}"#));
+        assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE], "{other}");
+    }
     assert_eq!(
-        post_as(api, "192.0.2.99", "/cleanup", &request).await.0,
+        post_as(api, "192.0.2.10", "/cleanup", &request).await.0,
         200
     );
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    // An IPv6 client owns its /64, where it may pick a new address for
+    // each connection; the rest of its /56 does not.
+    let present = post_as(api, "2001:db8:0:1::10", "/present", &request).await;
+    assert_eq!(present.0, 200);
+    post_as(api, "2001:db8:0:2::10", "/cleanup", &request).await;
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    let cleanup = post_as(api, "2001:db8:0:1:aaaa::99", "/cleanup", &request).await;
+    assert_eq!(cleanup.0, 200);
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
 }
 
@@ -450,6 +463,35 @@ async fn name_server_takes_writes_with_and_without_an_owner() {
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
 
     assert_eq!(write("/present", owned("nobody")).await.0, 400);
+}
+
+#[tokio::test]
+async fn name_server_takes_writes_from_old_and_new_apis() {
+    // An API from v0.5.0 sends the client's network as the owner; a newer
+    // one sends the client's address as the owner, and its network.
+    let ns = name_server("127.0.0.1").await;
+    let old = serde_json::json!({ "fqdn": NAME, "value": VALUE, "owner": "192.0.2.0" });
+    let new = |owner: &str| serde_json::json!({ "fqdn": NAME, "value": VALUE, "owner": owner, "network": "192.0.2.0" });
+    let write = |path, body: serde_json::Value| async move {
+        post_json(ns.write, path, &body.to_string()).await.unwrap()
+    };
+
+    // A value presented before the API's upgrade: a client on the network
+    // takes it down after the upgrade, as it could before.
+    assert_eq!(write("/present", old.clone()).await.0, 200);
+    assert_eq!(write("/cleanup", new("192.0.2.99")).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    // A value presented after it belongs to the address alone.
+    assert_eq!(write("/present", new("192.0.2.10")).await.0, 200);
+    assert_eq!(write("/cleanup", new("192.0.2.99")).await.0, 200);
+    assert_eq!(write("/cleanup", old).await.0, 200);
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    assert_eq!(write("/cleanup", new("192.0.2.10")).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    let bad = serde_json::json!({ "fqdn": NAME, "value": VALUE, "network": "x" });
+    assert_eq!(write("/present", bad).await.0, 400);
 }
 
 #[tokio::test]

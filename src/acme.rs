@@ -13,15 +13,16 @@
 //!   finds it whichever name server it asks.
 //! - Each name server keeps the values in memory for a few minutes
 //!   ([`Challenges`]) and takes writes only from the API hosts ([`Node`]).
-//!   A value belongs to the client network that presented it, which the
-//!   API sends along; only that network can clean it up.
+//!   A value belongs to the client that presented it, by its IPv4 address
+//!   or its IPv6 /64, which the API sends along ([`Origin`]); only that
+//!   client can clean it up.
 //!
 //! Only names with private addresses qualify ([`Zone::check_challenge`]),
 //! and values must look like real challenge digests, so the API cannot be
 //! used to publish arbitrary text in the zone.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -61,7 +62,11 @@ const MAX_VALUES: usize = 16;
 
 /// Most values one client network may hold at one name: a certificate for
 /// a name and its wildcard needs two at once.
-const MAX_VALUES_PER_OWNER: usize = 2;
+const MAX_VALUES_PER_NETWORK: usize = 2;
+
+/// The IPv6 prefix that owns a value: one host, as far as an address
+/// says, since a host usually picks addresses from its whole /64.
+const IPV6_OWNER_PREFIX: u32 = 64;
 
 /// Time the API gives each name server to take a change.
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -105,11 +110,12 @@ pub fn is_valid_value(value: &str) -> bool {
 
 /// Challenge values published on this name server, by name.
 ///
-/// Each value belongs to the client network that presented it through the
-/// API (the owner), and only that network can clean it up: values are
-/// public in DNS while a CA validates them, so knowing one proves nothing.
-/// Values are never pushed out before they expire; when a cap is reached,
-/// the new value is refused instead.
+/// Each value belongs to the client that presented it through the API
+/// (the owner, see [`Origin`]), and only that client can clean it up:
+/// values are public in DNS while a CA validates them, so knowing one
+/// proves nothing. The caps on pending values count by the client's
+/// network. Values are never pushed out before they expire; when a cap is
+/// reached, the new value is refused instead.
 #[derive(Default)]
 pub struct Challenges {
     inner: Mutex<Inner>,
@@ -124,10 +130,43 @@ struct Inner {
 
 struct Entry {
     value: String,
-    /// The client network that presented the value, as the API groups
-    /// clients. `None` for writes from an API that sends no owner.
-    owner: Option<IpAddr>,
+    /// Who presented the value.
+    origin: Origin,
     expires: Instant,
+}
+
+impl Entry {
+    /// Whether a cleanup from `origin` takes this value down.
+    fn owned_by(&self, origin: &Origin) -> bool {
+        self.origin.owner == origin.owner
+            // Presented through an API from v0.5.0, which sent the client's
+            // network as the owner: the network cleans it up, as it could
+            // then. Only for values from before the API's upgrade.
+            || (self.origin.network.is_none()
+                && origin.network.is_some()
+                && self.origin.owner == origin.network)
+    }
+}
+
+/// Who presented a value or cleans it up, as the API sends it along with
+/// each change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Origin {
+    /// The client: its IPv4 address, or its IPv6 /64 (see [`owner`]).
+    /// Only the same owner can clean a value up. `None` for writes from an
+    /// API that sends no owner; those belong to nobody else.
+    pub owner: Option<IpAddr>,
+    /// The client's network, as the API groups clients for rate limiting.
+    /// The caps on pending values count by it. An API from v0.5.0 sends
+    /// the network as the owner and leaves this out.
+    pub network: Option<IpAddr>,
+}
+
+impl Origin {
+    /// What the caps on pending values count by.
+    fn network(&self) -> Option<IpAddr> {
+        self.network.or(self.owner)
+    }
 }
 
 /// Why a value could not be published.
@@ -137,8 +176,8 @@ pub enum Full {
     Store,
     /// The name holds as many values as it may (16).
     Name,
-    /// The owner holds as many values at the name as it may (2).
-    Owner,
+    /// The client network holds as many values at the name as it may (2).
+    Network,
 }
 
 impl Full {
@@ -150,10 +189,10 @@ impl Full {
                 409,
                 &format!("this name already holds {MAX_VALUES} pending values"),
             ),
-            Self::Owner => error(
+            Self::Network => error(
                 409,
                 &format!(
-                    "this client network already holds {MAX_VALUES_PER_OWNER} pending values at this name"
+                    "this client network already holds {MAX_VALUES_PER_NETWORK} pending values at this name"
                 ),
             ),
         }
@@ -165,18 +204,19 @@ impl Challenges {
         Self::default()
     }
 
-    /// Publishes `value` at `name` for `owner`, or extends it if `owner`
-    /// published it there already.
-    pub fn present(&self, name: LowerName, value: &str, owner: Option<IpAddr>) -> Result<(), Full> {
-        self.present_at(name, value, owner, Instant::now())
+    /// Publishes `value` at `name` for the owner in `origin`, or extends
+    /// it if that owner published it there already.
+    pub fn present(&self, name: LowerName, value: &str, origin: Origin) -> Result<(), Full> {
+        self.present_at(name, value, origin, Instant::now())
     }
 
-    /// Removes `value` from `name` if `owner` published it. Anything else
-    /// is left alone, the same value published by another owner included.
-    pub fn cleanup(&self, name: &LowerName, value: &str, owner: Option<IpAddr>) {
+    /// Removes `value` from `name` if the owner in `origin` published it.
+    /// Anything else is left alone, the same value published by another
+    /// owner included.
+    pub fn cleanup(&self, name: &LowerName, value: &str, origin: Origin) {
         let names = &mut self.lock().names;
         if let Some(entries) = names.get_mut(name) {
-            entries.retain(|e| e.value != value || e.owner != owner);
+            entries.retain(|e| e.value != value || !e.owned_by(&origin));
             if entries.is_empty() {
                 names.remove(name);
             }
@@ -207,7 +247,7 @@ impl Challenges {
         &self,
         name: LowerName,
         value: &str,
-        owner: Option<IpAddr>,
+        origin: Origin,
         now: Instant,
     ) -> Result<(), Full> {
         let mut inner = self.lock();
@@ -230,24 +270,29 @@ impl Challenges {
         let expires = now + LIFETIME;
         if let Some(entry) = entries
             .iter_mut()
-            .find(|e| e.value == value && e.owner == owner)
+            .find(|e| e.value == value && e.origin.owner == origin.owner)
         {
             entry.expires = expires;
             return Ok(());
         }
         // Writes without an owner cannot be told apart, so only the cap
         // for the whole name applies to them.
-        if owner.is_some()
-            && entries.iter().filter(|e| e.owner == owner).count() >= MAX_VALUES_PER_OWNER
+        let network = origin.network();
+        if network.is_some()
+            && entries
+                .iter()
+                .filter(|e| e.origin.network() == network)
+                .count()
+                >= MAX_VALUES_PER_NETWORK
         {
-            return Err(Full::Owner);
+            return Err(Full::Network);
         }
         if entries.len() >= MAX_VALUES {
             return Err(Full::Name);
         }
         entries.push(Entry {
             value: value.to_owned(),
-            owner,
+            origin,
             expires,
         });
         Ok(())
@@ -323,13 +368,17 @@ struct Body {
 }
 
 /// What the API adds to the body when it forwards a change to the name
-/// servers. Only name servers read it, never the public API.
+/// servers, see [`Origin`]. Only name servers read it, never the public
+/// API. Unknown fields are ignored, so a name server from v0.5.0 takes
+/// changes from a newer API.
 #[derive(Deserialize)]
 struct Forwarded {
-    /// The client network the change came from, which owns the value. An
-    /// API from before values had owners leaves it out.
+    /// Left out by an API from before values had owners.
     #[serde(default)]
     owner: Option<IpAddr>,
+    /// Left out by an API from v0.5.0 or older.
+    #[serde(default)]
+    network: Option<IpAddr>,
 }
 
 fn route(req: &Request) -> Result<Action, Response> {
@@ -377,11 +426,14 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
     Ok((name, body.value))
 }
 
-/// The owner the API sent with a change, see [`Forwarded`].
-fn owner(req: &Request) -> Result<Option<IpAddr>, Response> {
+/// Where the API says a change comes from, see [`Forwarded`].
+fn origin(req: &Request) -> Result<Origin, Response> {
     serde_json::from_slice::<Forwarded>(&req.body)
-        .map(|f| f.owner)
-        .map_err(|_| error(400, "owner must be an IP address"))
+        .map(|f| Origin {
+            owner: f.owner,
+            network: f.network,
+        })
+        .map_err(|_| error(400, "owner and network must be IP addresses"))
 }
 
 fn ok() -> Response {
@@ -454,17 +506,17 @@ impl Node {
         let action = route(&req).inspect_err(rejected)?;
         let zone = self.handler.zone();
         let (name, value) = parse(&req, &zone).inspect_err(rejected)?;
-        let owner = owner(&req).inspect_err(rejected)?;
+        let origin = origin(&req).inspect_err(rejected)?;
         match action {
             Action::Present => {
-                if let Err(full) = self.store.present(name, &value, owner) {
+                if let Err(full) = self.store.present(name, &value, origin) {
                     self.count(AcmeWrite::Rejected);
                     return Err(full.response());
                 }
             }
             // Removing nothing (a value this owner never published, or one
             // already gone) still succeeds, so cleanup can be retried.
-            Action::Cleanup => self.store.cleanup(&name, &value, owner),
+            Action::Cleanup => self.store.cleanup(&name, &value, origin),
         }
         self.count(AcmeWrite::Accepted);
         Ok(ok())
@@ -537,15 +589,18 @@ impl Api {
             return Err(error(429, "too many requests, slow down"));
         }
         let (name, value) = parse(&req, &self.zone)?;
-        // The value belongs to the client's network, grouped as for rate
-        // limiting, so only that network can clean it up again.
-        let owner = self.limiter.network(client);
+        // The value belongs to the client, so only it can clean the value
+        // up again; the caps count by its network, grouped as for rate
+        // limiting.
+        let owner = owner(client);
+        let network = self.limiter.network(client);
         // The ASCII form: `to_string` turns Punycode labels into Unicode,
         // which name servers would reject.
         let body = serde_json::json!({
             "fqdn": name.to_ascii(),
             "value": value,
             "owner": owner,
+            "network": network,
         })
         .to_string();
 
@@ -688,10 +743,22 @@ fn reply_ok(reply: &str) -> Option<bool> {
 fn too_many_values() -> String {
     format!(
         "this name already holds as many pending values as allowed \
-         ({MAX_VALUES_PER_OWNER} per client network, {MAX_VALUES} in all); \
+         ({MAX_VALUES_PER_NETWORK} per client network, {MAX_VALUES} in all); \
          clean up values you no longer need, or wait up to {} minutes for them to expire",
         LIFETIME.as_secs() / 60
     )
+}
+
+/// The owner of the values `client` presents: its IPv4 address, or its
+/// IPv6 /64. `client` is canonical, so IPv4-mapped addresses are IPv4.
+fn owner(client: IpAddr) -> IpAddr {
+    match client {
+        IpAddr::V4(_) => client,
+        IpAddr::V6(ip) => {
+            let mask = u128::MAX << (128 - IPV6_OWNER_PREFIX);
+            IpAddr::V6(Ipv6Addr::from(u128::from(ip) & mask))
+        }
+    }
 }
 
 /// The client's address: `X-Real-IP` when the request comes through a
@@ -719,9 +786,26 @@ mod tests {
         LowerName::new(&Name::from_ascii(s).unwrap())
     }
 
-    fn owner(s: &str) -> Option<IpAddr> {
-        Some(s.parse().unwrap())
+    /// A client as the API describes it: its address and its network.
+    fn client(owner: &str, network: &str) -> Origin {
+        Origin {
+            owner: Some(owner.parse().unwrap()),
+            network: Some(network.parse().unwrap()),
+        }
     }
+
+    /// A client as an API from v0.5.0 describes it: by its network alone.
+    fn old_client(network: &str) -> Origin {
+        Origin {
+            owner: Some(network.parse().unwrap()),
+            network: None,
+        }
+    }
+
+    const NOBODY: Origin = Origin {
+        owner: None,
+        network: None,
+    };
 
     #[test]
     fn private_addresses() {
@@ -754,6 +838,14 @@ mod tests {
     }
 
     #[test]
+    fn owners_are_addresses_or_ipv6_64s() {
+        let owner_of = |ip: &str| owner(ip.parse().unwrap()).to_string();
+        assert_eq!(owner_of("192.0.2.10"), "192.0.2.10");
+        assert_eq!(owner_of("2001:db8:1:2:3:4:5:6"), "2001:db8:1:2::");
+        assert_eq!(owner_of("2001:db8:1:2::99"), "2001:db8:1:2::");
+    }
+
+    #[test]
     fn challenge_values() {
         assert!(is_valid_value(VALUE));
         assert!(!is_valid_value(&VALUE[1..]));
@@ -776,7 +868,7 @@ mod tests {
     fn store_publishes_and_expires() {
         let store = Challenges::new();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        let me = owner("192.0.2.0");
+        let me = client("192.0.2.10", "192.0.2.0");
         let now = Instant::now();
         store.present_at(n.clone(), VALUE, me, now).unwrap();
         store.present_at(n.clone(), "b", me, now).unwrap();
@@ -800,13 +892,21 @@ mod tests {
     fn only_the_owner_cleans_up() {
         let store = Challenges::new();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        let (me, other) = (owner("192.0.2.0"), owner("198.51.100.0"));
+        let me = client("192.0.2.10", "192.0.2.0");
+        let other = client("198.51.100.7", "198.51.100.0");
         let now = Instant::now();
         store.present_at(n.clone(), VALUE, me, now).unwrap();
 
-        // Another network, or a write with no owner, removes nothing.
-        store.cleanup(&n, VALUE, other);
-        store.cleanup(&n, VALUE, None);
+        // A neighbour on the same network, another network, a write with
+        // no owner, or one with the network as the owner removes nothing.
+        for them in [
+            client("192.0.2.99", "192.0.2.0"),
+            other,
+            NOBODY,
+            old_client("192.0.2.0"),
+        ] {
+            store.cleanup(&n, VALUE, them);
+        }
         assert_eq!(store.values_at(&n, now), [VALUE]);
 
         // The same value from two owners is answered once and stays until
@@ -829,33 +929,81 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_VALUES {
             store
-                .present_at(n.clone(), &i.to_string(), None, now)
+                .present_at(n.clone(), &i.to_string(), NOBODY, now)
                 .unwrap();
         }
-        assert_eq!(store.present_at(n.clone(), "x", None, now), Err(Full::Name));
-        store.cleanup(&n, "0", owner("192.0.2.0"));
+        assert_eq!(
+            store.present_at(n.clone(), "x", NOBODY, now),
+            Err(Full::Name)
+        );
+        store.cleanup(&n, "0", old_client("192.0.2.0"));
+        store.cleanup(&n, "0", client("192.0.2.10", "192.0.2.0"));
         assert_eq!(store.len_at(now), MAX_VALUES);
-        store.cleanup(&n, "0", None);
+        store.cleanup(&n, "0", NOBODY);
         assert_eq!(store.len_at(now), MAX_VALUES - 1);
+    }
+
+    #[test]
+    fn values_from_an_old_api_belong_to_the_network() {
+        // An API from v0.5.0 sends the client's network as the owner and no
+        // network: the caps count by that owner, and its cleanups remove
+        // what it presented.
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let now = Instant::now();
+        let old = old_client("192.0.2.0");
+        store.present_at(n.clone(), "a", old, now).unwrap();
+        store.present_at(n.clone(), "b", old, now).unwrap();
+        assert_eq!(
+            store.present_at(n.clone(), "c", old, now),
+            Err(Full::Network)
+        );
+        // The new API counts that client's network the same way.
+        let me = client("192.0.2.10", "192.0.2.0");
+        assert_eq!(
+            store.present_at(n.clone(), "c", me, now),
+            Err(Full::Network)
+        );
+
+        store.cleanup(&n, "a", old);
+        assert_eq!(store.values_at(&n, now), ["b"]);
+        // Once the API is upgraded, a client on that network can still take
+        // down what it presented before: those values never had an address.
+        store.cleanup(&n, "b", client("192.0.2.99", "192.0.2.0"));
+        assert!(store.values_at(&n, now).is_empty());
+
+        // Values the new API presented are not the network's.
+        store.present_at(n.clone(), "c", me, now).unwrap();
+        store.cleanup(&n, "c", old);
+        assert_eq!(store.values_at(&n, now), ["c"]);
     }
 
     #[test]
     fn live_values_are_never_pushed_out() {
         let store = Challenges::new();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        let me = owner("192.0.2.0");
+        let me = client("192.0.2.10", "192.0.2.0");
         let now = Instant::now();
         store.present_at(n.clone(), "a", me, now).unwrap();
         store.present_at(n.clone(), "b", me, now).unwrap();
-        // A third value from the same network is refused...
-        assert_eq!(store.present_at(n.clone(), "c", me, now), Err(Full::Owner));
+        // A third value from the same network is refused, whichever
+        // address on it asks...
+        assert_eq!(
+            store.present_at(n.clone(), "c", me, now),
+            Err(Full::Network)
+        );
+        let neighbour = client("192.0.2.99", "192.0.2.0");
+        assert_eq!(
+            store.present_at(n.clone(), "c", neighbour, now),
+            Err(Full::Network)
+        );
         // ...but extending one it holds is fine.
         store.present_at(n.clone(), "a", me, now).unwrap();
         assert_eq!(store.values_at(&n, now), ["a", "b"]);
 
         // Other networks fill the name up to its cap.
-        for i in 1..MAX_VALUES / MAX_VALUES_PER_OWNER {
-            let them = owner(&format!("198.51.{i}.0"));
+        for i in 1..MAX_VALUES / MAX_VALUES_PER_NETWORK {
+            let them = client(&format!("198.51.{i}.1"), &format!("198.51.{i}.0"));
             for v in ["a", "b"] {
                 store
                     .present_at(n.clone(), &format!("{v}{i}"), them, now)
@@ -863,7 +1011,7 @@ mod tests {
             }
         }
         assert_eq!(store.len_at(now), MAX_VALUES);
-        let late = owner("203.0.113.0");
+        let late = client("203.0.113.1", "203.0.113.0");
         assert_eq!(store.present_at(n.clone(), "z", late, now), Err(Full::Name));
         assert_eq!(store.values_at(&n, now)[..2], ["a", "b"]);
 
@@ -880,16 +1028,16 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, None, now).unwrap();
+            store.present_at(n, VALUE, NOBODY, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
         assert_eq!(
-            store.present_at(extra.clone(), VALUE, None, now),
+            store.present_at(extra.clone(), VALUE, NOBODY, now),
             Err(Full::Store)
         );
         // Once the others expire there is room again.
         store
-            .present_at(extra, VALUE, None, now + LIFETIME)
+            .present_at(extra, VALUE, NOBODY, now + LIFETIME)
             .unwrap();
         assert_eq!(store.len_at(now + LIFETIME), 1);
     }
@@ -900,10 +1048,10 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, None, now).unwrap();
+            store.present_at(n, VALUE, NOBODY, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
-        let present = |at| store.present_at(extra.clone(), VALUE, None, at);
+        let present = |at| store.present_at(extra.clone(), VALUE, NOBODY, at);
         // Just before the others expire: a sweep finds nothing to forget.
         let swept = now + LIFETIME - Duration::from_millis(500);
         assert_eq!(present(swept), Err(Full::Store));
@@ -920,7 +1068,7 @@ mod tests {
         let store = Challenges::new();
         let now = Instant::now();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        store.present_at(n.clone(), VALUE, None, now).unwrap();
+        store.present_at(n.clone(), VALUE, NOBODY, now).unwrap();
         assert_eq!(store.len_at(now), 1);
         // Gone from the count as soon as DNS stops serving it, before any purge.
         assert_eq!(store.len_at(now + LIFETIME), 0);
