@@ -12,9 +12,10 @@
 # release's SHA256SUMS and installs it with a systemd unit per service:
 # ipssl-dns.service on a name server, ipssl-acme-api.service on the host
 # that runs the challenge API (v0.4.0 and later; it never starts the DNS
-# server). Both run the same binary, so every enabled service is checked
-# and restarted. A service that is not enabled is enabled only when its
-# flag is given, so an upgrade never starts a role this host gave up.
+# server). Both run the same binary, so every enabled or running service
+# is checked and restarted. A service that is not enabled is enabled only
+# when its flag is given, so an upgrade never starts a role this host gave
+# up, and one started by hand without being enabled stays disabled.
 #
 # On a first install it also puts the example config at
 # /etc/ipssl/config.toml and stops, so the config can be filled in before
@@ -140,12 +141,17 @@ healthy() {
 }
 
 # Puts the previous binary and units back after a failed upgrade, and
-# turns off the services this run enabled. With no previous binary (a
-# first install), the new files stay for debugging.
+# turns off the services this run enabled. A service that was running
+# before, enabled or not, is restarted on the previous binary. With no
+# previous binary (a first install), the new files stay for debugging.
 rollback() {
     for svc in $SERVICES; do
-        if ! has "$ENABLED" "$svc"; then
-            systemctl disable --quiet --now "$svc"
+        if has "$WANT" "$svc" && ! has "$ENABLED" "$svc"; then
+            if has "$ACTIVE" "$svc"; then
+                systemctl disable --quiet "$svc"
+            else
+                systemctl disable --quiet --now "$svc"
+            fi
         fi
     done
     if [ ! -f "$OLD/ipssl-dns" ]; then
@@ -163,7 +169,8 @@ rollback() {
         fi
     done
     systemctl daemon-reload
-    for svc in $ENABLED; do
+    for svc in $SERVICES; do
+        has "$ENABLED" "$svc" || has "$ACTIVE" "$svc" || continue
         systemctl restart "$svc"
         if healthy "$svc"; then
             echo "install.sh: $svc is running $OLD_VERSION again" >&2
@@ -200,6 +207,7 @@ STAGE=""
 LOCK_DIR=""
 SERVICES=""
 ENABLED=""
+ACTIVE=""
 trap on_exit EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
@@ -215,13 +223,18 @@ else
 fi
 
 # The roles this host runs are the services that are enabled, not the
-# unit files that exist: a role that was given up keeps its unit file.
+# unit files that exist: a role that was given up keeps its unit file. A
+# service that runs without being enabled (started by hand) uses the same
+# binary, so it is restarted too, but left disabled.
 for svc in $ALL_SERVICES; do
     if systemctl is-enabled --quiet "$svc" 2> /dev/null; then
         ENABLED="$ENABLED $svc"
     fi
+    if systemctl is-active --quiet "$svc" 2> /dev/null; then
+        ACTIVE="$ACTIVE $svc"
+    fi
 done
-if [ -z "$WANT$ENABLED" ]; then
+if [ -z "$WANT$ENABLED$ACTIVE" ]; then
     installed=""
     for svc in $ALL_SERVICES; do
         if [ -f "$UNIT_DIR/$svc.service" ]; then
@@ -237,13 +250,23 @@ fi
 for svc in $ALL_SERVICES; do
     if has "$WANT" "$svc" || has "$ENABLED" "$svc"; then
         SERVICES="$SERVICES $svc"
+    elif has "$ACTIVE" "$svc"; then
+        echo "$svc is running but not enabled: it will be restarted on the new binary and stay disabled"
+        SERVICES="$SERVICES $svc"
     fi
 done
 SERVICES=${SERVICES# }
 ENABLED=${ENABLED# }
+ACTIVE=${ACTIVE# }
 
-if [ ! -f "$CONFIG" ] && [ -n "$ENABLED" ]; then
-    die "$CONFIG is missing but $ENABLED is enabled; put the config back first"
+if [ ! -f "$CONFIG" ]; then
+    running=""
+    for svc in $SERVICES; do
+        if has "$ENABLED" "$svc" || has "$ACTIVE" "$svc"; then
+            running="$running $svc"
+        fi
+    done
+    [ -z "$running" ] || die "$CONFIG is missing, but this host runs$running; put the config back first"
 fi
 
 case "$(uname -m)" in
@@ -262,10 +285,13 @@ case "$VERSION" in
     *) die "unexpected version '$VERSION'" ;;
 esac
 
-# How to run this again for the same services and release.
+# How to run this again for the same services and release. A service that
+# runs without being enabled gets no flag, which would enable it.
 RERUN="sudo sh install.sh"
 for svc in $SERVICES; do
-    RERUN="$RERUN $(flag_for "$svc")"
+    if has "$WANT" "$svc" || has "$ENABLED" "$svc"; then
+        RERUN="$RERUN $(flag_for "$svc")"
+    fi
 done
 RERUN="$RERUN $VERSION"
 
@@ -352,7 +378,7 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 for svc in $SERVICES; do
-    if ! has "$ENABLED" "$svc"; then
+    if has "$WANT" "$svc" && ! has "$ENABLED" "$svc"; then
         systemctl enable --quiet "$svc"
     fi
 done

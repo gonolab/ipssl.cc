@@ -176,11 +176,11 @@ sudo sh install.sh
 
 On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then run the command it prints (`sudo sh install.sh --dns` with the version), which checks the config and starts the service. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away. It refuses to start while the config is still the unchanged example, or while any line outside comments and `blocklist` holds a documentation address (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` or `2001:db8::/32`), as the example config of every release does. For a lab that uses those networks on purpose, run it as `sudo env IPSSL_ALLOW_DOC_ADDRESSES=1 sh install.sh` with the usual arguments.
 
-Run the script again to upgrade, optionally with a version such as `v0.4.0`. It upgrades every ipssl service enabled on the host, since they share the binary:
+Run the script again to upgrade, optionally with a version such as `v0.4.0`. It upgrades every ipssl service that is enabled or running on the host, since they share the binary:
 
 - Before replacing anything, it checks the config with the new binary as an unprivileged user, the way the services read it. Keep the config readable by everyone (mode 644).
 - It restarts the services, and puts the previous binary and units back if one does not stay up.
-- It enables a service only when asked to: `--dns` for the name server, `--acme-api` for the DNS-01 challenge API (see [step 7](#7-dns-01-challenge-api-optional)). A service that was disabled stays disabled.
+- It enables a service only when asked to: `--dns` for the name server, `--acme-api` for the DNS-01 challenge API (see [step 7](#7-dns-01-challenge-api-optional)). A service that was disabled stays disabled. One that was started by hand without being enabled is restarted on the new binary, and on the previous one after a failed upgrade, but is not enabled.
 
 To do it by hand, download a static Linux build from [Releases](https://github.com/gonolab/ipssl.cc/releases) and check it:
 
