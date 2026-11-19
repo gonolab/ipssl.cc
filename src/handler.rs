@@ -9,7 +9,6 @@ use hickory_server::net::runtime::Time;
 use hickory_server::net::xfer::Protocol;
 use hickory_server::proto::op::{Edns, Header, HeaderCounts, Metadata, OpCode, ResponseCode};
 use hickory_server::proto::rr::{DNSClass, LowerName, Name, Record, RecordType};
-use hickory_server::proto::serialize::binary::{BinEncodable, BinEncoder};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::{MessageResponse, MessageResponseBuilder};
 use tracing::{debug, warn};
@@ -17,7 +16,7 @@ use tracing::{debug, warn};
 use crate::acme::Challenges;
 use crate::metrics::{Gauges, Limited, Metrics};
 use crate::ratelimit::{RateLimiter, Verdict};
-use crate::zone::{Answer, Zone};
+use crate::zone::{Answer, Zone, message_len};
 
 /// Largest UDP response we send, per the DNS Flag Day 2020 recommendation.
 /// Keeps responses below common MTUs, so they are not fragmented.
@@ -176,7 +175,7 @@ impl RequestHandler for Handler {
             _ => usize::from(u16::MAX),
         };
         let fits = |records: &[&Record]| {
-            encoded_len(request.queries.as_bytes(), records, response_edns.as_ref())
+            message_len(request.queries.as_bytes(), records, response_edns.as_ref())
                 .is_some_and(|len| len <= limit)
         };
         let mut records: Vec<&Record> = answer.answers.iter().chain(&answer.soa).collect();
@@ -221,26 +220,6 @@ impl RequestHandler for Handler {
     }
 }
 
-/// Size of the response hickory would send: the header, the question copied
-/// as the client sent it, the records (answers, authority, additionals, in
-/// that order) and the OPT record. hickory copies the question verbatim, so
-/// record names only compress against each other. `None` if a record cannot
-/// be encoded at all.
-fn encoded_len(question: &[u8], records: &[&Record], edns: Option<&Edns>) -> Option<usize> {
-    const HEADER_LEN: usize = 12;
-    let mut buf = Vec::with_capacity(512);
-    let mut encoder = BinEncoder::new(&mut buf);
-    encoder.emit_vec(&[0; HEADER_LEN]).ok()?;
-    encoder.emit_vec(question).ok()?;
-    for record in records {
-        record.emit(&mut encoder).ok()?;
-    }
-    if let Some(edns) = edns {
-        Record::from(edns).emit(&mut encoder).ok()?;
-    }
-    Some(encoder.offset())
-}
-
 /// Sends `response` and counts it. If sending fails, the returned info
 /// carries SERVFAIL.
 async fn send<'a, R: ResponseHandler>(
@@ -269,6 +248,103 @@ async fn send<'a, R: ResponseHandler>(
                 metadata,
                 counts: HeaderCounts::default(),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use hickory_server::proto::op::{MessageType, Query};
+    use hickory_server::proto::serialize::binary::{BinDecoder, BinEncodable, BinEncoder};
+    use hickory_server::zone_handler::Queries;
+
+    const BASE: &str = r#"
+        domain = "ipssl.cc"
+
+        [[nameservers]]
+        name = "ns1.ipssl.cc"
+        ipv4 = ["198.51.100.1"]
+
+        [soa]
+        email = "hostmaster@ipssl.cc"
+    "#;
+
+    /// A zone whose `m.ipssl.cc` has `outside` MX records for names outside
+    /// the zone, then `inside` for fixed hosts with two addresses each.
+    fn mx_zone(outside: usize, inside: usize) -> Zone {
+        let mut config = format!("{BASE}\n[hosts.m]\nmx = [");
+        for i in 0..outside {
+            config += &format!("{{ preference = 1, exchange = \"q.r{i}.s{i}\" }}, ");
+        }
+        for i in 0..inside {
+            config += &format!("{{ preference = 2, exchange = \"t{i}.ipssl.cc\" }}, ");
+        }
+        config += "]\n";
+        for i in 0..inside {
+            config += &format!(
+                "[hosts.t{i}]\na = [\"198.51.100.{n}\"]\naaaa = [\"2001:db8::{n}\"]\n",
+                n = i + 1
+            );
+        }
+        Zone::from_config(&Config::parse(&config).unwrap()).unwrap()
+    }
+
+    /// The size of the message hickory writes for `answer`.
+    fn written_len(question: &[u8], answer: &Answer, edns: Option<&Edns>) -> usize {
+        let queries = Queries::read(&mut BinDecoder::new(question), 1).unwrap();
+        let metadata = Metadata::new(1, MessageType::Response, OpCode::Query);
+        let response = MessageResponseBuilder::new(&queries, edns).build(
+            metadata,
+            answer.answers.iter(),
+            iter::empty(),
+            answer.soa.iter(),
+            answer.additionals.iter(),
+        );
+        let mut buf = Vec::new();
+        response
+            .destructive_emit(&mut BinEncoder::new(&mut buf))
+            .unwrap();
+        buf.len()
+    }
+
+    #[test]
+    fn size_estimate_matches_what_hickory_writes() {
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        // Around the encoder's 64 name compression candidates, and past
+        // offset 0x3FFF, from which it stores no more of them.
+        let cases = (0..=40)
+            .step_by(2)
+            .flat_map(|outside| (0..=3).map(move |inside| (outside, inside)))
+            .chain([(700, 0), (700, 3)]);
+        for (outside, inside) in cases {
+            let zone = mx_zone(outside, inside);
+            for qname in ["m.ipssl.cc.", "M.IPSSL.cc.", "nothing.ipssl.cc."] {
+                let name = Name::from_ascii(qname).unwrap();
+                let answer = zone.resolve(
+                    &name,
+                    RecordType::MX,
+                    DNSClass::IN,
+                    IpAddr::from([0, 0, 0, 0]),
+                );
+                let question = Query::query(name, RecordType::MX).to_bytes().unwrap();
+                let records: Vec<&Record> = answer
+                    .answers
+                    .iter()
+                    .chain(&answer.soa)
+                    .chain(&answer.additionals)
+                    .collect();
+                for edns in [None, Some(&edns)] {
+                    assert_eq!(
+                        message_len(&question, &records, edns),
+                        Some(written_len(&question, &answer, edns)),
+                        "{outside} outside, {inside} inside, {qname}, edns {}",
+                        edns.is_some()
+                    );
+                }
+            }
         }
     }
 }

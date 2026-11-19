@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 use anyhow::{Context, Result, bail, ensure};
-use hickory_server::proto::op::ResponseCode;
+use hickory_server::proto::op::{Edns, Query, ResponseCode};
 use hickory_server::proto::rr::rdata::{A, AAAA, CAA, MX, NS, SOA, TXT};
 use hickory_server::proto::rr::{DNSClass, LowerName, Name, RData, Record, RecordType};
 use hickory_server::proto::serialize::binary::{BinEncodable, BinEncoder};
@@ -724,12 +724,6 @@ fn check_sizes(records: &[Record]) -> Result<()> {
 /// options, laid out the way the handler sends it. `None` if a record
 /// cannot be encoded at all.
 fn response_len(owner: &Name, records: &[&Record]) -> Option<usize> {
-    const HEADER_LEN: usize = 12;
-    const OPT_LEN: usize = 11;
-    // The name as the client sent it, then type and class.
-    let question_len = owner.to_bytes().ok()?.len() + 4;
-    let mut buf = Vec::new();
-    let mut encoder = BinEncoder::new(&mut buf);
     for record in records {
         // `Record::emit` panics on RDATA longer than its 16-bit length
         // field, so measure the RDATA on its own first.
@@ -738,9 +732,42 @@ fn response_len(owner: &Name, records: &[&Record]) -> Option<usize> {
         if rdata.len() > usize::from(u16::MAX) {
             return None;
         }
+    }
+    let rtype = records.first().map_or(RecordType::A, |r| r.record_type());
+    let question = Query::query(owner.clone(), rtype).to_bytes().ok()?;
+    message_len(&question, records, Some(&Edns::new()))
+}
+
+/// Size of the message hickory writes for a response: the header, the
+/// question section `question` copied as the client sent it, `records`
+/// (answers, authority and additionals, in that order) and the OPT record
+/// for `edns`. `None` if a record cannot be encoded.
+///
+/// This lays the message out the way hickory 0.26 does, so the size comes
+/// out exact, compression included. hickory also keeps the whole question
+/// section as a compression candidate. No record name matches it, since it
+/// ends in type and class, but it takes one of the encoder's 64 candidate
+/// slots, so later names may find no slot. It is stored here too.
+pub(crate) fn message_len(
+    question: &[u8],
+    records: &[&Record],
+    edns: Option<&Edns>,
+) -> Option<usize> {
+    const HEADER_LEN: usize = 12;
+    let mut buf = Vec::with_capacity(512);
+    let mut encoder = BinEncoder::new(&mut buf);
+    encoder.emit_vec(&[0; HEADER_LEN]).ok()?;
+    encoder.emit_vec(question).ok()?;
+    if !question.is_empty() {
+        encoder.store_label_pointer(HEADER_LEN, HEADER_LEN + question.len());
+    }
+    for record in records {
         record.emit(&mut encoder).ok()?;
     }
-    Some(HEADER_LEN + question_len + encoder.offset() + OPT_LEN)
+    if let Some(edns) = edns {
+        Record::from(edns).emit(&mut encoder).ok()?;
+    }
+    Some(encoder.offset())
 }
 
 /// Maximum length of one DNS character-string (RFC 1035 section 3.3).

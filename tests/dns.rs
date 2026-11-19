@@ -339,6 +339,57 @@ async fn additionals_that_do_not_fit_are_left_out() {
 }
 
 #[tokio::test]
+async fn responses_stay_whole_at_every_buffer_size() {
+    // Twenty MX targets outside the zone fill most of hickory's 64 name
+    // compression candidates, and the in-zone target's address fits or not
+    // depending on the client's buffer. The smallest buffers cannot even
+    // take the answer. At no size may the response lose its OPT record or
+    // carry stray bytes, and only a cleanly truncated one may set TC.
+    let mut config = format!("{EXAMPLE_CONFIG}\n[hosts.m]\nmx = [");
+    for i in 0..20u8 {
+        let l = char::from(b'a' + i);
+        config += &format!("{{ preference = {i}, exchange = \"q.r{l}.s{l}\" }}, ");
+    }
+    config +=
+        "{ preference = 99, exchange = \"t.ipssl.cc\" }]\n[hosts.t]\na = [\"198.51.100.9\"]\n";
+    // Without rate limiting: this sends more queries than one burst.
+    let server = start_with_limiter(Config::parse(&config).unwrap(), None);
+    // Truncated, answered without the address, answered with it.
+    let mut seen = [0; 3];
+    for payload in 512..=700u16 {
+        let mut req = query("m.ipssl.cc.", RecordType::MX);
+        let mut edns = Edns::new();
+        edns.set_max_payload(payload);
+        req.set_edns(edns);
+        let bytes = raw_udp(server.udp, &req).await;
+        assert!(bytes.len() <= usize::from(payload), "{payload}");
+        let mut decoder = BinDecoder::new(&bytes);
+        let resp = Message::read(&mut decoder).unwrap();
+        assert!(
+            decoder.is_empty(),
+            "{payload}: {} bytes left over",
+            decoder.len()
+        );
+        assert!(resp.edns.is_some(), "{payload}");
+        if resp.metadata.truncation {
+            assert!(
+                resp.answers.is_empty() && resp.additionals.is_empty(),
+                "{payload}"
+            );
+            seen[0] += 1;
+        } else if resp.additionals.is_empty() {
+            assert_eq!(resp.answers.len(), 21, "{payload}");
+            seen[1] += 1;
+        } else {
+            assert_eq!(resp.answers.len(), 21, "{payload}");
+            assert_eq!(additionals(&resp), ["t.ipssl.cc. A 198.51.100.9"]);
+            seen[2] += 1;
+        }
+    }
+    assert!(seen.iter().all(|n| *n > 0), "{seen:?}");
+}
+
+#[tokio::test]
 async fn names_without_records_are_nodata() {
     // Resolvers that minimise queries ask for `1.ipssl.cc` on the way to
     // `10.0.0.1.ipssl.cc`; an NXDOMAIN there would stop them short.
