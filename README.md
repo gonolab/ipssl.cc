@@ -463,7 +463,7 @@ Bump the `?v=` query on the stylesheet and script links in the HTML files so bro
 
 ## FAQ
 
-**Private IPs don't resolve?** Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers pointing to private addresses. Allowlist this domain there, or use a public resolver.
+**Private IPs don't resolve?** Many routers (OpenWrt, pfSense, dnsmasq, Fritz!Box and others) have DNS rebinding protection, which drops answers pointing to private addresses. Allow only the names you use there, for example `rebind-domain-ok=/192-168-1-10.ipssl.cc/` in dnsmasq. Don't allow the whole domain: a CNAME from any other domain to a LAN name under `ipssl.cc` would then pass the filter, for every client of that resolver. Or use a public resolver, or DNS over HTTPS on just the machine that needs the name.
 
 **Why not hand out a wildcard certificate?** Publishing a private key breaks the CA's subscriber agreement, and anyone holding the key can revoke the certificate. Get a certificate on your own server instead (see [HTTPS certificates](#https-certificates)).
 
@@ -482,6 +482,8 @@ git push origin v0.5.0
 ```
 
 The [release workflow](.github/workflows/release.yml) checks that the tag matches `Cargo.toml`, checks the code with the minimum Rust version, runs the tests on x86_64 and aarch64, and builds static musl binaries. It publishes them with a `SHA256SUMS` file only if the tag still points at the commit it built. Tags with a suffix, such as `v0.3.0-rc.1`, become pre-releases; build metadata after a `+` does not count.
+
+A tag could still move between that check and the release, so the repository protects its `v*` tags with a GitHub tag ruleset: restrict updates, restrict deletions and block force pushes, with no bypass list. A fork that publishes its own releases should set up the same. A wrong tag then needs a new version rather than a moved tag.
 
 ## Roadmap
 
