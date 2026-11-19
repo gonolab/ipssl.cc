@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         let store = Arc::new(Challenges::new());
         handler = handler.with_challenges(store.clone());
         tokio::spawn(purge_challenges(store.clone()));
-        let node = Node::new(handler.clone(), store, &acme.writers);
+        let node = Node::from_config(handler.clone(), store, acme)?;
         tokio::spawn(node.serve(listener));
     }
 

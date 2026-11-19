@@ -1,12 +1,14 @@
 //! TOML configuration. See `config.example.toml` for a documented example.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use data_encoding::{BASE64, BASE64_NOPAD, BASE64URL, BASE64URL_NOPAD, HEXLOWER_PERMISSIVE};
 use ipnet::IpNet;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,12 +85,92 @@ pub struct AcmeConfig {
     /// API requests a client network may make at once.
     #[serde(default = "default_acme_burst")]
     pub burst: u32,
+    /// Shared secret that signs every write from the API to the name
+    /// servers and every answer to it, see [`crate::acme`]. With a key, a
+    /// name server takes only signed writes, and the API trusts only
+    /// signed answers (but see `allow_unsigned_nodes`).
+    #[serde(default)]
+    pub key: Option<AcmeKey>,
+    /// API only, while `key` is being rolled out: also trust unsigned
+    /// answers, from name servers that do not have the key yet. A wrongly
+    /// signed answer is never trusted.
+    #[serde(default)]
+    pub allow_unsigned_nodes: bool,
+}
+
+/// Fewest bytes `acme.key` may have: as many as the SHA-256 output.
+pub const MIN_KEY_BYTES: usize = 32;
+
+/// The secret in `acme.key`, given as hex or base64.
+///
+/// It is decoded as the config is read, but a bad key is reported only by
+/// [`Config::validate`] and [`Config::validate_acme_api`]: a parse error
+/// would quote the line it is on. `Debug` never shows it either.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcmeKey(std::result::Result<Vec<u8>, KeyProblem>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyProblem {
+    Encoding,
+    Short(usize),
+}
+
+impl AcmeKey {
+    /// Decodes `text`: hex if it is hex digits only, otherwise base64,
+    /// standard or URL-safe, with or without padding.
+    pub fn decode(text: &str) -> Self {
+        let text = text.trim().as_bytes();
+        let hex = !text.is_empty()
+            && text.len().is_multiple_of(2)
+            && text.iter().all(u8::is_ascii_hexdigit);
+        let bytes = if hex {
+            HEXLOWER_PERMISSIVE.decode(text).ok()
+        } else {
+            [&BASE64, &BASE64_NOPAD, &BASE64URL, &BASE64URL_NOPAD]
+                .iter()
+                .find_map(|encoding| encoding.decode(text).ok())
+        };
+        Self(match bytes {
+            None => Err(KeyProblem::Encoding),
+            Some(bytes) if bytes.len() < MIN_KEY_BYTES => Err(KeyProblem::Short(bytes.len())),
+            Some(bytes) => Ok(bytes),
+        })
+    }
+
+    /// The key's bytes, or why it cannot be used.
+    pub fn bytes(&self) -> Result<&[u8]> {
+        match &self.0 {
+            Ok(bytes) => Ok(bytes),
+            Err(KeyProblem::Encoding) => bail!(
+                "acme.key must be hex or base64; create one with `openssl rand -hex {MIN_KEY_BYTES}`"
+            ),
+            Err(KeyProblem::Short(n)) => bail!(
+                "acme.key has {n} bytes, but needs at least {MIN_KEY_BYTES}; create one with \
+                 `openssl rand -hex {MIN_KEY_BYTES}`"
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for AcmeKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AcmeKey(..)")
+    }
+}
+
+impl<'de> Deserialize<'de> for AcmeKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|text| Self::decode(&text))
+    }
 }
 
 impl AcmeConfig {
-    /// Write endpoints of every name server, as the API reaches them:
-    /// `nodes` when set (each endpoint once), otherwise each name server's
-    /// first address on the `listen` port.
+    /// Write endpoints of every name server, as the API reaches them, each
+    /// once: `nodes` when set, otherwise each name server's first address
+    /// on the `listen` port. Name servers that share an address (one host
+    /// serving several names) share an endpoint. A name server with a key
+    /// takes each signed write once, so the same endpoint twice would fail
+    /// every change.
     ///
     /// The address has to be of the family `listen` accepts: IPv6 listeners
     /// are IPv6-only (see [`crate::bind_tcp`]), so `[::]:8053` cannot be
@@ -98,17 +180,10 @@ impl AcmeConfig {
     /// report success without it while the CA may still ask it.
     pub fn node_addrs(&self, nameservers: &[NameServer]) -> Result<Vec<SocketAddr>> {
         if !self.nodes.is_empty() {
-            // An endpoint listed twice would only get every change twice.
-            let mut nodes = Vec::with_capacity(self.nodes.len());
-            for node in &self.nodes {
-                if !nodes.contains(node) {
-                    nodes.push(*node);
-                }
-            }
-            return Ok(nodes);
+            return Ok(unique(self.nodes.iter().copied()));
         }
         let port = self.listen.port();
-        nameservers
+        let nodes: Result<Vec<_>> = nameservers
             .iter()
             .map(|ns| {
                 let ip = if self.listen.is_ipv4() {
@@ -130,8 +205,20 @@ impl AcmeConfig {
                     )
                 })
             })
-            .collect()
+            .collect();
+        Ok(unique(nodes?))
     }
+}
+
+/// `addrs` without repeats, in their order.
+fn unique(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut unique = Vec::new();
+    for addr in addrs {
+        if !unique.contains(&addr) {
+            unique.push(addr);
+        }
+    }
+    unique
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -326,6 +413,11 @@ impl Config {
             );
         }
         self.check_tcp_overlaps()?;
+        if let Some(acme) = &self.acme
+            && let Some(key) = &acme.key
+        {
+            key.bytes()?;
+        }
         self.rate_limit.validate()
     }
 
@@ -340,6 +432,9 @@ impl Config {
             acme.requests_per_minute >= 1 && acme.burst >= 1,
             "acme.requests_per_minute and acme.burst must be at least 1"
         );
+        if let Some(key) = &acme.key {
+            key.bytes()?;
+        }
         // The API groups and tracks clients the way the DNS server does.
         self.rate_limit.validate_networks()?;
         let nodes = acme.node_addrs(&self.nameservers)?;
@@ -381,6 +476,22 @@ impl Config {
                 nodes.len(),
                 self.nameservers.len()
             ));
+        }
+        match (&acme.key, acme.allow_unsigned_nodes) {
+            (None, false) => warnings.push(
+                "acme.key is not set, so nothing proves that writes to the name servers, \
+                 or their answers, are genuine"
+                    .to_owned(),
+            ),
+            (None, true) => {
+                warnings.push("acme.allow_unsigned_nodes does nothing without acme.key".to_owned());
+            }
+            (Some(_), true) => warnings.push(
+                "acme.allow_unsigned_nodes is on, so unsigned answers from name servers are \
+                 trusted; remove it once every name server has acme.key"
+                    .to_owned(),
+            ),
+            (Some(_), false) => {}
         }
         warnings
     }
@@ -706,6 +817,13 @@ mod tests {
         email = "hostmaster@ipssl.cc"
     "#;
 
+    /// The warnings about `acme.nodes`.
+    fn node_warnings(config: &Config) -> Vec<String> {
+        let mut warnings = config.acme_api_warnings();
+        warnings.retain(|w| w.contains("acme.nodes"));
+        warnings
+    }
+
     fn nodes(config: &Config) -> Result<Vec<String>> {
         let acme = config.acme.as_ref().unwrap();
         let addrs = acme.node_addrs(&config.nameservers)?;
@@ -744,7 +862,7 @@ mod tests {
             ["127.0.0.1:9000", "127.0.0.1:9001"]
         );
         config.validate_acme_api().unwrap();
-        assert!(config.acme_api_warnings().is_empty());
+        assert!(node_warnings(&config).is_empty());
     }
 
     #[test]
@@ -779,7 +897,7 @@ mod tests {
 
         let both = config(&two, "\"198.51.100.1:8053\", \"198.51.100.2:8053\"");
         both.validate_acme_api().unwrap();
-        assert!(both.acme_api_warnings().is_empty());
+        assert!(node_warnings(&both).is_empty());
 
         // Two names served by one host share its endpoint: allowed, with a
         // warning in case the shared address is a typo.
@@ -791,7 +909,7 @@ mod tests {
         );
         let config_shared = config(&shared, "\"198.51.100.1:8053\", \"198.51.100.3:8053\"");
         config_shared.validate_acme_api().unwrap();
-        let warnings = config_shared.acme_api_warnings();
+        let warnings = node_warnings(&config_shared);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("2 write endpoint(s) for 3 name servers"));
         assert!(
@@ -808,14 +926,18 @@ mod tests {
         let two_nodes = config(&outside, "\"198.51.100.1:8053\", \"192.0.2.1:8053\"");
         assert!(two_nodes.validate_acme_api().is_err());
 
-        // The derived list stays as it was: one endpoint per name server.
+        // The derived list needs no check: it has an endpoint for every
+        // name server, one for each host.
         let derived = Config::parse(&format!(
             "domain = \"ipssl.cc\"\n{shared}\n[soa]\nemail = \"hostmaster@ipssl.cc\"\n[acme]\n"
         ))
         .unwrap();
-        assert_eq!(nodes(&derived).unwrap().len(), 3);
+        assert_eq!(
+            nodes(&derived).unwrap(),
+            ["198.51.100.1:8053", "198.51.100.3:8053"]
+        );
         derived.validate_acme_api().unwrap();
-        assert!(derived.acme_api_warnings().is_empty());
+        assert!(node_warnings(&derived).is_empty());
     }
 
     #[test]
@@ -829,5 +951,75 @@ mod tests {
         let error = err(config.validate_acme_api());
         assert!(error.contains("ns.example.net"), "{error}");
         assert!(error.contains("acme.nodes"), "{error}");
+    }
+
+    const HEX_KEY: &str = "4f1c0e5b9a7d3e2f6a8b1c4d7e0f2a3b5c6d8e9f0a1b2c3d4e5f60718293a4b5";
+
+    fn with_key(key: &str, extra: &str) -> Config {
+        let text =
+            format!("{MINIMAL}\n[acme]\nnodes = [\"127.0.0.1:8053\"]\nkey = \"{key}\"\n{extra}");
+        Config::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn acme_key_is_hex_or_base64() {
+        let bytes = HEXLOWER_PERMISSIVE.decode(HEX_KEY.as_bytes()).unwrap();
+        for text in [
+            HEX_KEY.to_owned(),
+            HEX_KEY.to_ascii_uppercase(),
+            BASE64.encode(&bytes),
+            BASE64_NOPAD.encode(&bytes),
+            BASE64URL.encode(&bytes),
+            format!(" {} ", BASE64.encode(&bytes)),
+        ] {
+            assert_eq!(AcmeKey::decode(&text).bytes().unwrap(), bytes, "{text}");
+            let config = with_key(&text, "");
+            config.validate().unwrap();
+            config.validate_acme_api().unwrap();
+        }
+        // 48 random bytes in base64 are 64 characters: base64, not hex.
+        let long = BASE64.encode(&[0xfb; 48]);
+        assert_eq!(AcmeKey::decode(&long).bytes().unwrap(), [0xfb; 48]);
+    }
+
+    #[test]
+    fn bad_acme_keys_are_reported_without_the_key() {
+        let short = &HEX_KEY[..62];
+        let bad = "not a key at all, not hex and not base64!";
+        for (key, problem) in [
+            (short, "has 31 bytes"),
+            (bad, "hex or base64"),
+            ("", "has 0 bytes"),
+        ] {
+            // Parsing works, so the parser cannot quote the line.
+            let config = with_key(key, "");
+            for error in [err(config.validate()), err(config.validate_acme_api())] {
+                assert!(error.contains(problem), "{error}");
+                assert!(key.is_empty() || !error.contains(key), "{error}");
+            }
+        }
+        let debug = format!("{:?}", with_key(HEX_KEY, "").acme);
+        assert!(
+            !debug.contains(HEX_KEY) && !debug.contains("79, 28"),
+            "{debug}"
+        );
+        assert!(debug.contains("AcmeKey(..)"), "{debug}");
+    }
+
+    #[test]
+    fn acme_api_warns_about_its_key_settings() {
+        let warnings = |config: &Config| {
+            let mut warnings = config.acme_api_warnings();
+            warnings.retain(|w| w.contains("acme.key") || w.contains("allow_unsigned"));
+            warnings
+        };
+        let keyless = Config::parse(&format!(
+            "{MINIMAL}\n[acme]\nnodes = [\"127.0.0.1:8053\"]\n"
+        ))
+        .unwrap();
+        assert!(warnings(&keyless)[0].contains("acme.key is not set"));
+        assert!(warnings(&with_key(HEX_KEY, "")).is_empty());
+        let rollout = with_key(HEX_KEY, "allow_unsigned_nodes = true\n");
+        assert!(warnings(&rollout)[0].contains("remove it once every name server has acme.key"));
     }
 }

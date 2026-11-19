@@ -63,18 +63,42 @@ pub struct Request {
 }
 
 impl Request {
-    /// The first header called `name` (lowercase).
+    /// A request as the server reads it, header names in lowercase.
+    pub fn new(
+        method: &str,
+        path: &str,
+        peer: SocketAddr,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            peer,
+            headers,
+            body,
+        }
+    }
+
+    /// The first header called `name`, in any case.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
+        header(&self.headers, name)
     }
 }
 
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
+    /// Headers besides `Content-Type`, `Content-Length` and `Connection`.
+    pub headers: Vec<(&'static str, String)>,
     pub body: String,
 }
 
@@ -83,8 +107,15 @@ impl Response {
         Self {
             status,
             content_type,
+            headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// Adds a header. `value` must not contain line breaks.
+    pub fn with_header(mut self, name: &'static str, value: String) -> Self {
+        self.headers.push((name, value));
+        self
     }
 
     pub fn text(status: u16, body: &str) -> Self {
@@ -338,13 +369,17 @@ async fn read_request(
 }
 
 async fn write_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         response.status,
         reason(response.status),
         response.content_type,
         response.body.len()
     );
+    for (name, value) in &response.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(response.body.as_bytes()).await?;
     stream.shutdown().await
@@ -354,6 +389,7 @@ fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -366,14 +402,48 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// A response as the client reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub status: u16,
+    /// Header names in lowercase.
+    headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Reply {
+    /// The first header called `name`, in any case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header(&self.headers, name)
+    }
+}
+
 /// Sends a POST with a JSON `body` to `addr` and returns the status code
 /// and the response body. The caller sets the deadline.
 pub async fn post_json(addr: SocketAddr, path: &str, body: &str) -> io::Result<(u16, String)> {
+    let reply = post(addr, path, &[], body).await?;
+    Ok((reply.status, reply.body))
+}
+
+/// Sends a POST with a JSON `body` and the extra `headers` to `addr`, and
+/// returns the response. Header values must not contain line breaks. The
+/// caller sets the deadline.
+pub async fn post(
+    addr: SocketAddr,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &str,
+) -> io::Result<Reply> {
     let mut stream = TcpStream::connect(addr).await?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).await?;
 
     let mut response = Vec::new();
@@ -383,16 +453,26 @@ pub async fn post_json(addr: SocketAddr, path: &str, body: &str) -> io::Result<(
 }
 
 /// Splits a whole response, read until the server closed the connection,
-/// into the final status code and body. Interim responses (1xx, such as
-/// `103 Early Hints`) may come first and are skipped (RFC 9110 section
-/// 15.2).
-fn parse_response(mut text: &str) -> io::Result<(u16, String)> {
+/// into the final status code, headers and body. Interim responses (1xx,
+/// such as `103 Early Hints`) may come first and are skipped (RFC 9110
+/// section 15.2).
+fn parse_response(mut text: &str) -> io::Result<Reply> {
     loop {
         let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
         let status = status_code(head)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
         if !(100..200).contains(&status) {
-            return Ok((status, body.to_owned()));
+            let headers = head
+                .split("\r\n")
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(n, v)| (n.trim().to_ascii_lowercase(), v.trim().to_owned()))
+                .collect();
+            return Ok(Reply {
+                status,
+                headers,
+                body: body.to_owned(),
+            });
         }
         text = body;
     }
@@ -492,13 +572,35 @@ mod tests {
         assert_eq!(body, r#"POST /present application/json {"a":1}"#);
     }
 
+    #[tokio::test]
+    async fn headers_go_both_ways() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, |req: Request| {
+            let seen = req.header("X-Test").unwrap_or("-").to_owned();
+            std::future::ready(Response::text(200, "-").with_header("X-Seen", seen))
+        }));
+        let headers = [("X-Test", "abc".to_owned())];
+        let reply = post(addr, "/", &headers, "{}").await.unwrap();
+        assert_eq!(reply.header("x-seen"), Some("abc"));
+        assert_eq!(reply.header("X-SEEN"), Some("abc"));
+    }
+
     #[test]
     fn client_skips_interim_responses() {
         let hints = "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n";
-        let last = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
-        let parsed = parse_response(&format!("{hints}HTTP/1.1 100 Continue\r\n\r\n{last}"));
-        assert_eq!(parsed.unwrap(), (200, r#"{"ok":true}"#.to_owned()));
-        assert_eq!(parse_response(last).unwrap().0, 200);
+        let last = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\nX-Ipssl-Mac: ab\r\n\r\n{\"ok\":true}";
+        let parsed =
+            parse_response(&format!("{hints}HTTP/1.1 100 Continue\r\n\r\n{last}")).unwrap();
+        assert_eq!(
+            (parsed.status, parsed.body.as_str()),
+            (200, r#"{"ok":true}"#)
+        );
+        // The final response's headers, not the interim ones'.
+        assert_eq!(parsed.header("x-ipssl-mac"), Some("ab"));
+        assert_eq!(parsed.header("Content-Length"), Some("11"));
+        assert_eq!(parsed.header("link"), None);
+        assert_eq!(parse_response(last).unwrap().status, 200);
 
         // Interim responses with no final one, or no HTTP at all.
         for bad in [

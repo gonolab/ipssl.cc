@@ -1,0 +1,298 @@
+//! Signatures on the writes between the API and the name servers, with
+//! the shared secret in `acme.key`.
+//!
+//! The API signs each write with HMAC-SHA256 over the time, the method,
+//! the path and the body, which holds the change's sequence number, and
+//! sends the time and the MAC in two headers:
+//!
+//! ```text
+//! X-Ipssl-Time: 1763540000
+//! X-Ipssl-Mac:  <64 hex digits>
+//! MAC = HMAC(key, "ipssl-acme-v1 request\n" time "\n" method "\n" path "\n" body)
+//! ```
+//!
+//! A name server with the key takes a write only if the MAC is right, the
+//! time is within [`MAX_SKEW`] of its own clock and not before it started,
+//! and it has not taken the same write before. It signs its answer, bound
+//! to the request's MAC, so the API can tell it from a forged one:
+//!
+//! ```text
+//! X-Ipssl-Mac:  <64 hex digits>
+//! MAC = HMAC(key, "ipssl-acme-v1 reply\n" request-MAC-in-hex "\n" status "\n" body)
+//! ```
+//!
+//! A name server without a key ignores the headers and does not sign.
+
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use data_encoding::{HEXLOWER, HEXLOWER_PERMISSIVE};
+use ring::hmac;
+
+use super::error;
+use crate::http::{Request, Response};
+
+/// The header with the time a request was signed, in Unix seconds.
+pub const TIME: &str = "X-Ipssl-Time";
+
+/// The header with a request's or an answer's MAC, in hex.
+pub const MAC: &str = "X-Ipssl-Mac";
+
+/// Most seconds a signed request's time may be off the name server's
+/// clock, either way. The API signs right before it sends, so this only
+/// has to cover the difference between the clocks.
+const MAX_SKEW: i64 = 30;
+
+/// Most signed requests a name server remembers to refuse them a second
+/// time, see [`Recent`]. Far more than the API sends in a minute.
+const MAX_RECENT: usize = 100_000;
+
+/// A request's MAC.
+pub type Tag = [u8; 32];
+
+/// The shared secret, ready to sign and verify.
+#[derive(Clone)]
+pub struct Key(hmac::Key);
+
+impl Key {
+    pub fn new(secret: &[u8]) -> Self {
+        Self(hmac::Key::new(hmac::HMAC_SHA256, secret))
+    }
+
+    /// The headers that sign a request made at `time`, and the request's
+    /// MAC, which the answer is bound to.
+    pub fn sign_request(
+        &self,
+        time: i64,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> (Vec<(&'static str, String)>, Tag) {
+        let tag = hmac::sign(&self.0, &request_message(time, method, path, body));
+        let mac: Tag = tag.as_ref().try_into().expect("SHA-256 has 32 bytes");
+        let headers = vec![(TIME, time.to_string()), (MAC, HEXLOWER.encode(&mac))];
+        (headers, mac)
+    }
+
+    /// Adds the MAC that binds `response` to the request whose MAC is
+    /// `request`.
+    pub fn sign_response(&self, request: &Tag, response: Response) -> Response {
+        let message = reply_message(request, response.status, response.body.as_bytes());
+        let mac = HEXLOWER.encode(hmac::sign(&self.0, &message).as_ref());
+        response.with_header(MAC, mac)
+    }
+
+    /// Whether `mac` (hex) is this key's MAC of an answer with `status` and
+    /// `body` to the request whose MAC is `request`. In constant time.
+    pub fn verifies_reply(&self, request: &Tag, status: u16, body: &[u8], mac: &str) -> bool {
+        let Ok(mac) = HEXLOWER_PERMISSIVE.decode(mac.as_bytes()) else {
+            return false;
+        };
+        hmac::verify(&self.0, &reply_message(request, status, body), &mac).is_ok()
+    }
+}
+
+fn request_message(time: i64, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let mut message = format!("ipssl-acme-v1 request\n{time}\n{method}\n{path}\n").into_bytes();
+    message.extend_from_slice(body);
+    message
+}
+
+fn reply_message(request: &Tag, status: u16, body: &[u8]) -> Vec<u8> {
+    let request = HEXLOWER.encode(request);
+    let mut message = format!("ipssl-acme-v1 reply\n{request}\n{status}\n").into_bytes();
+    message.extend_from_slice(body);
+    message
+}
+
+/// The current time in Unix seconds.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// What a name server with a key checks every write against.
+pub struct Guard {
+    key: Key,
+    /// When the name server started: what it took before then is gone
+    /// from [`Recent`], so it takes nothing signed before then.
+    started: i64,
+    recent: Mutex<Recent>,
+}
+
+impl Guard {
+    pub fn new(key: Key) -> Self {
+        Self {
+            key,
+            started: now(),
+            recent: Mutex::default(),
+        }
+    }
+
+    pub fn key(&self) -> &Key {
+        &self.key
+    }
+
+    /// Checks that `req` is signed with the key, recently, and new; returns
+    /// its MAC, or the answer that refuses it.
+    pub fn check(&self, req: &Request) -> Result<Tag, Response> {
+        self.check_at(req, now())
+    }
+
+    fn check_at(&self, req: &Request, now: i64) -> Result<Tag, Response> {
+        let refuse = |message: &str| error(401, message);
+        let time = req.header(TIME).and_then(|t| t.parse::<i64>().ok());
+        let mac = req
+            .header(MAC)
+            .and_then(|m| HEXLOWER_PERMISSIVE.decode(m.as_bytes()).ok());
+        let (Some(time), Some(mac)) = (time, mac) else {
+            return Err(refuse(
+                "not signed: this name server has acme.key, so the API needs it too",
+            ));
+        };
+        let message = request_message(time, &req.method, &req.path, &req.body);
+        if hmac::verify(&self.key.0, &message, &mac).is_err() {
+            return Err(refuse(
+                "bad signature: acme.key differs between the API and this name server",
+            ));
+        }
+        let mac: Tag = mac.try_into().expect("verified, so 32 bytes");
+        let age = now - time;
+        if age.abs() > MAX_SKEW {
+            return Err(refuse(&format!(
+                "signed {age} s from now by this name server's clock, more than {MAX_SKEW} s off; \
+                 check that the clocks agree"
+            )));
+        }
+        if time < self.started {
+            return Err(refuse("signed before this name server started"));
+        }
+        self.lock().insert(mac, time, now)?;
+        Ok(mac)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Recent> {
+        self.recent.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The MACs of the signed requests taken while they are fresh, so that a
+/// copy of one is refused: as long as a request's time is within
+/// [`MAX_SKEW`] of the clock, its MAC is kept.
+#[derive(Default)]
+struct Recent {
+    seen: HashSet<Tag>,
+    /// Each MAC in `seen` with the time it was signed, in the order taken.
+    order: VecDeque<(i64, Tag)>,
+}
+
+impl Recent {
+    fn insert(&mut self, mac: Tag, time: i64, now: i64) -> Result<(), Response> {
+        // Times are close to the order requests arrive in. One that is
+        // stale but behind a fresh one stays a little longer, which is
+        // harmless; none goes before it is stale.
+        while let Some(&(signed, old)) = self.order.front()
+            && now - signed > MAX_SKEW
+        {
+            self.order.pop_front();
+            self.seen.remove(&old);
+        }
+        if self.seen.contains(&mac) {
+            return Err(error(401, "this request was taken already"));
+        }
+        if self.seen.len() >= MAX_RECENT {
+            return Err(error(503, "too many writes, try again later"));
+        }
+        self.seen.insert(mac);
+        self.order.push_back((time, mac));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(key: &Key, time: i64, path: &str, body: &str) -> (Request, Tag) {
+        let (headers, mac) = key.sign_request(time, "POST", path, body.as_bytes());
+        let headers = headers
+            .into_iter()
+            .map(|(n, v)| (n.to_ascii_lowercase(), v))
+            .collect();
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let req = Request::new("POST", path, peer, headers, body.as_bytes().to_vec());
+        (req, mac)
+    }
+
+    #[test]
+    fn signed_requests_and_answers_verify() {
+        let key = Key::new(&[7; 32]);
+        let guard = Guard::new(key.clone());
+        let now = guard.started;
+        let (req, mac) = request(&key, now, "/present", "{}");
+        assert_eq!(guard.check_at(&req, now).unwrap(), mac);
+
+        let answer = key.sign_response(&mac, Response::new(200, "application/json", "{}"));
+        let signature = answer.headers[0].1.clone();
+        assert!(key.verifies_reply(&mac, 200, b"{}", &signature));
+        // Bound to the request, the status and the body.
+        assert!(!key.verifies_reply(&[0; 32], 200, b"{}", &signature));
+        assert!(!key.verifies_reply(&mac, 409, b"{}", &signature));
+        assert!(!key.verifies_reply(&mac, 200, b"{ }", &signature));
+        assert!(!Key::new(&[8; 32]).verifies_reply(&mac, 200, b"{}", &signature));
+        assert!(!key.verifies_reply(&mac, 200, b"{}", "not hex"));
+    }
+
+    #[test]
+    fn requests_must_be_signed_fresh_and_new() {
+        let key = Key::new(&[7; 32]);
+        let guard = Guard::new(key.clone());
+        let now = guard.started + 100;
+        let status = |req: &Request, at: i64| guard.check_at(req, at).err().map(|r| r.status);
+
+        let (req, _) = request(&key, now, "/present", "{}");
+        assert_eq!(status(&req, now), None);
+        assert_eq!(status(&req, now), Some(401), "replayed");
+
+        // Another key, another path, another body, no signature.
+        let (other, _) = request(&Key::new(&[8; 32]), now, "/present", "{}");
+        assert_eq!(status(&other, now), Some(401));
+        let (mut moved, _) = request(&key, now, "/present", "{\"a\":1}");
+        moved.path = "/cleanup".to_owned();
+        assert_eq!(status(&moved, now), Some(401));
+        let (mut changed, _) = request(&key, now, "/present", "{\"a\":2}");
+        changed.body = b"{\"a\":3}".to_vec();
+        assert_eq!(status(&changed, now), Some(401));
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let bare = Request::new("POST", "/present", peer, Vec::new(), b"{}".to_vec());
+        assert_eq!(status(&bare, now), Some(401));
+
+        // Too old, too far ahead, or from before the name server started.
+        for time in [now - MAX_SKEW - 1, now + MAX_SKEW + 1, guard.started - 1] {
+            let (req, _) = request(&key, time, "/present", "{\"b\":1}");
+            let at = if time < guard.started {
+                guard.started
+            } else {
+                now
+            };
+            assert_eq!(status(&req, at), Some(401), "{time}");
+        }
+        let (edge, _) = request(&key, now - MAX_SKEW, "/present", "{\"c\":1}");
+        assert_eq!(status(&edge, now), None);
+    }
+
+    #[test]
+    fn recent_requests_are_forgotten_once_stale() {
+        let mut recent = Recent::default();
+        recent.insert([1; 32], 1000, 1000).unwrap();
+        recent.insert([2; 32], 1010, 1010).unwrap();
+        assert!(recent.insert([1; 32], 1000, 1000 + MAX_SKEW).is_err());
+        // Once a copy would be refused as stale anyway, it is forgotten.
+        recent.insert([3; 32], 1031, 1031).unwrap();
+        assert!(!recent.seen.contains(&[1; 32]));
+        assert!(recent.seen.contains(&[2; 32]));
+        assert_eq!(recent.seen.len(), recent.order.len());
+    }
+}

@@ -16,8 +16,12 @@ anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
+# Hex and base64 for acme.key, and MACs as hex; already pulled in by hickory.
+data-encoding = "2"
 hickory-server = { version = "0.26.3", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
+# HMAC-SHA256 for the writes between the challenge API and the name servers.
+ring = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"

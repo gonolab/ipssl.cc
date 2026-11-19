@@ -16,7 +16,12 @@
 //!   A value belongs to the client that presented it, by its IPv4 address
 //!   or its IPv6 /64, which the API sends along ([`Origin`]); only that
 //!   client can clean it up. The API numbers its changes, and name servers
-//!   apply them in that order however they arrive ([`Sequence`]).
+//!   apply them in that order however they arrive.
+//!
+//! With a shared key (`acme.key`), the API signs every change, and a name
+//! server takes only signed ones (still only from the API hosts) and signs
+//! its answers, so someone on the path between them can neither forge a
+//! change nor an answer.
 //!
 //! Only names with private addresses qualify ([`Zone::check_challenge`]),
 //! and values must look like real challenge digests, so the API cannot be
@@ -35,12 +40,14 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tracing::warn;
 
-use crate::config::Config;
+use crate::config::{AcmeConfig, Config};
 use crate::handler::Handler;
-use crate::http::{Request, Response, Server, post_json};
+use crate::http::{Reply, Request, Response, Server, post};
 use crate::metrics::{AcmeWrite, ApiMetrics, NodeWrite};
 use crate::ratelimit::{RateLimiter, Verdict};
 use crate::zone::{ChallengeError, Zone};
+
+mod auth;
 
 /// First label of every DNS-01 challenge name (RFC 8555 section 8.4).
 pub const CHALLENGE_LABEL: &str = "_acme-challenge";
@@ -184,8 +191,8 @@ impl Entry {
 /// each change.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Origin {
-    /// The client: its IPv4 address, or its IPv6 /64 (see [`owner`]).
-    /// Only the same owner can clean a value up. `None` for writes from an
+    /// The client: its IPv4 address, or its IPv6 /64. Only the same
+    /// owner can clean a value up. `None` for writes from an
     /// API that sends no owner; those belong to nobody else.
     pub owner: Option<IpAddr>,
     /// The client's network, as the API groups clients for rate limiting.
@@ -256,7 +263,8 @@ impl Challenges {
     /// Anything else is left alone, the same value published by another
     /// owner included, and so is a value presented after this cleanup
     /// (by `seq`). With a `seq`, the cleanup is remembered for a while,
-    /// see [`Removal`].
+    /// so that a present sent before it that arrives late cannot bring the
+    /// value back.
     pub fn cleanup(&self, name: &LowerName, value: &str, origin: Origin, seq: Option<u64>) {
         self.cleanup_at(name, value, origin, seq, Instant::now());
     }
@@ -598,17 +606,42 @@ pub struct Node {
     handler: Handler,
     store: Arc<Challenges>,
     writers: Vec<IpAddr>,
+    /// With a key, writes must be signed with it, and answers are.
+    guard: Option<auth::Guard>,
 }
 
 impl Node {
     /// `handler` supplies the current zone and the metrics; `store` must
-    /// be the one `handler` answers from.
+    /// be the one `handler` answers from. Takes unsigned writes from
+    /// `writers`; see [`Node::with_key`].
     pub fn new(handler: Handler, store: Arc<Challenges>, writers: &[IpAddr]) -> Self {
         Self {
             handler,
             store,
             writers: writers.iter().map(|ip| ip.to_canonical()).collect(),
+            guard: None,
         }
+    }
+
+    /// The write endpoint `acme` describes: its writers and, with
+    /// `acme.key`, signatures.
+    pub fn from_config(
+        handler: Handler,
+        store: Arc<Challenges>,
+        acme: &AcmeConfig,
+    ) -> Result<Self> {
+        let node = Self::new(handler, store, &acme.writers);
+        Ok(match &acme.key {
+            Some(key) => node.with_key(key.bytes()?),
+            None => node,
+        })
+    }
+
+    /// Takes only writes signed with `key`, recently and once, from the
+    /// writers, and signs every answer to them.
+    pub fn with_key(mut self, key: &[u8]) -> Self {
+        self.guard = Some(auth::Guard::new(auth::Key::new(key)));
+        self
     }
 
     /// Takes writes on `listener` until the task is dropped. Connections
@@ -627,7 +660,28 @@ impl Node {
     }
 
     pub async fn handle(&self, req: Request) -> Response {
-        self.try_handle(req).unwrap_or_else(|response| response)
+        // Already checked in `serve`; this is for callers of `handle`.
+        if !self.admits(req.peer.ip()) {
+            return error(403, "not allowed to write challenges");
+        }
+        let Some(guard) = &self.guard else {
+            return self.try_handle(req).unwrap_or_else(|response| response);
+        };
+        let mac = match guard.check(&req) {
+            Ok(mac) => mac,
+            Err(refusal) => {
+                warn!(
+                    peer = %req.peer.ip(),
+                    status = refusal.status,
+                    "acme: refused a write that is not properly signed: {}",
+                    refusal.body
+                );
+                self.count(AcmeWrite::Rejected);
+                return refusal;
+            }
+        };
+        let response = self.try_handle(req).unwrap_or_else(|response| response);
+        guard.key().sign_response(&mac, response)
     }
 
     /// Whether `ip` may write challenges. Counts those that may not, so a
@@ -646,10 +700,6 @@ impl Node {
     }
 
     fn try_handle(&self, req: Request) -> Result<Response, Response> {
-        // Already checked in `serve`; this is for callers of `handle`.
-        if !self.admits(req.peer.ip()) {
-            return Err(error(403, "not allowed to write challenges"));
-        }
         let rejected = |_: &Response| self.count(AcmeWrite::Rejected);
         let action = route(&req).inspect_err(rejected)?;
         let zone = self.handler.zone();
@@ -678,6 +728,17 @@ pub struct Api {
     nodes: Vec<SocketAddr>,
     metrics: ApiMetrics,
     seq: Sequence,
+    /// With `acme.key`: how writes are signed and answers checked.
+    signing: Option<Signing>,
+}
+
+/// How the API signs its writes and which answers it trusts.
+#[derive(Clone)]
+struct Signing {
+    key: auth::Key,
+    /// Whether unsigned answers count, from name servers that do not have
+    /// the key yet (`acme.allow_unsigned_nodes`).
+    allow_unsigned: bool,
 }
 
 impl Api {
@@ -701,6 +762,13 @@ impl Api {
             metrics: ApiMetrics::new(&nodes),
             nodes,
             seq: Sequence::default(),
+            signing: match &acme.key {
+                Some(key) => Some(Signing {
+                    key: auth::Key::new(key.bytes()?),
+                    allow_unsigned: acme.allow_unsigned_nodes,
+                }),
+                None => None,
+            },
         })
     }
 
@@ -823,10 +891,9 @@ impl Api {
             .map(|node| {
                 let addr = self.nodes[node];
                 let body = body.to_owned();
-                (
-                    node,
-                    tokio::spawn(async move { send(addr, action, &body, limit).await }),
-                )
+                let signing = self.signing.clone();
+                let task = async move { send(addr, action, &body, limit, signing.as_ref()).await };
+                (node, tokio::spawn(task))
             })
             .collect();
         let mut outcomes = Vec::with_capacity(tasks.len());
@@ -903,29 +970,99 @@ impl Outcome {
     }
 }
 
-/// Sends a change to the name server at `addr`, waiting at most `limit`.
-async fn send(addr: SocketAddr, action: Action, body: &str, limit: Duration) -> Outcome {
-    let problem = match timeout(limit, post_json(addr, action.path(), body)).await {
-        // Only a name server's own answer counts, not any 200: a port
-        // that serves something else must not acknowledge a value.
-        Ok(Ok((200, reply))) if reply_ok(&reply) == Some(true) => return Outcome::Accepted,
-        Ok(Ok((200, _))) => "HTTP 200 without {\"ok\":true}".to_owned(),
-        // A cap on pending values: the client's to sort out.
-        Ok(Ok((409, reply))) if reply_ok(&reply) == Some(false) => return Outcome::Rejected,
-        Ok(Ok((status, _))) => format!("HTTP {status}"),
+/// Sends a change to the name server at `addr`, waiting at most `limit`,
+/// signed if there is `signing`.
+async fn send(
+    addr: SocketAddr,
+    action: Action,
+    body: &str,
+    limit: Duration,
+    signing: Option<&Signing>,
+) -> Outcome {
+    let path = action.path();
+    let (headers, mac) = match signing {
+        Some(signing) => {
+            let (headers, mac) =
+                signing
+                    .key
+                    .sign_request(auth::now(), "POST", path, body.as_bytes());
+            (headers, Some(mac))
+        }
+        None => (Vec::new(), None),
+    };
+    let problem = match timeout(limit, post(addr, path, &headers, body)).await {
+        Ok(Ok(reply)) => match (reply.status, reply_ok(&reply.body)) {
+            // Only a name server's own answer counts, not any 200: a port
+            // that serves something else must not acknowledge a value.
+            // A refusal over a cap (the client's to sort out) also stops
+            // the API from taking the value back there, so both have to
+            // be genuine.
+            (200, Some(true)) | (409, Some(false)) => match trust(&reply, signing, mac) {
+                Ok(()) if reply.status == 200 => return Outcome::Accepted,
+                Ok(()) => return Outcome::Rejected,
+                Err(problem) => problem.to_owned(),
+            },
+            (200, _) => "HTTP 200 without {\"ok\":true}".to_owned(),
+            (status, _) => match reply_error(&reply.body) {
+                Some(error) => format!("HTTP {status}: {error}"),
+                None => format!("HTTP {status}"),
+            },
+        },
         Ok(Err(e)) => e.to_string(),
         Err(_) => "timed out".to_owned(),
     };
     Outcome::Failed(format!("{addr} ({problem})"))
 }
 
+/// Whether `reply`, the answer to a request signed with `signing` whose
+/// MAC is `mac`, is genuine: signed with the key and bound to that
+/// request. Without a key every answer counts, as it did before keys.
+fn trust(
+    reply: &Reply,
+    signing: Option<&Signing>,
+    mac: Option<auth::Tag>,
+) -> Result<(), &'static str> {
+    let (Some(signing), Some(mac)) = (signing, mac) else {
+        return Ok(());
+    };
+    match reply.header(auth::MAC) {
+        Some(signature)
+            if signing
+                .key
+                .verifies_reply(&mac, reply.status, reply.body.as_bytes(), signature) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err("answer with a bad signature"),
+        None if signing.allow_unsigned => Ok(()),
+        None => Err("unsigned answer; does the name server have acme.key?"),
+    }
+}
+
 /// The `ok` field of a name server's JSON answer, if it is one.
 fn reply_ok(reply: &str) -> Option<bool> {
     #[derive(Deserialize)]
-    struct Reply {
+    struct Answer {
         ok: bool,
     }
-    serde_json::from_str::<Reply>(reply).ok().map(|r| r.ok)
+    serde_json::from_str::<Answer>(reply).ok().map(|r| r.ok)
+}
+
+/// The `error` field of a name server's JSON answer, for the log: plain
+/// ASCII without line breaks, and short.
+fn reply_error(reply: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Answer {
+        error: String,
+    }
+    let error = serde_json::from_str::<Answer>(reply).ok()?.error;
+    Some(
+        error
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(200)
+            .collect(),
+    )
 }
 
 /// The API's answer when a name server refuses a value over a cap.

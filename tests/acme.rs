@@ -3,11 +3,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use data_encoding::HEXLOWER;
 
 use hickory_server::Server;
 use hickory_server::proto::op::{Message, Query, ResponseCode};
 use hickory_server::proto::rr::{Name, RData, RecordType};
+use ring::hmac;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -15,7 +18,7 @@ use tokio::time::timeout;
 use ipssl::acme::{Api, Challenges, Node};
 use ipssl::config::Config;
 use ipssl::handler::Handler;
-use ipssl::http::post_json;
+use ipssl::http::{post, post_json};
 use ipssl::zone::Zone;
 
 const EXAMPLE_CONFIG: &str = include_str!("../config.example.toml");
@@ -31,17 +34,28 @@ struct NameServer {
 }
 
 async fn name_server(writers: &str) -> NameServer {
+    name_server_with(writers, "").await
+}
+
+/// Like [`name_server`], with more `[acme]` settings, such as a key.
+async fn name_server_with(writers: &str, acme: &str) -> NameServer {
     let config = Config::parse(EXAMPLE_CONFIG).unwrap();
     let store = Arc::new(Challenges::new());
     let handler = Handler::new(Zone::from_config(&config).unwrap()).with_challenges(store.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let write = listener.local_addr().unwrap();
-    let writers: Vec<_> = writers
+    let writers: Vec<String> = writers
         .split_whitespace()
-        .map(|w| w.parse().unwrap())
+        .map(|w| format!("\"{w}\""))
         .collect();
-    tokio::spawn(Node::new(handler.clone(), store, &writers).serve(listener));
+    let text = format!(
+        "{EXAMPLE_CONFIG}\n[acme]\nwriters = [{}]\n{acme}\n",
+        writers.join(", ")
+    );
+    let settings = Config::parse(&text).unwrap().acme.unwrap();
+    let node = Node::from_config(handler.clone(), store, &settings).unwrap();
+    tokio::spawn(node.serve(listener));
 
     let udp = ipssl::bind_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     NameServer {
@@ -671,4 +685,232 @@ async fn api_counts_requests_and_name_server_writes() {
     assert_eq!(writes(down, "failed"), 3);
     assert_eq!(writes(down, "accepted"), 0);
     assert_eq!(metric(&metrics, "ipssl_rate_limit_tracked_networks"), 1);
+}
+
+const KEY: &str = "4f1c0e5b9a7d3e2f6a8b1c4d7e0f2a3b5c6d8e9f0a1b2c3d4e5f60718293a4b5";
+const OTHER_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+/// The `[acme]` line that sets `key`.
+fn key(key: &str) -> String {
+    format!("key = \"{key}\"")
+}
+
+fn mac(key: &str, message: &str) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &HEXLOWER.decode(key.as_bytes()).unwrap());
+    HEXLOWER.encode(hmac::sign(&key, message.as_bytes()).as_ref())
+}
+
+/// The MAC that signs a request, as the API makes it.
+fn request_mac(key: &str, time: i64, path: &str, body: &str) -> String {
+    mac(
+        key,
+        &format!("ipssl-acme-v1 request\n{time}\nPOST\n{path}\n{body}"),
+    )
+}
+
+/// The MAC that signs a name server's answer to a request with `request`.
+fn reply_mac(key: &str, request: &str, status: u16, body: &str) -> String {
+    mac(
+        key,
+        &format!("ipssl-acme-v1 reply\n{request}\n{status}\n{body}"),
+    )
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A change as the API sends it to the name servers.
+fn change(seq: u64) -> String {
+    serde_json::json!({
+        "fqdn": NAME, "value": VALUE,
+        "owner": "192.0.2.10", "network": "192.0.2.0", "seq": seq,
+    })
+    .to_string()
+}
+
+/// A name server's answer with `status` and `body`, and `extra` headers.
+fn answer(status: &str, extra: &str, body: &str) -> &'static str {
+    let raw = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}",
+        body.len()
+    );
+    Box::leak(raw.into_boxed_str())
+}
+
+#[tokio::test]
+async fn signed_writes_reach_name_servers_with_the_key() {
+    let ns1 = name_server_with("127.0.0.1", &key(KEY)).await;
+    let ns2 = name_server_with("127.0.0.1", &key(KEY)).await;
+    let api = api(&[ns1.write, ns2.write], &key(KEY)).await;
+
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!((status, reply.as_str()), (200, r#"{"ok":true}"#));
+    for ns in [&ns1, &ns2] {
+        assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    }
+    assert_eq!(
+        post_json(api, "/cleanup", &body(NAME, VALUE))
+            .await
+            .unwrap()
+            .0,
+        200
+    );
+    for ns in [&ns1, &ns2] {
+        assert!(txt(ns.dns, NAME).await.answers.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn name_server_with_a_key_refuses_other_keys_and_unsigned_writes() {
+    let ns = name_server_with("127.0.0.1", &key(KEY)).await;
+    for settings in [key(OTHER_KEY), String::new()] {
+        let api = api(&[ns.write], &settings).await;
+        let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+            .await
+            .unwrap();
+        assert_eq!(status, 502, "{settings}: {reply}");
+        assert!(txt(ns.dns, NAME).await.answers.is_empty());
+    }
+    // The present and the cleanup after it, from both APIs.
+    let metrics = ns.handler.render_metrics();
+    assert_eq!(
+        metric(&metrics, r#"ipssl_acme_writes_total{result="rejected"}"#),
+        4
+    );
+    assert_eq!(
+        metric(&metrics, r#"ipssl_acme_writes_total{result="accepted"}"#),
+        0
+    );
+}
+
+#[tokio::test]
+async fn name_server_with_a_key_takes_each_fresh_signed_write_once() {
+    let ns = name_server_with("127.0.0.1", &key(KEY)).await;
+    let request = change(1);
+    let signed = |time: i64, path: &str, mac: String| {
+        let headers = vec![("X-Ipssl-Time", time.to_string()), ("X-Ipssl-Mac", mac)];
+        let (path, body) = (path.to_owned(), request.clone());
+        async move { post(ns.write, &path, &headers, &body).await.unwrap() }
+    };
+
+    // No signature at all.
+    let (status, reply) = post_json(ns.write, "/present", &request).await.unwrap();
+    assert_eq!(status, 401, "{reply}");
+    assert!(reply.contains("not signed"), "{reply}");
+
+    // Signed, but too long ago, too far ahead, for another path, or
+    // with another key.
+    let now = unix_now();
+    for (time, path, key) in [
+        (now - 60, "/present", KEY),
+        (now + 60, "/present", KEY),
+        (now, "/cleanup", KEY),
+        (now, "/present", OTHER_KEY),
+    ] {
+        let reply = signed(time, "/present", request_mac(key, time, path, &request)).await;
+        assert_eq!(reply.status, 401, "{time} {path}: {}", reply.body);
+    }
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    // Signed right: taken, and the answer is signed for this request.
+    let mac = request_mac(KEY, now, "/present", &request);
+    let reply = signed(now, "/present", mac.clone()).await;
+    assert_eq!((reply.status, reply.body.as_str()), (200, r#"{"ok":true}"#));
+    let expected = reply_mac(KEY, &mac, 200, &reply.body);
+    assert_eq!(reply.header("x-ipssl-mac"), Some(expected.as_str()));
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+
+    // The same request again, as someone on the path could send it.
+    let again = signed(now, "/present", mac).await;
+    assert_eq!(again.status, 401, "{}", again.body);
+    assert!(again.body.contains("taken already"), "{}", again.body);
+
+    // Refusals for the client are signed too, so the API can trust them.
+    let bad = body(NAME, "not a challenge digest");
+    let headers = vec![
+        ("X-Ipssl-Time", now.to_string()),
+        ("X-Ipssl-Mac", request_mac(KEY, now, "/present", &bad)),
+    ];
+    let reply = post(ns.write, "/present", &headers, &bad).await.unwrap();
+    assert_eq!(reply.status, 400);
+    let mac = request_mac(KEY, now, "/present", &bad);
+    let expected = reply_mac(KEY, &mac, 400, &reply.body);
+    assert_eq!(reply.header("x-ipssl-mac"), Some(expected.as_str()));
+}
+
+#[tokio::test]
+async fn name_server_without_a_key_takes_signed_writes() {
+    // While the key is rolled out, the API has it before the name servers.
+    let ns = name_server("127.0.0.1").await;
+    let rollout = format!("{}\nallow_unsigned_nodes = true", key(KEY));
+    let api_rollout = api(&[ns.write], &rollout).await;
+    let request = body(NAME, VALUE);
+    assert_eq!(
+        post_json(api_rollout, "/present", &request)
+            .await
+            .unwrap()
+            .0,
+        200
+    );
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    assert_eq!(
+        post_json(api_rollout, "/cleanup", &request)
+            .await
+            .unwrap()
+            .0,
+        200
+    );
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    // Without allow_unsigned_nodes, an unsigned answer counts for nothing:
+    // the API reports a failure and takes the value back.
+    let api_strict = api(&[ns.write], &key(KEY)).await;
+    let (status, reply) = post_json(api_strict, "/present", &request).await.unwrap();
+    assert_eq!(status, 502, "{reply}");
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
+async fn api_with_a_key_trusts_no_forged_answer() {
+    // What someone on the path to a name server could answer instead.
+    let ok = r#"{"ok":true}"#;
+    let unsigned = answer("200 OK", "", ok);
+    let made_up = answer(
+        "200 OK",
+        &format!("X-Ipssl-Mac: {}\r\n", "00".repeat(32)),
+        ok,
+    );
+    // A genuine signature, from the answer to another request.
+    let old = reply_mac(KEY, &request_mac(KEY, 1, "/present", "{}"), 200, ok);
+    let replayed = answer("200 OK", &format!("X-Ipssl-Mac: {old}\r\n"), ok);
+    let full = answer("409 Conflict", "", r#"{"ok":false,"error":"full"}"#);
+
+    let strict = key(KEY);
+    let rollout = format!("{strict}\nallow_unsigned_nodes = true");
+    for (raw, settings, expected) in [
+        (unsigned, &strict, 502),
+        (made_up, &strict, 502),
+        (made_up, &rollout, 502),
+        (replayed, &strict, 502),
+        (replayed, &rollout, 502),
+        // A refusal is not believed either: it would stop the API from
+        // taking the value back on that name server.
+        (full, &strict, 502),
+        // While the key is rolled out, an unsigned answer is trusted.
+        (unsigned, &rollout, 200),
+        (full, &rollout, 409),
+    ] {
+        let node = fake_node(raw).await;
+        let api = api(&[node], settings).await;
+        let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+            .await
+            .unwrap();
+        assert_eq!(status, expected, "{raw:?} with {settings:?}: {reply}");
+    }
 }
