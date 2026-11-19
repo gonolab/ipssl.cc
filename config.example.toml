@@ -4,7 +4,8 @@
 # a restart. A reload checks the whole file the way `--check` and startup
 # do, and keeps the running config if it fails.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
-# replace them before going live.
+# replace them before going live. install.sh refuses to start a service
+# while any remain outside `blocklist`.
 
 # The zone this server is authoritative for
 domain = "ipssl.cc"
@@ -15,9 +16,15 @@ domain = "ipssl.cc"
 # its family). IPv6 addresses are IPv6-only, so 0.0.0.0:53 and [::]:53 can
 # be used together; on a system without IPv6, [::] is skipped with a
 # warning.
+# On a server with more than one public address, list each of them here
+# instead of the wildcards: a wildcard socket can send a UDP reply from
+# another address than the one queried, and resolvers ignore such replies.
 # On Ubuntu, systemd-resolved holds 127.0.0.53:53, which can make binding
-# 0.0.0.0:53 fail: either disable its stub listener or list the server's
-# public IP here instead.
+# 0.0.0.0:53 fail. Either list the server's public IP here instead, or
+# disable the stub listener; in that case, also point /etc/resolv.conf at
+# /run/systemd/resolve/resolv.conf (see the README): the host's own
+# lookups would otherwise reach this server, which answers only for the
+# zone.
 listen = ["0.0.0.0:53", "[::]:53"]
 
 # Idle timeout for TCP connections, in seconds
@@ -28,8 +35,9 @@ tcp_timeout_secs = 10
 # (Let's Encrypt, ZeroSSL, Google Trust Services, ...).
 caa_issuers = []
 
-# Names embedding an address in these networks get NXDOMAIN
-# (for handling abuse reports)
+# Names embedding an address in these networks get NXDOMAIN (for handling
+# abuse reports). An entry blocks every name that encodes an address in
+# it, in any form and with any other labels, not only the reported one.
 blocklist = []
 
 # Authoritative name servers. Create glue records with the same names at

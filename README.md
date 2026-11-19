@@ -293,7 +293,21 @@ On Ubuntu, systemd-resolved holds `127.0.0.53:53` by default, which can make bin
 
 ### 4. Registrar setup
 
-1. If the domain has DNSSEC, note the DS record's TTL (`dig +noall +answer DS ipssl.cc`), remove the DS record at the registrar, and wait at least that long before changing the name servers. This server does not sign the zone, and resolvers that still hold the DS record would reject its answers.
+1. If the domain has DNSSEC, turn it off first, while the old signed name servers keep serving the zone. This server does not sign the zone, and resolvers that still hold the DS record would reject its answers.
+   - Read the DS record's TTL from a server of the parent zone. A recursive resolver shows only what is left of its cached copy.
+
+     ```bash
+     dig +norec +noall +answer DS ipssl.cc @$(dig +short NS cc. | head -n 1)
+     ```
+
+   - Remove the DS record at the registrar.
+   - The parent zone may publish the removal later. Query every one of its servers until none returns the DS record any more:
+
+     ```bash
+     for ns in $(dig +short NS cc.); do dig +norec +noall +answer DS ipssl.cc @"$ns"; done
+     ```
+
+   - Only then wait that full TTL, plus a margin such as an hour, before changing the name servers.
 2. Create **glue records** (some registrars call them "child name servers" or host records): `ns1.ipssl.cc` and `ns2.ipssl.cc`, each pointing to one server's IP.
 3. Then set the domain's name servers to `ns1.ipssl.cc` and `ns2.ipssl.cc`.
 4. Once the change has propagated, check it:
@@ -366,9 +380,14 @@ This step enables [certificates for private addresses](#certificates-for-private
 
    By default that is each name server's first address of the family `acme.listen` uses (IPv4 for `0.0.0.0:8053`, IPv6 for `[::]:8053`), on the `acme.listen` port. If a name server has no address of that family, for example one outside the zone, list the endpoints in `acme.nodes`: the API refuses to start without them.
 
-   When the set of name servers changes, update the API host's config too and restart `ipssl-acme-api`: it reads the config only when it starts.
+   When the set of name servers changes, update the API host's config too and restart `ipssl-acme-api`: it reads the config only when it starts. Keep the API writing to every name server that resolvers may still ask:
+
+   - To add a name server, set it up with the `[acme]` section, add it to the API host's config and restart `ipssl-acme-api`. Only then delegate to it: glue record, the domain's name servers at the registrar, and `[[nameservers]]` on the other name servers.
+   - To remove one, first remove the delegation and its `[[nameservers]]` entry on the other name servers, and keep it running. Wait out the NS TTL, the longer of the parent zone's (`dig +norec +noall +authority NS ipssl.cc @$(dig +short NS cc. | head -n 1)`) and `ttl.records`. Then remove it from the API host's config, restart `ipssl-acme-api` and shut the name server down.
 
 3. Add the two locations from [`deploy/acme/nginx.conf`](deploy/acme/nginx.conf) to the website's `server` block, so the API is reachable over HTTPS at `/acme`, and reload nginx.
+
+   With a load balancer, CDN or other proxy in front of nginx, also set up the trusted client address as the comment at the top of that file shows. Otherwise the API sees the proxy's address for every client, so they all share one rate limit and can clean up each other's values.
 
 ## Rate limiting
 
