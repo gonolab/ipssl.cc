@@ -600,7 +600,7 @@ async fn udp_is_rate_limited_but_tcp_is_not() {
 #[cfg(unix)]
 mod reload_helper {
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Output};
+    use std::process::{Child, Command, Output, Stdio};
     use std::time::Instant;
     use std::{fs, thread};
 
@@ -661,6 +661,68 @@ mod reload_helper {
         assert_eq!(status.pid, std::process::id());
         assert_eq!(status.generation, 2);
         assert_eq!(status.state, State::Failed("bad".into()));
+    }
+
+    #[tokio::test]
+    async fn reload_helper_waits_for_a_reload_after_its_signal() {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reload-running");
+        let _ = fs::remove_dir_all(&dir);
+        let run = dir.join("run");
+        fs::create_dir_all(&run).unwrap();
+        let config = dir.join("config.toml");
+        let text = "domain = \"ipssl.cc\"\nlisten = [\"127.0.0.1:5353\"]\n\
+                    [[nameservers]]\nname = \"ns1.ipssl.cc\"\nipv4 = [\"198.51.100.1\"]\n\
+                    [soa]\nemail = \"hostmaster@ipssl.cc\"\n";
+        fs::write(&config, text).unwrap();
+
+        // This test plays the server, which is in the middle of a reload
+        // when the helper starts: it may have read the file before the
+        // helper checked it.
+        let mut hangup =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).unwrap();
+        let pid = std::process::id();
+        let write = |generation, state| {
+            Status {
+                pid,
+                generation,
+                state,
+            }
+            .write(&run)
+            .unwrap()
+        };
+        write(5, State::Reloading);
+        let mut helper = Command::new(env!("CARGO_BIN_EXE_ipssl-dns"))
+            .arg("-c")
+            .arg(&config)
+            .args(["--reload", &pid.to_string()])
+            .env("RUNTIME_DIRECTORY", &run)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        timeout(Duration::from_secs(10), hangup.recv())
+            .await
+            .expect("no SIGHUP");
+
+        // The reload that was running ends. It is not the helper's.
+        write(5, State::Serving(100));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            helper.try_wait().unwrap().is_none(),
+            "the helper took the old reload"
+        );
+
+        // The one the signal asked for.
+        write(6, State::Reloading);
+        write(6, State::Serving(101));
+        let out = helper.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("serial=101"), "{stdout}");
     }
 
     #[tokio::test]
