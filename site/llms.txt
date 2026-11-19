@@ -18,7 +18,7 @@ Use this file to give a machine a hostname and an HTTPS certificate. Work in thi
 ## 2. Check it resolves
 
 - `dig +short A 192-168-1-10.ipssl.cc` should print `192.168.1.10`; for IPv6 ask for AAAA: `dig +short AAAA 2001-db8--1.ipssl.cc`. An IPv4 name has no AAAA record and an IPv6 name has no A record.
-- If a private address does not resolve on the user's network, the router probably has DNS rebinding protection (OpenWrt, pfSense, dnsmasq, Fritz!Box). Allowlist only the names in use (dnsmasq: `rebind-domain-ok=/192-168-1-10.ipssl.cc/`), or all of `ipssl.cc`, or use a public resolver such as 1.1.1.1 or 8.8.8.8.
+- If a private address does not resolve on the user's network, the router probably has DNS rebinding protection (OpenWrt, pfSense, dnsmasq, Fritz!Box). Allowlist only the names in use (dnsmasq: `rebind-domain-ok=/192-168-1-10.ipssl.cc/`). To fix one machine without changing the router, set it to a public resolver such as 1.1.1.1 or 8.8.8.8, or turn on DNS over HTTPS on it.
 
 ## 3. Get the certificate
 
@@ -43,8 +43,8 @@ The DNS API below refuses names with public addresses.
 Private means 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, fc00::/7, fe80::/10 or ::1. A CA cannot reach these, so the ACME client publishes the DNS-01 challenge through the API and ipssl.cc answers it in DNS. The client can run on any machine with internet access, not only the one at the address.
 
 - lego v5, or Traefik with the `httpreq` DNS provider:
-  `HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run --dns httpreq --dns.propagation.disable-ans --email YOUR_EMAIL -d 192-168-1-10.ipssl.cc`
-  Replace `YOUR_EMAIL` with the user's address. `--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API only answers once all four name servers hold the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`.
+  `HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run --dns httpreq --dns.propagation.disable-ans -d 192-168-1-10.ipssl.cc`
+  lego before 4.30 also needs `--email you@example.com`. `--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API only answers once all four name servers hold the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`.
 - certbot, with the hook script saved where only root can change it, since renewal runs it as root:
   `sudo curl -fsSL -o /usr/local/bin/ipssl-certbot-hook.sh https://ipssl.cc/acme/ipssl-certbot-hook.sh`
   `sudo certbot certonly --manual --preferred-challenges dns --manual-auth-hook "sh /usr/local/bin/ipssl-certbot-hook.sh present" --manual-cleanup-hook "sh /usr/local/bin/ipssl-certbot-hook.sh cleanup" -d 192-168-1-10.ipssl.cc`
@@ -70,7 +70,8 @@ The API, for other clients:
 
 - Every name under ipssl.cc shares Let's Encrypt's rate limit for the domain. Do not request new certificates in loops; keep one until it is due for renewal, or use ZeroSSL or Google Trust Services.
 - Let's Encrypt also allows 5 certificates per 7 days for the exact same set of names, shared by everyone who uses that name. Give common private names a label of the user's own (`myname-192-168-1-10.ipssl.cc`).
-- A certificate for a private address encrypts the connection but does not prove whose machine it is: anyone can get one for the same name, and anyone who can validate a name can also revoke its certificates.
+- A certificate for a private address encrypts the connection but does not prove whose machine it is: anyone can get one for the same name.
+- Anyone who can validate every name in a certificate can revoke it; for a certificate whose names all have private addresses, that is anyone.
 - After a public IP changes hands, its previous holder may still hold, or for a while obtain, certificates for its name.
 - Issued certificates appear in public Certificate Transparency logs, so the names in them, labels and addresses included, are searchable.
 - Never set cookies with `Domain=ipssl.cc`: other people's names under ipssl.cc can set those cookies too. Use host-only cookies or the `__Host-` prefix.

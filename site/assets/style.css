@@ -1427,12 +1427,6 @@ p {
   color: var(--code-accent);
 }
 
-/* A value to fill in before running the command. */
-.snip .ph {
-  color: var(--code-warn);
-  white-space: nowrap;
-}
-
 /* What is on port 80: picks one of a client's commands. */
 .modes {
   display: flex;
