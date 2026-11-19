@@ -560,7 +560,8 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
         let status = match e {
             ChallengeError::PublicAddress
             | ChallengeError::FixedAddress
-            | ChallengeError::Blocked => 403,
+            | ChallengeError::Blocked
+            | ChallengeError::CoversPublicHost => 403,
             _ => 400,
         };
         error(status, e.message())

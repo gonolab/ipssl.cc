@@ -51,6 +51,10 @@ async fn main() -> Result<()> {
     if args.acme_api {
         let config = Config::load(&args.config)?;
         let api = Api::from_config(&config)?;
+        // The API built the same zone, so this cannot fail.
+        if let Ok(zone) = Zone::from_config(&config) {
+            warn_about_challenges(&zone);
+        }
         if args.check {
             info!(nodes = ?api.nodes(), "config OK");
             return Ok(());
@@ -58,8 +62,8 @@ async fn main() -> Result<()> {
         return run_acme_api(&config, api).await;
     }
     if args.check {
-        let (config, _) = load(&args.config)?;
-        warn_about(&config);
+        let (config, zone) = load(&args.config)?;
+        warn_about(&config, &zone);
         info!("config OK");
         return Ok(());
     }
@@ -73,7 +77,7 @@ async fn main() -> Result<()> {
         .context("installing the SIGHUP handler")?;
 
     let (config, zone) = load(&args.config)?;
-    warn_about(&config);
+    warn_about(&config, &zone);
     let limiter = RateLimiter::from_config(&config.rate_limit)?;
     let listeners = bind_dns(&config.listen)?;
 
@@ -139,11 +143,24 @@ fn load(path: &Path) -> Result<(Config, Zone)> {
 }
 
 /// Logs settings that are allowed but probably not what was meant.
-fn warn_about(config: &Config) {
-    if let Some(acme) = &config.acme
-        && acme.writers.is_empty()
-    {
-        warn!("acme.writers is empty, so no challenge can be published");
+fn warn_about(config: &Config, zone: &Zone) {
+    if let Some(acme) = &config.acme {
+        if acme.writers.is_empty() {
+            warn!("acme.writers is empty, so no challenge can be published");
+        }
+        warn_about_challenges(zone);
+    }
+}
+
+/// Lists the names refused DNS-01 challenges only because of a fixed host
+/// right below them, see [`Zone::check_challenge`].
+fn warn_about_challenges(zone: &Zone) {
+    let names = zone.public_host_parents();
+    if !names.is_empty() {
+        warn!(
+            names = names.join(", "),
+            "these names take no DNS-01 challenges: a wildcard certificate for them would also cover a fixed host with a public address"
+        );
     }
 }
 
@@ -257,6 +274,10 @@ fn reload(path: &Path, running: &Config, handler: &Handler) -> Result<u32> {
     let (config, zone) = load(path)?;
     for setting in config.restart_only_changes(running) {
         warn!(setting, "changed, but only takes effect after a restart");
+    }
+    // Challenges are taken as long as the process runs with [acme].
+    if running.acme.is_some() {
+        warn_about_challenges(&zone);
     }
     handler.set_zone(zone);
     Ok(config.soa.serial)

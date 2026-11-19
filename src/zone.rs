@@ -47,6 +47,10 @@ pub struct Zone {
     /// They have to exist for the hosts to be found, even when the address
     /// in them is blocked.
     fixed_ancestors: HashSet<LowerName>,
+    /// Names with a fixed host right below them that has a public address
+    /// (`10-0-2-2.<domain>` for `app.10-0-2-2.<domain>`). They take no
+    /// DNS-01 challenges, see [`Self::check_challenge`].
+    public_host_parents: HashSet<LowerName>,
     whoami: LowerName,
     ip_ttl: u32,
     blocklist: Vec<IpNet>,
@@ -206,6 +210,19 @@ impl Zone {
             }
         }
 
+        // A wildcard covers one label, so only each host's own parent is
+        // affected; hosts at every depth have one.
+        let mut public_host_parents = HashSet::new();
+        for (owner, records) in &hosts {
+            let parent = owner.base_name();
+            if records.iter().any(is_public_address)
+                && parent != origin_lower
+                && origin_lower.zone_of(&parent)
+            {
+                public_host_parents.insert(parent);
+            }
+        }
+
         let whoami = fqdn(&format!(
             "{WHOAMI_LABEL}.{}",
             cfg.domain.trim_end_matches('.')
@@ -217,6 +234,7 @@ impl Zone {
             negative_soa,
             hosts,
             fixed_ancestors,
+            public_host_parents,
             whoami: LowerName::new(&whoami),
             ip_ttl: cfg.ttl.ip,
             blocklist: cfg.blocklist.clone(),
@@ -323,20 +341,34 @@ impl Zone {
     ///
     /// `<name>` is judged by what DNS answers for it: a fixed host with an
     /// address of its own never qualifies, whatever address its name holds.
+    ///
+    /// The challenge for `<name>` also proves control of `*.<name>`, which
+    /// covers every name one label below. So `<name>` does not qualify
+    /// either when a fixed host right below it has a public address:
+    /// otherwise anyone could get a wildcard certificate that is valid for
+    /// that host. The certificate for `<name>` alone is refused too, since
+    /// it uses the same challenge name.
     pub fn check_challenge(&self, name: &Name) -> Result<IpAddr, ChallengeError> {
         let base = self.challenge_base(name)?;
-        let fixed = self.hosts.get(&LowerName::new(&base));
-        if fixed.is_some_and(|records| records.iter().any(is_address)) {
-            return Err(ChallengeError::FixedAddress);
+        let ip = self.check_challenge_base(&base)?;
+        if self.public_host_parents.contains(&LowerName::new(&base)) {
+            return Err(ChallengeError::CoversPublicHost);
         }
-        let ip = self.embedded_ip(&base).ok_or(ChallengeError::NoAddress)?;
-        if self.is_blocked(ip) {
-            Err(ChallengeError::Blocked)
-        } else if !is_private(ip) {
-            Err(ChallengeError::PublicAddress)
-        } else {
-            Ok(ip)
-        }
+        Ok(ip)
+    }
+
+    /// Names that would take DNS-01 challenges if no fixed host with a
+    /// public address were right below them, sorted. Worth a warning: the
+    /// API refuses them although their own address is private.
+    pub fn public_host_parents(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .public_host_parents
+            .iter()
+            .filter(|name| self.check_challenge_base(name).is_ok())
+            .map(|name| name.to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     /// The answer to a TXT query for a challenge name, given the values
@@ -356,6 +388,23 @@ impl Zone {
             .map(|v| Record::from_rdata(qname.clone(), 0, RData::TXT(TXT::new(vec![v]))))
             .collect();
         self.answer(answers)
+    }
+
+    /// [`Self::check_challenge`] for `base`, the name a challenge name is
+    /// for, without the rule for the hosts below it.
+    fn check_challenge_base(&self, base: &Name) -> Result<IpAddr, ChallengeError> {
+        let fixed = self.hosts.get(&LowerName::new(base));
+        if fixed.is_some_and(|records| records.iter().any(is_address)) {
+            return Err(ChallengeError::FixedAddress);
+        }
+        let ip = self.embedded_ip(base).ok_or(ChallengeError::NoAddress)?;
+        if self.is_blocked(ip) {
+            Err(ChallengeError::Blocked)
+        } else if !is_private(ip) {
+            Err(ChallengeError::PublicAddress)
+        } else {
+            Ok(ip)
+        }
     }
 
     /// The name a challenge name is for: `10-0-2-2.<domain>` for
@@ -477,6 +526,9 @@ pub enum ChallengeError {
     FixedAddress,
     PublicAddress,
     Blocked,
+    /// A fixed host right below the name has a public address, which a
+    /// wildcard certificate for the name would cover.
+    CoversPublicHost,
 }
 
 impl ChallengeError {
@@ -494,6 +546,9 @@ impl ChallengeError {
                 "only names with private addresses can use this API; for a public address, run your ACME client on the machine that holds it (wildcard certificates are not available for names with public addresses)"
             }
             Self::Blocked => "this address is blocked",
+            Self::CoversPublicHost => {
+                "a wildcard certificate for this name would also cover a fixed host with a public address, so this name cannot use this API"
+            }
         }
     }
 }
@@ -516,6 +571,16 @@ impl Answer {
 
 fn is_address(record: &Record) -> bool {
     matches!(record.record_type(), RecordType::A | RecordType::AAAA)
+}
+
+/// Whether `record` is an A or AAAA record for an address that cannot take
+/// DNS-01 challenges itself (see [`is_private`]).
+fn is_public_address(record: &Record) -> bool {
+    match &record.data {
+        RData::A(a) => !is_private(IpAddr::V4(a.0)),
+        RData::AAAA(aaaa) => !is_private(IpAddr::V6(aaaa.0)),
+        _ => false,
+    }
 }
 
 /// TTLs and SOA timers are 31-bit numbers on the wire; the timers must
@@ -1316,6 +1381,80 @@ mod tests {
         ] {
             assert!(zone.challenge_name(name).is_ok(), "{name}");
         }
+    }
+
+    #[test]
+    fn public_hosts_block_the_wildcard_above_them() {
+        let zone = zone_with(
+            r#"
+            [hosts."app.10-0-2-2"]
+            a = ["203.0.113.5"]
+
+            [hosts."v6.10-0-2-3"]
+            aaaa = ["2001:db8::5"]
+
+            [hosts."lan.10-0-2-4"]
+            a = ["192.168.1.4"]
+            aaaa = ["fd00::4"]
+
+            [hosts."mail.10-0-2-5"]
+            txt = ["v=spf1 -all"]
+            mx = [{ preference = 10, exchange = "mx.example.net" }]
+
+            [hosts."a.b.10-0-2-6"]
+            a = ["198.51.100.6"]
+
+            [acme]
+            "#,
+        )
+        .unwrap();
+        // `*.10-0-2-2.ipssl.cc` would cover `app.10-0-2-2.ipssl.cc`.
+        for name in [
+            "_acme-challenge.10-0-2-2.ipssl.cc",
+            "_acme-challenge.10-0-2-3.ipssl.cc",
+            "_acme-challenge.b.10-0-2-6.ipssl.cc",
+        ] {
+            let err = zone.challenge_name(name).err();
+            assert_eq!(err, Some(ChallengeError::CoversPublicHost), "{name}");
+        }
+        // Children with private addresses only, or with no address of their
+        // own, change nothing. Nor does a host two labels down, which no
+        // wildcard for the name covers.
+        for name in [
+            "_acme-challenge.10-0-2-4.ipssl.cc",
+            "_acme-challenge.10-0-2-5.ipssl.cc",
+            "_acme-challenge.10-0-2-6.ipssl.cc",
+            "_acme-challenge.other.10-0-2-2.ipssl.cc",
+        ] {
+            assert!(zone.challenge_name(name).is_ok(), "{name}");
+        }
+        // Cleanup still takes the blocked names.
+        assert!(
+            zone.cleanup_name("_acme-challenge.10-0-2-2.ipssl.cc")
+                .is_ok()
+        );
+        // Only names that would qualify otherwise are listed, so not the
+        // apex: it is above `www`, but holds no address of its own.
+        assert_eq!(
+            zone.public_host_parents(),
+            [
+                "10-0-2-2.ipssl.cc.",
+                "10-0-2-3.ipssl.cc.",
+                "b.10-0-2-6.ipssl.cc."
+            ]
+        );
+    }
+
+    #[test]
+    fn name_server_addresses_block_the_wildcard_above_them() {
+        let mut cfg = config();
+        cfg.nameservers[1].name = "ns2.10-0-2-7.ipssl.cc".into();
+        let zone = Zone::from_config(&cfg).unwrap();
+        assert_eq!(
+            zone.challenge_name("_acme-challenge.10-0-2-7.ipssl.cc")
+                .err(),
+            Some(ChallengeError::CoversPublicHost)
+        );
     }
 
     #[test]
