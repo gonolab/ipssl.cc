@@ -28,7 +28,8 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use data_encoding::{HEXLOWER, HEXLOWER_PERMISSIVE};
-use ring::hmac;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 
 use super::error;
 use crate::http::{Request, Response};
@@ -53,11 +54,25 @@ pub type Tag = [u8; 32];
 
 /// The shared secret, ready to sign and verify.
 #[derive(Clone)]
-pub struct Key(hmac::Key);
+pub struct Key(Hmac<Sha256>);
 
 impl Key {
     pub fn new(secret: &[u8]) -> Self {
-        Self(hmac::Key::new(hmac::HMAC_SHA256, secret))
+        Self(Hmac::new_from_slice(secret).expect("HMAC takes keys of any length"))
+    }
+
+    fn sign(&self, message: &[u8]) -> Tag {
+        let mut mac = self.0.clone();
+        mac.update(message);
+        let tag = mac.finalize().into_bytes();
+        tag.as_slice().try_into().expect("SHA-256 has 32 bytes")
+    }
+
+    /// Whether `tag` is the MAC of `message`, compared in constant time.
+    fn verifies(&self, message: &[u8], tag: &[u8]) -> bool {
+        let mut mac = self.0.clone();
+        mac.update(message);
+        mac.verify_slice(tag).is_ok()
     }
 
     /// The headers that sign a request made at `time`, and the request's
@@ -69,8 +84,7 @@ impl Key {
         path: &str,
         body: &[u8],
     ) -> (Vec<(&'static str, String)>, Tag) {
-        let tag = hmac::sign(&self.0, &request_message(time, method, path, body));
-        let mac: Tag = tag.as_ref().try_into().expect("SHA-256 has 32 bytes");
+        let mac = self.sign(&request_message(time, method, path, body));
         let headers = vec![(TIME, time.to_string()), (MAC, HEXLOWER.encode(&mac))];
         (headers, mac)
     }
@@ -79,7 +93,7 @@ impl Key {
     /// `request`.
     pub fn sign_response(&self, request: &Tag, response: Response) -> Response {
         let message = reply_message(request, response.status, response.body.as_bytes());
-        let mac = HEXLOWER.encode(hmac::sign(&self.0, &message).as_ref());
+        let mac = HEXLOWER.encode(&self.sign(&message));
         response.with_header(MAC, mac)
     }
 
@@ -89,7 +103,7 @@ impl Key {
         let Ok(mac) = HEXLOWER_PERMISSIVE.decode(mac.as_bytes()) else {
             return false;
         };
-        hmac::verify(&self.0, &reply_message(request, status, body), &mac).is_ok()
+        self.verifies(&reply_message(request, status, body), &mac)
     }
 }
 
@@ -153,7 +167,7 @@ impl Guard {
             ));
         };
         let message = request_message(time, &req.method, &req.path, &req.body);
-        if hmac::verify(&self.key.0, &message, &mac).is_err() {
+        if !self.key.verifies(&message, &mac) {
             return Err(refuse(
                 "bad signature: acme.key differs between the API and this name server",
             ));
@@ -224,6 +238,18 @@ mod tests {
         let peer = "127.0.0.1:1".parse().unwrap();
         let req = Request::new("POST", path, peer, headers, body.as_bytes().to_vec());
         (req, mac)
+    }
+
+    #[test]
+    fn mac_is_hmac_sha256() {
+        // RFC 4231, test case 2.
+        let tag = Key::new(b"Jefe").sign(b"what do ya want for nothing?");
+        assert_eq!(
+            HEXLOWER.encode(&tag),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert!(Key::new(b"Jefe").verifies(b"what do ya want for nothing?", &tag));
+        assert!(!Key::new(b"Jefe").verifies(b"what do ya want for nothing?", &tag[..31]));
     }
 
     #[test]

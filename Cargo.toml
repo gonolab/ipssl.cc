@@ -18,12 +18,14 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 # Hex and base64 for acme.key, and MACs as hex; already pulled in by hickory.
 data-encoding = "2"
+# HMAC-SHA256 for the writes between the challenge API and the name
+# servers. Pure Rust, so the static musl builds need no C toolchain.
+hmac = "0.13"
 hickory-server = { version = "0.26.3", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
-# HMAC-SHA256 for the writes between the challenge API and the name servers.
-ring = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.11", default-features = false }
 socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 toml = "0.9"

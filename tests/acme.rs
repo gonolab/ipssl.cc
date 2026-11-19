@@ -10,7 +10,8 @@ use data_encoding::HEXLOWER;
 use hickory_server::Server;
 use hickory_server::proto::op::{Message, Query, ResponseCode};
 use hickory_server::proto::rr::{Name, RData, RecordType};
-use ring::hmac;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -696,8 +697,10 @@ fn key(key: &str) -> String {
 }
 
 fn mac(key: &str, message: &str) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &HEXLOWER.decode(key.as_bytes()).unwrap());
-    HEXLOWER.encode(hmac::sign(&key, message.as_bytes()).as_ref())
+    let key = HEXLOWER.decode(key.as_bytes()).unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+    mac.update(message.as_bytes());
+    HEXLOWER.encode(&mac.finalize().into_bytes())
 }
 
 /// The MAC that signs a request, as the API makes it.
