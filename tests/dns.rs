@@ -608,8 +608,9 @@ mod reload_helper {
 
     use super::*;
 
-    /// A port free on 127.0.0.1 for both UDP and TCP, for a server run as its
-    /// own process: its config cannot ask for port 0.
+    /// A port free on 127.0.0.1 for both UDP and TCP right now, for a server
+    /// run as its own process: its config cannot ask for port 0. The port
+    /// is released again, so the caller must cope with losing it.
     fn free_port() -> u16 {
         loop {
             let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -671,10 +672,8 @@ mod reload_helper {
         fs::create_dir_all(&run).unwrap();
         let config = dir.join("config.toml");
 
-        let dns: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-        let acme = format!("127.0.0.1:{}", free_port());
         // The config with this serial, plus `extra`.
-        let config_text = |serial: u32, extra: &str| {
+        let config_text = |dns: SocketAddr, serial: u32, extra: &str| {
             format!(
                 r#"
                 domain = "ipssl.cc"
@@ -692,27 +691,44 @@ mod reload_helper {
                 "#
             )
         };
-        let with_acme = format!("[acme]\nlisten = \"{acme}\"\nwriters = [\"127.0.0.1\"]");
-        fs::write(&config, config_text(2026110501, &with_acme)).unwrap();
+        let acme_section =
+            |acme: SocketAddr| format!("[acme]\nlisten = \"{acme}\"\nwriters = [\"127.0.0.1\"]");
 
-        let log = fs::File::create(dir.join("server.log")).unwrap();
-        let server = Process(
-            Command::new(bin)
-                .arg("-c")
-                .arg(&config)
-                .env("RUNTIME_DIRECTORY", &run)
-                .stdout(log.try_clone().unwrap())
-                .stderr(log)
-                .spawn()
-                .unwrap(),
-        );
-        let pid = server.0.id().to_string();
+        // Another process can take a port between `free_port` and the
+        // server binding it. The server then exits, so try other ports.
         let status = run.join("reload");
-        let started = Instant::now();
-        while !status.exists() {
-            assert!(started.elapsed() < Duration::from_secs(10), "no status");
-            thread::sleep(Duration::from_millis(20));
-        }
+        let (server, dns, acme) = (0..10)
+            .find_map(|_| {
+                let dns = SocketAddr::from(([127, 0, 0, 1], free_port()));
+                let acme = SocketAddr::from(([127, 0, 0, 1], free_port()));
+                let text = config_text(dns, 2026110501, &acme_section(acme));
+                fs::write(&config, text).unwrap();
+                let log = fs::File::create(dir.join("server.log")).unwrap();
+                let mut server = Process(
+                    Command::new(bin)
+                        .arg("-c")
+                        .arg(&config)
+                        .env("RUNTIME_DIRECTORY", &run)
+                        .stdout(log.try_clone().unwrap())
+                        .stderr(log)
+                        .spawn()
+                        .unwrap(),
+                );
+                // The status is written once every socket is bound.
+                let started = Instant::now();
+                while !status.exists() {
+                    if server.0.try_wait().unwrap().is_some() {
+                        return None;
+                    }
+                    assert!(started.elapsed() < Duration::from_secs(10), "no status");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Some((server, dns, acme))
+            })
+            .expect("the server never started");
+        let pid = server.0.id().to_string();
+        let with_acme = acme_section(acme);
+        let config_text = |serial: u32, extra: &str| config_text(dns, serial, extra);
         let reload = |runtime_dir: &Path| -> Output {
             Command::new(bin)
                 .arg("-c")
