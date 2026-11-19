@@ -755,6 +755,10 @@ p {
   color: var(--warn);
 }
 
+.callout-warn:first-child {
+  margin-top: 0;
+}
+
 .callout-link {
   display: inline-block;
   margin-top: 6px;

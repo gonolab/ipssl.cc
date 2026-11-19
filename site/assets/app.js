@@ -290,14 +290,21 @@
       "cert.public": "Run one command on the server at {ip}, and Let's Encrypt or any other CA issues it.",
       "cert.doc": "{ip} is an example address, reserved for documentation, so no CA validates it. Type your server's public address instead.",
       "cert.private": "A CA cannot reach {ip}, so ipssl.cc proves the name through DNS for you. Get it from any machine.",
-      "cert.tooLong": "This name is too long for a DNS-01 challenge: with _acme-challenge. in front, it passes 253 characters. Keep it to 237.",
       "cert.other": "No CA issues certificates for {ip}.",
       "cert.none": "Put an IP address in the name to get a certificate for it.",
-      "le.labels": "Let's Encrypt refuses names with more than 10 labels, and this one has {n}.",
-      "le.rldh": "Let's Encrypt refuses labels with -- as the third and fourth characters, such as {label}.",
+      "bad.tooLong": "This name is too long for a DNS-01 challenge: with _acme-challenge. in front, it passes 253 characters. Keep it to 237.",
+      "bad.labels": "Let's Encrypt refuses names with more than 10 labels, and this one has {n}.",
+      "bad.rldh": "Let's Encrypt refuses labels with -- as the third and fourth characters, such as {label}.",
       "ai.prompt": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} a hostname under ipssl.cc and an SSL certificate for it.",
       "ai.promptName": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} the hostname {name} and an SSL certificate for it.",
       "ai.promptNoIp": "Read https://ipssl.cc/llms.txt, then give my machine a hostname under ipssl.cc and an SSL certificate for it.",
+      "ai.promptFix": "Read https://ipssl.cc/llms.txt, then give my machine at {ip} a hostname under ipssl.cc {rules} ({why}) and an SSL certificate for it.",
+      "ai.rule.tooLong": "of at most 237 characters",
+      "ai.rule.labels": "with at most 10 labels",
+      "ai.rule.rldh": "with no -- as the third and fourth characters of a label",
+      "ai.why.tooLong": "{name} is too long for DNS-01",
+      "ai.why.labels": "{name} has {n} labels",
+      "ai.why.rldh": "Let's Encrypt refuses {label}",
       "forms.caption": "Every way to write {ip}",
       "anat.label": "Your label, optional",
       "anat.addr4": "The address, dots written as dashes",
@@ -317,7 +324,10 @@
       "note.publicEx": "Example name. Type a public IP above to use yours.",
       "note.private": "Run it on any machine with internet access.",
       "note.privateEx": "Example name. Type a private IP above to use yours.",
-      "note.tooLong": "Example name. Yours is too long for a DNS-01 challenge; keep it to 237 characters.",
+      "note.example": "Example name.",
+      "note.tooLong": "Yours is too long for a DNS-01 challenge; keep it to 237 characters.",
+      "note.labels": "Yours has {n} labels, and Let's Encrypt allows 10.",
+      "note.rldh": "Let's Encrypt refuses {label}: its third and fourth characters are --.",
       copy: "Copy",
       copied: "Copied",
       copyFailed: "Could not copy. Select the text and copy it yourself.",
@@ -365,14 +375,21 @@
       "cert.public": "在 {ip} 这台服务器上运行一条命令，Let's Encrypt 等任意 CA 都能签发。",
       "cert.doc": "{ip} 是文档专用的示例地址，没有 CA 会验证它。请换成你服务器的公网地址。",
       "cert.private": "CA 访问不到 {ip}，由 ipssl.cc 通过 DNS 替你完成验证，在任意机器上都能申请。",
-      "cert.tooLong": "这个名字太长，做不了 DNS-01 验证：前面加上 _acme-challenge. 后超过 253 个字符。请控制在 237 个字符以内。",
       "cert.other": "{ip} 这类地址申请不到证书。",
       "cert.none": "名字里要有 IP 地址，才能为它申请证书。",
-      "le.labels": "Let's Encrypt 不接受超过 10 级标签的名字，这个名字有 {n} 级。",
-      "le.rldh": "Let's Encrypt 不接受第 3、4 个字符是 -- 的标签，比如 {label}。",
+      "bad.tooLong": "这个名字太长，做不了 DNS-01 验证：前面加上 _acme-challenge. 后超过 253 个字符。请控制在 237 个字符以内。",
+      "bad.labels": "Let's Encrypt 不接受超过 10 级标签的名字，这个名字有 {n} 级。",
+      "bad.rldh": "Let's Encrypt 不接受第 3、4 个字符是 -- 的标签，比如 {label}。",
       "ai.prompt": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
       "ai.promptName": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配上域名 {name}，并为它申请 SSL 证书。",
       "ai.promptNoIp": "请阅读 https://ipssl.cc/llms.txt，然后给我的机器配一个 ipssl.cc 域名，并为它申请 SSL 证书。",
+      "ai.promptFix": "请阅读 https://ipssl.cc/llms.txt，然后给 IP 为 {ip} 的机器配一个{rules}的 ipssl.cc 域名（{why}），并为它申请 SSL 证书。",
+      "ai.rule.tooLong": "不超过 237 个字符",
+      "ai.rule.labels": "不超过 10 级标签",
+      "ai.rule.rldh": "标签第 3、4 个字符不是 -- ",
+      "ai.why.tooLong": "{name} 太长，做不了 DNS-01 验证",
+      "ai.why.labels": "{name} 有 {n} 级标签",
+      "ai.why.rldh": "Let's Encrypt 不接受 {label}",
       "forms.caption": "{ip} 的所有写法",
       "anat.label": "可选前缀",
       "anat.addr4": "地址，点写成横杠",
@@ -392,7 +409,10 @@
       "note.publicEx": "示例域名。在上面输入公网 IP，就会换成你的。",
       "note.private": "在任意一台能上网的机器上运行。",
       "note.privateEx": "示例域名。在上面输入内网 IP，就会换成你的。",
-      "note.tooLong": "示例域名。你的名字太长，做不了 DNS-01 验证，请控制在 237 个字符以内。",
+      "note.example": "示例域名。",
+      "note.tooLong": "你的名字太长，做不了 DNS-01 验证，请控制在 237 个字符以内。",
+      "note.labels": "你的名字有 {n} 级标签，Let's Encrypt 最多接受 10 级。",
+      "note.rldh": "Let's Encrypt 不接受 {label}：它的第 3、4 个字符是 --。",
       copy: "复制",
       copied: "已复制",
       copyFailed: "复制失败，请手动选中文字复制。",
@@ -572,16 +592,33 @@
     return ip ? { state: "name", ip, name, labels } : { state: "none", name, labels };
   }
 
-  /** Why Let's Encrypt would refuse `name` though DNS answers for it. */
-  function leProblems(name) {
+  /**
+   * Why a certificate for `name` would fail though DNS answers for it: too
+   * long for a DNS-01 challenge (private addresses), more than 10 labels, or
+   * a label Let's Encrypt keeps for encodings. Kept as data, so the callouts,
+   * the command panels and the AI prompt all say the same thing in either
+   * language. Addresses no CA validates have nothing to add here.
+   */
+  function certProblems(name, kind) {
+    if (kind !== "public" && kind !== "private") return [];
     const labels = name.split(".");
     const out = [];
-    if (labels.length > 10) out.push(t("le.labels", { n: labels.length }));
+    if (kind === "private" && name.length > MAX_DNS01_NAME) out.push({ key: "tooLong" });
+    if (labels.length > 10) out.push({ key: "labels", n: labels.length });
     // "ab--" is reserved for encodings; only punycode's "xn--" is allowed.
     const reserved = labels.find((l) => l.length >= 4 && l.slice(2, 4) === "--" && !l.startsWith("xn--"));
-    if (reserved) out.push(t("le.rldh", { label: reserved }));
+    if (reserved) out.push({ key: "rldh", label: reserved });
     return out;
   }
+
+  /** Joins whole sentences: a space in English, nothing in Chinese. */
+  const sentences = (parts) => parts.filter(Boolean).join(lang === "zh" ? "" : " ");
+
+  /** "a, b and c" in English, "a、b、c" in Chinese. */
+  const listOf = (items) =>
+    lang === "zh" || items.length < 2
+      ? items.join("、")
+      : `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 
   // ---------------------------------------------------------------------
   // Rendering
@@ -619,20 +656,18 @@
     let cert;
     if (r.state === "ip" || r.state === "name") {
       const ip = ipText(r.ip);
-      const { kind, query } = current;
+      const { kind, query, problems } = current;
+      const linkLocal = isLinkLocal6(r.ip);
       if (r.state === "ip") {
         title = escapeHtml(t("name.pending"));
         text = badge(r.ip) + escapeHtml(t("found", { name: query, ip }));
       } else {
         title = escapeHtml(t("name.resolves", { ip }));
-        text = badge(r.ip) + escapeHtml(t(isLinkLocal6(r.ip) ? "kind.linklocal" : `kind.${kind}`));
+        text = badge(r.ip) + escapeHtml(t(linkLocal ? "kind.linklocal" : `kind.${kind}`));
       }
-      if (kind === "private" && query.length > MAX_DNS01_NAME) {
-        cert = warn(t("cert.tooLong"));
-      } else {
-        cert = escapeHtml(t(`cert.${kind}`, { ip }));
-        if (kind === "public" || kind === "private") cert += leProblems(query).map(warn).join("");
-      }
+      // A name too long for DNS-01 has no way left to get a certificate.
+      const tooLong = problems.some((p) => p.key === "tooLong");
+      cert = (tooLong ? "" : escapeHtml(t(`cert.${kind}`, { ip }))) + problems.map((p) => warn(t(`bad.${p.key}`, p))).join("");
     } else if (r.state === "none") {
       title = escapeHtml(t("name.noneTitle"));
       text = escapeHtml(t("name.none"));
@@ -650,13 +685,26 @@
     nameTextEl.innerHTML = text;
     certText.innerHTML = cert;
     callouts.dataset.state = r.state;
-    // A typed name goes into the prompt whole, so the agent keeps its labels.
-    aiPrompt.textContent =
-      r.state === "name"
-        ? t("ai.promptName", { ip: ipText(r.ip), name: r.name })
-        : r.ip
-          ? t("ai.prompt", { ip: ipText(r.ip) })
-          : t("ai.promptNoIp");
+    aiPrompt.textContent = promptText(r);
+  }
+
+  /**
+   * The prompt for an AI agent. A typed name goes in whole, so the agent
+   * keeps its labels; one a CA would refuse goes in as the reason instead,
+   * so the agent picks a name that works.
+   */
+  function promptText(r) {
+    if (!r.ip) return t("ai.promptNoIp");
+    const ip = ipText(r.ip);
+    const { problems, query } = current;
+    if (problems.length) {
+      return t("ai.promptFix", {
+        ip,
+        rules: listOf(problems.map((p) => t(`ai.rule.${p.key}`))),
+        why: problems.map((p) => t(`ai.why.${p.key}`, { ...p, name: query })).join(lang === "zh" ? "；" : "; "),
+      });
+    }
+    return r.state === "name" ? t("ai.promptName", { ip, name: r.name }) : t("ai.prompt", { ip });
   }
 
   /** The forms table: every way to write the address, each one copyable. */
@@ -709,11 +757,16 @@
     const rec = namesFor(ip)[0];
 
     const name = current ? current.query : nameText(rec);
-    const publicHere = Boolean(current) && kind === "public";
+    // A name a CA would refuse keeps the example in the commands, and the
+    // note under them says why.
+    const problems = current ? current.problems : [];
+    const refused = problems.length
+      ? sentences([t("note.example"), ...problems.map((p) => t(`note.${p.key}`, p))])
+      : "";
+    const publicHere = Boolean(current) && kind === "public" && !refused;
     // A documentation address may fill the example, but it is nobody's address.
     const docHere = Boolean(current) && kind === "doc";
-    const tooLong = Boolean(current) && kind === "private" && name.length > MAX_DNS01_NAME;
-    const privateHere = Boolean(current) && kind === "private" && !tooLong;
+    const privateHere = Boolean(current) && kind === "private" && !refused;
     document.querySelectorAll('.host-slot[data-path="public"]').forEach((el) => {
       el.textContent = publicHere || docHere ? name : "203-0-113-10.ipssl.cc";
     });
@@ -722,16 +775,18 @@
     });
     $("#path-public").classList.toggle("is-yours", publicHere);
     $("#path-private").classList.toggle("is-yours", privateHere);
+    const refusedPublic = kind === "public" && refused;
+    const refusedPrivate = kind === "private" && refused;
     const notePublic = $("#note-public");
     notePublic.textContent = publicHere
       ? t("note.public", { ip: ipText(ip) })
       : docHere
         ? t("note.doc", { ip: ipText(ip) })
-        : t("note.publicEx");
-    notePublic.dataset.tone = docHere ? "warn" : "";
+        : refusedPublic || t("note.publicEx");
+    notePublic.dataset.tone = docHere || refusedPublic ? "warn" : "";
     const notePrivate = $("#note-private");
-    notePrivate.textContent = privateHere ? t("note.private") : tooLong ? t("note.tooLong") : t("note.privateEx");
-    notePrivate.dataset.tone = tooLong ? "warn" : "";
+    notePrivate.textContent = privateHere ? t("note.private") : refusedPrivate || t("note.privateEx");
+    notePrivate.dataset.tone = refusedPrivate ? "warn" : "";
     document.querySelectorAll(".ip-slot").forEach((el) => {
       el.textContent = privateHere ? ipText(ip) : "192.168.1.10";
     });
@@ -789,7 +844,13 @@
   function update() {
     const r = readInput(input.value);
     reading = r;
-    current = r.ip ? { ip: r.ip, kind: kindOf(r.ip), query: r.state === "name" ? r.name : nameText(namesFor(r.ip)[0]) } : null;
+    if (r.ip) {
+      const kind = kindOf(r.ip);
+      const query = r.state === "name" ? r.name : nameText(namesFor(r.ip)[0]);
+      current = { ip: r.ip, kind, query, problems: certProblems(query, kind) };
+    } else {
+      current = null;
+    }
     // A name without an address can still be looked up; it just has no expected answer.
     target = current ? { name: current.query, ip: current.ip } : r.state === "none" ? { name: r.name, ip: null } : null;
     if (current) family = current.ip.v;
