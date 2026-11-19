@@ -49,8 +49,14 @@ while :; do
         echo "ipssl.cc: $action request to $api failed" >&2
         exit 1
     }
+    # The API answers {"ok":true} on success. A 200 without it comes from
+    # something else, such as a proxy's error page, or reports a failure.
     if [ "$code" = 200 ]; then
-        exit 0
+        if grep -q '"ok"[[:space:]]*:[[:space:]]*true' "$tmp/body"; then
+            exit 0
+        fi
+        echo "ipssl.cc: $action failed (HTTP 200 without \"ok\":true): $(cat "$tmp/body")" >&2
+        exit 1
     fi
     if [ "$code" = 429 ]; then
         delay=$(tr -d '\r' < "$tmp/headers" | tr '[:upper:]' '[:lower:]' |

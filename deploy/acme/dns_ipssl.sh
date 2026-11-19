@@ -71,8 +71,14 @@ _ipssl_call() {
     fi
     _ipssl_code="$(grep -i '^HTTP' "$HTTP_HEADER" | _tail_n 1 | cut -d ' ' -f 2 | tr -d '\r\n')"
     _debug code "$_ipssl_code"
+    # The API answers {"ok":true} on success. A 200 without it comes from
+    # something else, such as a proxy's error page, or reports a failure.
     if [ "$_ipssl_code" = "200" ]; then
-      return 0
+      if _contains "$_ipssl_response" '"ok"[[:space:]]*:[[:space:]]*true'; then
+        return 0
+      fi
+      _err "ipssl.cc $_ipssl_action failed (HTTP 200 without \"ok\":true): $_ipssl_response"
+      return 1
     fi
     if [ "$_ipssl_code" = "429" ]; then
       # Wait as long as Retry-After asks, or back off from 6 seconds.
