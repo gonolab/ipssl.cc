@@ -3,6 +3,12 @@ Description=ipssl DNS-01 challenge API
 Documentation=https://github.com/gonolab/ipssl.cc#certificates-for-private-addresses
 After=network-online.target
 Wants=network-online.target
+# With acme.key the API signs each write with the time, and name servers
+# refuse times more than 30 s off their own clocks: start once the clock
+# is set. This waits for a sync only where a service such as
+# systemd-time-wait-sync or chrony-wait holds time-sync.target back.
+After=time-sync.target
+Wants=time-sync.target
 
 [Service]
 ExecStart=/usr/local/bin/ipssl-dns --acme-api -c /etc/ipssl/config.toml
