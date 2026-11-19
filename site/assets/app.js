@@ -268,7 +268,6 @@
       langAria: "切换到中文",
       empty: "Type an IP address such as 10.0.2.2, or a name such as app.10-0-2-2.ipssl.cc.",
       invalid: "Use digits, letters, dots and dashes, as in 10.0.2.2 or app.10-0-2-2.ipssl.cc.",
-      zoneId: "Drop the zone index (%…); a name cannot carry it.",
       outside: "The final dot ends the name there, and it is not under ipssl.cc. Drop the dot to put it in front of .ipssl.cc.",
       hyphen: "A label, the part between two dots, cannot start or end with a dash.",
       labelLong: "A label, the part between two dots, can be at most 63 characters long.",
@@ -353,7 +352,6 @@
       langAria: "Switch to English",
       empty: "输入一个 IP 地址，比如 10.0.2.2，或者一个域名，比如 app.10-0-2-2.ipssl.cc。",
       invalid: "只能用数字、字母、点和横杠，比如 10.0.2.2 或 app.10-0-2-2.ipssl.cc。",
-      zoneId: "去掉接口标识（%…），域名里放不下它。",
       outside: "末尾的点表示名字到此结束，而它不在 ipssl.cc 下。去掉这个点，它就会接在 .ipssl.cc 前面。",
       hyphen: "标签（两个点之间的部分）不能以横杠开头或结尾。",
       labelLong: "标签（两个点之间的部分）最长 63 个字符。",
@@ -571,8 +569,12 @@
     if (absolute) s = s.slice(0, -1);
     if (!s) return { state: "empty" };
     if (s.includes(":")) {
-      if (s.includes("%")) return { state: "error", msg: "zoneId" };
-      const a = parseV6(s, true);
+      // A zone index (fe80::1%en0) picks an interface on one machine only. A
+      // name cannot carry it, so it is dropped here, and a link-local address
+      // gets a warning instead.
+      const pct = s.indexOf("%");
+      if (pct >= 0 && !/^[a-z0-9_.-]+$/.test(s.slice(pct + 1))) return { state: "error", msg: "invalid" };
+      const a = parseV6(pct >= 0 ? s.slice(0, pct) : s, true);
       return a ? { state: "ip", ip: { v: 6, a } } : { state: "error", msg: "invalid" };
     }
     if (/^\d+(\.\d+){3}$/.test(s)) {
@@ -660,7 +662,8 @@
       const linkLocal = isLinkLocal6(r.ip);
       if (r.state === "ip") {
         title = escapeHtml(t("name.pending"));
-        text = badge(r.ip) + escapeHtml(t("found", { name: query, ip }));
+        // Warn before the name is made: it will not say which interface to use.
+        text = badge(r.ip) + escapeHtml(t("found", { name: query, ip })) + (linkLocal ? warn(t("kind.linklocal")) : "");
       } else {
         title = escapeHtml(t("name.resolves", { ip }));
         text = badge(r.ip) + escapeHtml(t(linkLocal ? "kind.linklocal" : `kind.${kind}`));

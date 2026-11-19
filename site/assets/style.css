@@ -748,7 +748,7 @@ p {
   font: 600 11.5px/1.6 var(--mono);
 }
 
-/* Why a CA would refuse this name, under the certificate note. */
+/* Why a CA would refuse this name, or why a name will not reach the address. */
 .callout-warn {
   display: block;
   margin-top: 4px;
