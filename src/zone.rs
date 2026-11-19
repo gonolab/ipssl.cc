@@ -58,7 +58,22 @@ pub struct Zone {
 }
 
 impl Zone {
+    /// Builds the zone `cfg` describes, for a server that starts with it.
     pub fn from_config(cfg: &Config) -> Result<Self> {
+        Self::build(cfg, false)
+    }
+
+    /// Builds the zone `cfg` describes, for a server that is already
+    /// running. `challenges` says whether that server answers challenge
+    /// names from its challenge store: it does from start to exit if it
+    /// started with `[acme]`, whatever `cfg` says now. Records configured
+    /// for such names would stay hidden, so they are an error then, as
+    /// they are with `[acme]` in `cfg`.
+    pub fn for_running(cfg: &Config, challenges: bool) -> Result<Self> {
+        Self::build(cfg, challenges)
+    }
+
+    fn build(cfg: &Config, running_challenges: bool) -> Result<Self> {
         let origin = fqdn(&cfg.domain).context("invalid `domain`")?;
         // An empty `domain` would make this server claim the whole DNS.
         ensure!(!origin.is_root(), "`domain` must not be empty");
@@ -244,12 +259,19 @@ impl Zone {
         // With [acme] on, TXT queries for names that can take a challenge
         // are answered from the challenge store, so records configured for
         // such a name would never be served.
-        if cfg.acme.is_some() {
+        if cfg.acme.is_some() || running_challenges {
             for label in cfg.hosts.keys() {
                 let name = host_name(label, &cfg.domain, &origin)?;
-                ensure!(
-                    zone.check_challenge(&name).is_err(),
-                    "host {label:?}: with [acme] on, TXT answers for this name come from the DNS-01 challenge API; remove the host or turn [acme] off"
+                if zone.check_challenge(&name).is_err() {
+                    continue;
+                }
+                if cfg.acme.is_some() {
+                    bail!(
+                        "host {label:?}: with [acme] on, TXT answers for this name come from the DNS-01 challenge API; remove the host or turn [acme] off"
+                    );
+                }
+                bail!(
+                    "host {label:?}: this server started with [acme], so TXT answers for this name come from the DNS-01 challenge API until it restarts; restart it instead of reloading to serve this host"
                 );
             }
         }
@@ -1475,6 +1497,27 @@ mod tests {
         assert!(err.to_string().contains("[acme]"), "{err}");
         // Names that cannot take a challenge keep their records.
         zone_with("[hosts.\"_acme-challenge.198-51-100-10\"]\ntxt = [\"manual\"]\n[acme]").unwrap();
+    }
+
+    #[test]
+    fn challenge_hosts_clash_with_a_running_challenge_store() {
+        // A server that started with [acme] keeps answering challenge names
+        // from its store after a reload drops [acme].
+        let cfg = format!("{CONFIG}\n[hosts.\"_acme-challenge.10-0-2-2\"]\ntxt = [\"manual\"]\n");
+        let cfg = Config::parse(&cfg).unwrap();
+        let err = Zone::for_running(&cfg, true).err().unwrap();
+        assert!(err.to_string().contains("restart"), "{err}");
+        // A server without a store serves the record.
+        Zone::for_running(&cfg, false).unwrap();
+        // With [acme] in the file, the store is in the way either way.
+        let mut with_acme = cfg.clone();
+        with_acme.acme = Config::parse(&format!("{CONFIG}\n[acme]\n")).unwrap().acme;
+        for running in [false, true] {
+            let err = Zone::for_running(&with_acme, running).err().unwrap();
+            assert!(err.to_string().contains("turn [acme] off"), "{err}");
+        }
+        // Other hosts are fine on a server with a store.
+        Zone::for_running(&config(), true).unwrap();
     }
 
     #[test]

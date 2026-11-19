@@ -134,12 +134,18 @@ async fn main() -> Result<()> {
 /// steps for `--check`, startup and reload, so a config one accepts the
 /// others accept too.
 fn load(path: &Path) -> Result<(Config, Zone)> {
+    let config = load_config(path)?;
+    let zone = Zone::from_config(&config)?;
+    Ok((config, zone))
+}
+
+/// Loads and checks the config at `path`, without its zone.
+fn load_config(path: &Path) -> Result<Config> {
     let config = Config::load(path)?;
     config
         .validate()
         .with_context(|| format!("checking {}", path.display()))?;
-    let zone = Zone::from_config(&config)?;
-    Ok((config, zone))
+    Ok(config)
 }
 
 /// Logs settings that are allowed but probably not what was meant.
@@ -269,12 +275,18 @@ async fn reload_on_sighup(
 /// restart are compared against it, so the warning repeats on every reload
 /// until the process is restarted. They are still validated, so a reload
 /// never accepts a config a restart would refuse.
+///
+/// The zone is checked against what keeps running too: a process that
+/// started with `[acme]` answers challenge names from its challenge store
+/// until it exits, so a reload that drops `[acme]` and configures records
+/// for such a name fails instead of leaving them hidden.
 #[cfg(unix)]
 fn reload(path: &Path, running: &Config, handler: &Handler) -> Result<u32> {
-    let (config, zone) = load(path)?;
+    let config = load_config(path)?;
     for setting in config.restart_only_changes(running) {
         warn!(setting, "changed, but only takes effect after a restart");
     }
+    let zone = Zone::for_running(&config, running.acme.is_some())?;
     // Challenges are taken as long as the process runs with [acme].
     if running.acme.is_some() {
         warn_about_challenges(&zone);
