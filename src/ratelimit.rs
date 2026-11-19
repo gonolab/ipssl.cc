@@ -6,10 +6,18 @@
 //! to `burst`. Once it runs dry, every `slip`-th response goes out truncated
 //! (TC=1, no records), which tells real resolvers to retry over TCP, where
 //! the source cannot be forged and nothing is limited. The rest are dropped.
+//!
+//! The table tracks at most `max_tracked` networks. A bucket that has filled
+//! up again carries no state a new one would not have, so such entries are
+//! forgotten: about once a second, and whenever a new network finds the
+//! table full. New networks share one overflow bucket only while every
+//! network in their part of the table is still active (checked at most
+//! every 100 ms).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -18,13 +26,23 @@ use ipnet::IpNet;
 
 use crate::config::RateLimitConfig;
 
-/// Number of independently locked parts of the table, to keep lock
-/// contention low on multi-core servers.
+/// Most independently locked parts of the table, to keep lock contention
+/// low on multi-core servers.
 const SHARDS: usize = 32;
 
-/// Shortest time between two sweeps of idle entries in one shard. Bounds
-/// the cost of sweeping when the table is full of busy networks.
+/// Smallest share of `max_tracked` per part. A new network can only take
+/// the place of one in its own part, so small tables get fewer parts, each
+/// big enough to hold an idle entry when any part does.
+const NETWORKS_PER_SHARD: usize = 1024;
+
+/// How often a part of the table forgets idle entries while there is room.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Shortest time between two sweeps of one part while the table is full.
+/// A sweep reads every entry of the part, so this bounds the cost when
+/// every tracked network is busy and there is nothing to forget; until
+/// the next sweep, new networks there share the overflow bucket.
+const FULL_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What to do with a response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,9 +60,6 @@ pub struct RateLimiter {
     rate: f64,
     /// Bucket size.
     burst: f64,
-    /// Time for an empty bucket to fill up; after that an entry carries no
-    /// state a fresh one would not have, so it can be forgotten.
-    refill: Duration,
     slip: u32,
     ipv4_prefix: u8,
     ipv6_prefix: u8,
@@ -52,9 +67,11 @@ pub struct RateLimiter {
     /// Random per process, so nobody can aim many networks at one shard.
     hasher: RandomState,
     shards: Box<[Mutex<Shard>]>,
-    shard_capacity: usize,
-    /// Shared by all networks that arrive while the table is full, so
-    /// flooding it with forged sources does not get anyone past the limit.
+    /// Networks tracked in all shards together, at most `max_tracked`.
+    tracked: AtomicUsize,
+    max_tracked: usize,
+    /// Shared by all networks that arrive while the table is full of active
+    /// ones, so flooding it with forged sources gets nobody past the limit.
     overflow: Mutex<Bucket>,
 }
 
@@ -105,11 +122,10 @@ impl RateLimiter {
     ) -> Self {
         let now = Instant::now();
         let burst = f64::from(burst);
-        let shards = SHARDS.min(max_tracked);
+        let shards = (max_tracked / NETWORKS_PER_SHARD).clamp(1, SHARDS);
         Self {
             rate,
             burst,
-            refill: Duration::from_secs_f64(burst / rate),
             slip: 0,
             ipv4_prefix,
             ipv6_prefix,
@@ -123,12 +139,8 @@ impl RateLimiter {
                     })
                 })
                 .collect(),
-            // Rounded up, so the table never holds fewer networks than
-            // configured. The limit is approximate: shards fill up on their
-            // own, so a busy shard can send new networks to the shared
-            // overflow bucket a little before `max_tracked` is reached, and
-            // up to `shards - 1` more networks may be tracked in total.
-            shard_capacity: max_tracked.div_ceil(shards),
+            tracked: AtomicUsize::new(0),
+            max_tracked,
             overflow: Mutex::new(Bucket::full(burst, now)),
         }
     }
@@ -140,7 +152,7 @@ impl RateLimiter {
 
     /// Number of client networks currently tracked.
     pub fn tracked(&self) -> usize {
-        self.shards.iter().map(|s| lock(s).buckets.len()).sum()
+        self.tracked.load(Ordering::Relaxed)
     }
 
     fn check_at(&self, client: IpAddr, now: Instant) -> Verdict {
@@ -156,16 +168,18 @@ impl RateLimiter {
             return self.take(bucket, now);
         }
 
-        // A network we are not tracking yet. Forget idle ones first:
-        // their buckets are full, the same as a new entry's.
+        // A network we are not tracking yet. Forget idle ones now and then,
+        // and whenever the table is full, so the new one can take the place
+        // of one of them.
         if now.saturating_duration_since(shard.last_sweep) >= SWEEP_INTERVAL {
-            let refill = self.refill;
-            shard
-                .buckets
-                .retain(|_, b| now.saturating_duration_since(b.updated) < refill);
-            shard.last_sweep = now;
+            self.sweep(&mut shard, now);
         }
-        if shard.buckets.len() < self.shard_capacity {
+        let mut reserved = self.reserve();
+        if !reserved && now.saturating_duration_since(shard.last_sweep) >= FULL_SWEEP_INTERVAL {
+            self.sweep(&mut shard, now);
+            reserved = self.reserve();
+        }
+        if reserved {
             let mut bucket = Bucket::full(self.burst, now);
             let verdict = self.take(&mut bucket, now);
             shard.buckets.insert(network, bucket);
@@ -174,6 +188,31 @@ impl RateLimiter {
         drop(shard);
 
         self.take(&mut lock(&self.overflow), now)
+    }
+
+    /// Counts one more tracked network, unless the table is full.
+    fn reserve(&self) -> bool {
+        self.tracked
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < self.max_tracked).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// Forgets the networks in `shard` whose buckets have filled up again:
+    /// they are the same as a new entry.
+    fn sweep(&self, shard: &mut Shard, now: Instant) {
+        let before = shard.buckets.len();
+        shard.buckets.retain(|_, bucket| !self.is_full(bucket, now));
+        self.tracked
+            .fetch_sub(before - shard.buckets.len(), Ordering::Relaxed);
+        shard.last_sweep = now;
+    }
+
+    /// Whether `bucket` would be full again at `now`.
+    fn is_full(&self, bucket: &Bucket, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
+        bucket.tokens + elapsed * self.rate >= self.burst
     }
 
     /// The client's network address, used as the bucket key.
@@ -331,37 +370,100 @@ mod tests {
         assert_eq!(rl.tracked(), 0);
     }
 
-    #[test]
-    fn full_table_shares_one_bucket() {
-        let rl = limiter(RateLimitConfig {
-            max_tracked: SHARDS,
-            ..cfg(1, 1, 0)
-        });
-        let now = Instant::now();
-        let allowed = (0..=255u8)
-            .flat_map(|a| (0..4u8).map(move |b| IpAddr::V4(Ipv4Addr::new(10, a, b, 1))))
-            .filter(|client| rl.check_at(*client, now) == Verdict::Allow)
-            .count();
-        // Every tracked network got its one token; all the others shared one.
-        let tracked = rl.tracked();
-        assert!(tracked <= SHARDS);
-        assert_eq!(allowed, tracked + 1);
+    /// The `i`-th of many IPv4 networks (/24s).
+    fn network(i: usize) -> IpAddr {
+        let [_, a, b, c] = u32::try_from(i).unwrap().to_be_bytes();
+        IpAddr::V4(Ipv4Addr::new(10 + a, b, c, 1))
     }
 
     #[test]
-    fn small_tables_track_as_many_networks_as_configured() {
-        // Room for 63 networks over 32 shards: two in each, not one.
+    fn full_table_shares_one_bucket() {
         let rl = limiter(RateLimitConfig {
-            max_tracked: 63,
+            max_tracked: 32,
             ..cfg(1, 1, 0)
         });
         let now = Instant::now();
-        for a in 0..=255u8 {
-            for b in 0..4u8 {
-                rl.check_at(IpAddr::V4(Ipv4Addr::new(10, a, b, 1)), now);
-            }
+        let allowed = (0..1024)
+            .filter(|i| rl.check_at(network(*i), now) == Verdict::Allow)
+            .count();
+        // Every tracked network got its one token; all the others shared one.
+        assert_eq!(rl.tracked(), 32);
+        assert_eq!(allowed, 32 + 1);
+    }
+
+    #[test]
+    fn tables_fill_up_before_networks_share_a_bucket() {
+        // Small tables are one part, bigger ones several; either way every
+        // entry is used before new networks overflow.
+        for max_tracked in [1, 63, 1000, 4096, 5000] {
+            let rl = limiter(RateLimitConfig {
+                max_tracked,
+                ..cfg(1, 1, 0)
+            });
+            let now = Instant::now();
+            let allowed = (0..max_tracked + 100)
+                .filter(|i| rl.check_at(network(*i), now) == Verdict::Allow)
+                .count();
+            assert_eq!(rl.tracked(), max_tracked, "{max_tracked}");
+            assert_eq!(allowed, max_tracked + 1, "{max_tracked}");
         }
-        assert_eq!(rl.tracked(), 64);
+    }
+
+    #[test]
+    fn full_table_overflows_only_while_every_network_is_active() {
+        let rl = limiter(RateLimitConfig {
+            max_tracked: 4,
+            ..cfg(1, 2, 0)
+        });
+        // Late enough that the table may be swept at once.
+        let t0 = Instant::now() + Duration::from_secs(1);
+        for i in 0..4 {
+            assert_eq!(rl.check_at(network(i), t0), Verdict::Allow);
+        }
+        // No bucket is full again yet, so every tracked network is active
+        // and new networks share the overflow bucket.
+        let t1 = t0 + Duration::from_millis(500);
+        for i in 0..3 {
+            assert_eq!(rl.check_at(network(i), t1), Verdict::Allow);
+        }
+        assert_eq!(rl.check_at(network(10), t1), Verdict::Allow);
+        assert_eq!(rl.check_at(network(10), t1), Verdict::Allow);
+        assert_eq!(rl.check_at(network(11), t1), Verdict::Drop);
+        assert_eq!(rl.tracked(), 4);
+
+        // Network 3 has been idle for a second, so its bucket is full
+        // again and a new network takes its place, with a bucket of its
+        // own. The others still have state worth keeping.
+        let t2 = t0 + Duration::from_secs(1);
+        assert_eq!(rl.check_at(network(12), t2), Verdict::Allow);
+        assert_eq!(rl.check_at(network(12), t2), Verdict::Allow);
+        assert_eq!(rl.check_at(network(12), t2), Verdict::Drop);
+        assert_eq!(rl.tracked(), 4);
+        assert_eq!(rl.check_at(network(0), t2), Verdict::Allow);
+        assert_eq!(rl.check_at(network(0), t2), Verdict::Drop);
+    }
+
+    #[test]
+    fn refilled_buckets_are_reclaimed() {
+        let rl = limiter(RateLimitConfig {
+            max_tracked: 1000,
+            ..cfg(1, 1, 0)
+        });
+        let t0 = Instant::now();
+        for i in 0..1000 {
+            assert_eq!(rl.check_at(network(i), t0), Verdict::Allow);
+        }
+        assert_eq!(rl.check_at(network(1000), t0), Verdict::Allow);
+        assert_eq!(rl.check_at(network(1001), t0), Verdict::Drop);
+
+        // A second later every bucket is full again, so another thousand
+        // networks get buckets of their own.
+        let t1 = t0 + Duration::from_secs(1);
+        let allowed = (2000..3000)
+            .filter(|i| rl.check_at(network(*i), t1) == Verdict::Allow)
+            .count();
+        assert_eq!(allowed, 1000);
+        assert_eq!(rl.tracked(), 1000);
     }
 
     #[test]
