@@ -1107,3 +1107,59 @@ async fn a_rollback_does_not_undo_a_retry_that_overlaps_it() {
         assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
     }
 }
+
+/// A stand-in for a name server that takes connections and reads the
+/// requests, but never answers.
+async fn silent_node() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _request = read_whole_request(&mut stream).await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_silent_name_server_costs_the_client_seconds_not_the_answer() {
+    // The present waits 5 s for the silent name server, then 2 s for it
+    // again while the value is taken back: inside the 10 s deadline.
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write, silent_node().await], "").await;
+    let started = std::time::Instant::now();
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert_eq!(status, 502, "{reply}");
+    assert!(took < Duration::from_secs(9), "{took:?}");
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}
+
+#[tokio::test]
+async fn a_slow_client_still_gets_its_answer_and_the_rollback() {
+    // The client takes 6 s to send its request. The answer's deadline
+    // starts after that, so the 7 s of waiting for the silent name server
+    // fit, and the value is taken back.
+    let ns = name_server("127.0.0.1").await;
+    let api = api(&[ns.write, silent_node().await], "").await;
+    let request = body(NAME, VALUE);
+    let mut stream = TcpStream::connect(api).await.unwrap();
+    let head = format!(
+        "POST /present HTTP/1.1\r\nHost: ipssl.cc\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        request.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 502 "), "{response:?}");
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+}

@@ -28,7 +28,8 @@ const MAX_CONNECTIONS: usize = 16;
 /// request, see [`turn_away`].
 const MAX_REFUSALS: usize = 16;
 
-/// Time a connection turned away with `503` has to send its request.
+/// Time a connection turned away with `503` has to send its request, and
+/// then to take the answer.
 const REFUSAL_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Largest request head we read.
@@ -40,7 +41,12 @@ const MAX_BODY: usize = 4 * 1024;
 /// Largest response the client reads.
 const MAX_RESPONSE: usize = 16 * 1024;
 
-/// Time a client has to send its request and read the response.
+/// Time a client has to send its request.
+const READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Time the server has to answer once the request is in: the handler and
+/// sending the response. It starts after the request is read, so a slow
+/// client does not eat into the handler's time.
 const DEADLINE: Duration = Duration::from_secs(10);
 
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
@@ -219,7 +225,8 @@ impl Server {
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    connection(stream, peer, DEADLINE, &*handler, &*observe).await;
+                    let deadlines = (READ_DEADLINE, DEADLINE);
+                    connection(stream, peer, deadlines, &*handler, &*observe).await;
                 });
             } else if let Ok(permit) = refusals.clone().try_acquire_owned() {
                 // Every slot is busy. Still read the request and say so:
@@ -227,7 +234,8 @@ impl Server {
                 // to the proxy in front, which then makes up its own error.
                 tokio::spawn(async move {
                     let _permit = permit;
-                    connection(stream, peer, REFUSAL_DEADLINE, &busy, &*observe).await;
+                    let deadlines = (REFUSAL_DEADLINE, REFUSAL_DEADLINE);
+                    connection(stream, peer, deadlines, &busy, &*observe).await;
                 });
             } else {
                 // The refusals are all taken too: say so all the same, but
@@ -266,21 +274,34 @@ fn turn_away(stream: &TcpStream) {
     }
 }
 
-/// Serves one connection, giving up after `deadline`.
+/// Serves one connection. `deadlines` are the time the client has to
+/// send its request, and then the time the server has to answer it.
 async fn connection<H, F>(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
-    deadline: Duration,
+    deadlines: (Duration, Duration),
     handler: &H,
     observe: &Observe,
 ) where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    match timeout(deadline, respond(stream, peer, handler, observe)).await {
+    let (read, answer) = deadlines;
+    let request = match timeout(read, read_request(&mut stream, peer)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
+            debug!(%error, "http: connection failed");
+            return;
+        }
+        Err(_) => {
+            debug!("http: request timed out");
+            return;
+        }
+    };
+    match timeout(answer, respond(stream, request, handler, observe)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => debug!(%error, "http: connection failed"),
-        Err(_) => debug!("http: connection timed out"),
+        Err(_) => debug!("http: answer timed out"),
     }
 }
 
@@ -289,9 +310,10 @@ fn busy(_: Request) -> std::future::Ready<Response> {
     std::future::ready(Response::text(503, "busy, try again shortly"))
 }
 
+/// Answers `request`, or sends the response that refuses it.
 async fn respond<H, F>(
     mut stream: TcpStream,
-    peer: SocketAddr,
+    request: Result<Request, Response>,
     handler: &H,
     observe: &Observe,
 ) -> io::Result<()>
@@ -299,7 +321,7 @@ where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    let (path, response) = match read_request(&mut stream, peer).await? {
+    let (path, response) = match request {
         Ok(request) => {
             let path = request.path.clone();
             (path, handler(request).await)
@@ -403,6 +425,7 @@ fn reason(status: u16) -> &'static str {
         411 => "Length Required",
         413 => "Content Too Large",
         429 => "Too Many Requests",
+        500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Unknown",

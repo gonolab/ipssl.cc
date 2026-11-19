@@ -794,13 +794,13 @@ impl Api {
         self.metrics.render(self.limiter.tracked())
     }
 
-    pub async fn handle(&self, req: Request) -> Response {
+    pub async fn handle(self: &Arc<Self>, req: Request) -> Response {
         match self.try_handle(req).await {
             Ok(response) | Err(response) => response,
         }
     }
 
-    async fn try_handle(&self, req: Request) -> Result<Response, Response> {
+    async fn try_handle(self: &Arc<Self>, req: Request) -> Result<Response, Response> {
         let action = route(&req)?;
         let client = client_ip(&req);
         if self.limiter.check(client) != Verdict::Allow {
@@ -810,8 +810,30 @@ impl Api {
         // The value belongs to the client, so only it can clean the value
         // up again; the caps count by its network, grouped as for rate
         // limiting.
-        let owner = owner(client);
-        let network = self.limiter.network(client);
+        let origin = Origin {
+            owner: Some(owner(client)),
+            network: Some(self.limiter.network(client)),
+        };
+        // The change runs in a task of its own, so that it finishes, and
+        // takes a failed present back, even if the client's connection is
+        // dropped meanwhile.
+        let api = self.clone();
+        tokio::spawn(async move { api.change(action, name, value, origin).await })
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "acme: a change failed");
+                Err(error(500, "internal error, try again later"))
+            })
+    }
+
+    /// Sends a checked change to every name server and answers the client.
+    async fn change(
+        &self,
+        action: Action,
+        name: LowerName,
+        value: String,
+        origin: Origin,
+    ) -> Result<Response, Response> {
         // Each change gets its own number, so every name server ends up
         // with the latest one. A present takes the number of its rollback
         // too, right after its own: a retry that overlaps a present that
@@ -827,8 +849,8 @@ impl Api {
             serde_json::json!({
                 "fqdn": name.to_ascii(),
                 "value": value,
-                "owner": owner,
-                "network": network,
+                "owner": origin.owner,
+                "network": origin.network,
                 "seq": seq,
             })
             .to_string()
