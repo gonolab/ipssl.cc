@@ -15,7 +15,8 @@
 //!   ([`Challenges`]) and takes writes only from the API hosts ([`Node`]).
 //!   A value belongs to the client that presented it, by its IPv4 address
 //!   or its IPv6 /64, which the API sends along ([`Origin`]); only that
-//!   client can clean it up.
+//!   client can clean it up. The API numbers its changes, and name servers
+//!   apply them in that order however they arrive ([`Sequence`]).
 //!
 //! Only names with private addresses qualify ([`Zone::check_challenge`]),
 //! and values must look like real challenge digests, so the API cannot be
@@ -23,8 +24,9 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use hickory_server::proto::rr::LowerName;
@@ -49,6 +51,10 @@ const LIFETIME: Duration = Duration::from_secs(600);
 
 /// Most challenge names held at once. Bounds memory.
 const MAX_NAMES: usize = 10_000;
+
+/// Most recent cleanups remembered at once, see [`Removal`]. Bounds
+/// memory; past it, the oldest are forgotten early.
+const MAX_REMOVALS: usize = 10_000;
 
 /// Shortest time between two sweeps of a full store, see
 /// [`Challenges::present`].
@@ -125,7 +131,9 @@ pub struct Challenges {
 #[derive(Default)]
 struct Inner {
     names: HashMap<LowerName, Vec<Entry>>,
-    /// When expired values were last swept out of the whole table.
+    /// Recent cleanups with a sequence number.
+    removals: HashMap<Key, Removal>,
+    /// When expired values and removals were last swept out.
     last_purge: Option<Instant>,
 }
 
@@ -133,7 +141,30 @@ struct Entry {
     value: String,
     /// Who presented the value.
     origin: Origin,
+    /// The API's number for the latest present of it, see [`Sequence`].
+    seq: Option<u64>,
     expires: Instant,
+}
+
+/// A cleanup the name server remembers for as long as a present sent
+/// before it could still be pending, so that such a present, arriving
+/// late, cannot bring the value back. Changes reach the name servers
+/// independently, so one name server may get a present after the cleanup
+/// that followed it while the others got them in order.
+///
+/// Removals are not values: they are never served and never count toward
+/// a cap. When there are too many, the oldest are forgotten early.
+struct Removal {
+    seq: u64,
+    /// When any present sent before the cleanup would have expired.
+    expires: Instant,
+}
+
+/// Whether a change numbered `seq` is older than the state numbered
+/// `current`, and so must not undo it. Changes without a number (from an
+/// API on v0.5.0) are applied as they come.
+fn superseded(seq: Option<u64>, current: Option<u64>) -> bool {
+    matches!((seq, current), (Some(seq), Some(current)) if seq <= current)
 }
 
 impl Entry {
@@ -207,21 +238,27 @@ impl Challenges {
 
     /// Publishes `value` at `name` for the owner in `origin`, or extends
     /// it if that owner published it there already.
-    pub fn present(&self, name: LowerName, value: &str, origin: Origin) -> Result<(), Full> {
-        self.present_at(name, value, origin, Instant::now())
+    ///
+    /// `seq` is the API's number for the change. A present older than the
+    /// latest present or cleanup of the same value by the same owner
+    /// changes nothing and still succeeds: the later change wins.
+    pub fn present(
+        &self,
+        name: LowerName,
+        value: &str,
+        origin: Origin,
+        seq: Option<u64>,
+    ) -> Result<(), Full> {
+        self.present_at(name, value, origin, seq, Instant::now())
     }
 
     /// Removes `value` from `name` if the owner in `origin` published it.
     /// Anything else is left alone, the same value published by another
-    /// owner included.
-    pub fn cleanup(&self, name: &LowerName, value: &str, origin: Origin) {
-        let names = &mut self.lock().names;
-        if let Some(entries) = names.get_mut(name) {
-            entries.retain(|e| e.value != value || !e.owned_by(&origin));
-            if entries.is_empty() {
-                names.remove(name);
-            }
-        }
+    /// owner included, and so is a value presented after this cleanup
+    /// (by `seq`). With a `seq`, the cleanup is remembered for a while,
+    /// see [`Removal`].
+    pub fn cleanup(&self, name: &LowerName, value: &str, origin: Origin, seq: Option<u64>) {
+        self.cleanup_at(name, value, origin, seq, Instant::now());
     }
 
     /// The values currently published at `name`, each once.
@@ -249,54 +286,56 @@ impl Challenges {
         name: LowerName,
         value: &str,
         origin: Origin,
+        seq: Option<u64>,
         now: Instant,
     ) -> Result<(), Full> {
         let mut inner = self.lock();
-        if !inner.names.contains_key(&name) && inner.names.len() >= MAX_NAMES {
-            // A sweep walks the whole table while TXT lookups wait for the
-            // lock, so a store kept full by a flood of new names sweeps at
-            // most once a second, however many writes arrive.
-            if inner
-                .last_purge
-                .is_none_or(|last| now.saturating_duration_since(last) >= PURGE_INTERVAL)
-            {
-                inner.purge(now);
-            }
-            if inner.names.len() >= MAX_NAMES {
-                return Err(Full::Store);
-            }
-        }
-        let entries = inner.names.entry(name).or_default();
-        entries.retain(|e| e.expires > now);
-        let expires = now + LIFETIME;
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|e| e.value == value && e.origin.owner == origin.owner)
+        let key = (name, value.to_owned(), origin.owner);
+        if let Some(removal) = inner.removals.get(&key)
+            && removal.expires > now
+            && superseded(seq, Some(removal.seq))
         {
-            entry.expires = expires;
             return Ok(());
         }
-        // Writes without an owner cannot be told apart, so only the cap
-        // for the whole name applies to them.
-        let network = origin.network();
-        if network.is_some()
-            && entries
-                .iter()
-                .filter(|e| e.origin.network() == network)
-                .count()
-                >= MAX_VALUES_PER_NETWORK
-        {
-            return Err(Full::Network);
+        inner.present(&key, origin, seq, now)?;
+        // The value is back, so the cleanup before it has nothing left to
+        // guard. Changes without a number leave removals alone.
+        if seq.is_some() {
+            inner.removals.remove(&key);
         }
-        if entries.len() >= MAX_VALUES {
-            return Err(Full::Name);
-        }
-        entries.push(Entry {
-            value: value.to_owned(),
-            origin,
-            expires,
-        });
         Ok(())
+    }
+
+    fn cleanup_at(
+        &self,
+        name: &LowerName,
+        value: &str,
+        origin: Origin,
+        seq: Option<u64>,
+        now: Instant,
+    ) {
+        let mut inner = self.lock();
+        // Whether this owner presented the value again after this cleanup.
+        let mut presented_since = false;
+        if let Some(entries) = inner.names.get_mut(name) {
+            entries.retain(|e| {
+                if e.value != value || !e.owned_by(&origin) {
+                    return true;
+                }
+                let newer = superseded(seq, e.seq);
+                presented_since |= newer;
+                newer
+            });
+            if entries.is_empty() {
+                inner.names.remove(name);
+            }
+        }
+        if let Some(seq) = seq
+            && !presented_since
+        {
+            let key = (name.clone(), value.to_owned(), origin.owner);
+            inner.remember_removal(key, seq, now);
+        }
     }
 
     fn values_at(&self, name: &LowerName, now: Instant) -> Vec<String> {
@@ -321,13 +360,109 @@ impl Challenges {
     }
 }
 
+/// A challenge name, a value and its owner.
+type Key = (LowerName, String, Option<IpAddr>);
+
 impl Inner {
+    /// Publishes or extends the value in `key`, see [`Challenges::present`].
+    fn present(
+        &mut self,
+        key: &Key,
+        origin: Origin,
+        seq: Option<u64>,
+        now: Instant,
+    ) -> Result<(), Full> {
+        let (name, value, owner) = key;
+        if !self.names.contains_key(name) && self.names.len() >= MAX_NAMES {
+            self.purge_if_due(now);
+            if self.names.len() >= MAX_NAMES {
+                return Err(Full::Store);
+            }
+        }
+        let entries = self.names.entry(name.clone()).or_default();
+        entries.retain(|e| e.expires > now);
+        let expires = now + LIFETIME;
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.value == *value && e.origin.owner == *owner)
+        {
+            if !superseded(seq, entry.seq) {
+                entry.expires = expires;
+                entry.seq = entry.seq.max(seq);
+            }
+            return Ok(());
+        }
+        // Writes without an owner cannot be told apart, so only the cap
+        // for the whole name applies to them.
+        let network = origin.network();
+        if network.is_some()
+            && entries
+                .iter()
+                .filter(|e| e.origin.network() == network)
+                .count()
+                >= MAX_VALUES_PER_NETWORK
+        {
+            return Err(Full::Network);
+        }
+        if entries.len() >= MAX_VALUES {
+            return Err(Full::Name);
+        }
+        entries.push(Entry {
+            value: value.clone(),
+            origin,
+            seq,
+            expires,
+        });
+        Ok(())
+    }
+
     fn purge(&mut self, now: Instant) {
         self.names.retain(|_, entries| {
             entries.retain(|e| e.expires > now);
             !entries.is_empty()
         });
+        self.removals.retain(|_, removal| removal.expires > now);
         self.last_purge = Some(now);
+    }
+
+    /// Purges unless the last purge was less than [`PURGE_INTERVAL`] ago.
+    /// A sweep walks both tables while TXT lookups wait for the lock, so a
+    /// store kept full by a flood of new names or cleanups sweeps at most
+    /// once a second, however many writes arrive.
+    fn purge_if_due(&mut self, now: Instant) {
+        if self
+            .last_purge
+            .is_none_or(|last| now.saturating_duration_since(last) >= PURGE_INTERVAL)
+        {
+            self.purge(now);
+        }
+    }
+
+    fn remember_removal(&mut self, key: Key, seq: u64, now: Instant) {
+        let expires = now + LIFETIME;
+        if let Some(removal) = self.removals.get_mut(&key) {
+            if seq > removal.seq || removal.expires <= now {
+                *removal = Removal { seq, expires };
+            }
+            return;
+        }
+        if self.removals.len() >= MAX_REMOVALS {
+            self.purge_if_due(now);
+        }
+        if self.removals.len() >= MAX_REMOVALS {
+            // A present sent before a cleanup arrives within seconds, so
+            // the oldest removal is the one least likely to be needed. A
+            // removal never stands in the way of a new value.
+            if let Some(oldest) = self
+                .removals
+                .iter()
+                .min_by_key(|(_, removal)| removal.expires)
+                .map(|(key, _)| key.clone())
+            {
+                self.removals.remove(&oldest);
+            }
+        }
+        self.removals.insert(key, Removal { seq, expires });
     }
 }
 
@@ -380,6 +515,10 @@ struct Forwarded {
     /// Left out by an API from v0.5.0 or older.
     #[serde(default)]
     network: Option<IpAddr>,
+    /// The API's number for the change, see [`Sequence`]. Left out by an
+    /// API from v0.5.0 or older.
+    #[serde(default)]
+    seq: Option<u64>,
 }
 
 fn route(req: &Request) -> Result<Action, Response> {
@@ -427,14 +566,22 @@ fn parse(req: &Request, zone: &Zone) -> Result<(LowerName, String), Response> {
     Ok((name, body.value))
 }
 
-/// Where the API says a change comes from, see [`Forwarded`].
-fn origin(req: &Request) -> Result<Origin, Response> {
+/// Where the API says a change comes from, and its number.
+fn forwarded(req: &Request) -> Result<(Origin, Option<u64>), Response> {
     serde_json::from_slice::<Forwarded>(&req.body)
-        .map(|f| Origin {
-            owner: f.owner,
-            network: f.network,
+        .map(|f| {
+            let origin = Origin {
+                owner: f.owner,
+                network: f.network,
+            };
+            (origin, f.seq)
         })
-        .map_err(|_| error(400, "owner and network must be IP addresses"))
+        .map_err(|_| {
+            error(
+                400,
+                "owner and network must be IP addresses, seq a whole number",
+            )
+        })
 }
 
 fn ok() -> Response {
@@ -507,17 +654,17 @@ impl Node {
         let action = route(&req).inspect_err(rejected)?;
         let zone = self.handler.zone();
         let (name, value) = parse(&req, &zone).inspect_err(rejected)?;
-        let origin = origin(&req).inspect_err(rejected)?;
+        let (origin, seq) = forwarded(&req).inspect_err(rejected)?;
         match action {
             Action::Present => {
-                if let Err(full) = self.store.present(name, &value, origin) {
+                if let Err(full) = self.store.present(name, &value, origin, seq) {
                     self.count(AcmeWrite::Rejected);
                     return Err(full.response());
                 }
             }
             // Removing nothing (a value this owner never published, or one
             // already gone) still succeeds, so cleanup can be retried.
-            Action::Cleanup => self.store.cleanup(&name, &value, origin),
+            Action::Cleanup => self.store.cleanup(&name, &value, origin, seq),
         }
         self.count(AcmeWrite::Accepted);
         Ok(ok())
@@ -530,6 +677,7 @@ pub struct Api {
     limiter: RateLimiter,
     nodes: Vec<SocketAddr>,
     metrics: ApiMetrics,
+    seq: Sequence,
 }
 
 impl Api {
@@ -552,6 +700,7 @@ impl Api {
             ),
             metrics: ApiMetrics::new(&nodes),
             nodes,
+            seq: Sequence::default(),
         })
     }
 
@@ -595,15 +744,21 @@ impl Api {
         // limiting.
         let owner = owner(client);
         let network = self.limiter.network(client);
-        // The ASCII form: `to_string` turns Punycode labels into Unicode,
-        // which name servers would reject.
-        let body = serde_json::json!({
-            "fqdn": name.to_ascii(),
-            "value": value,
-            "owner": owner,
-            "network": network,
-        })
-        .to_string();
+        // Each change, a rollback included, gets its own number, so every
+        // name server ends up with the latest one.
+        let change = || {
+            // The ASCII form: `to_string` turns Punycode labels into
+            // Unicode, which name servers would reject.
+            serde_json::json!({
+                "fqdn": name.to_ascii(),
+                "value": value,
+                "owner": owner,
+                "network": network,
+                "seq": self.seq.next(),
+            })
+            .to_string()
+        };
+        let body = change();
 
         let all = 0..self.nodes.len();
         let mut rejected = Vec::new();
@@ -637,7 +792,7 @@ impl Api {
         // right after the error cannot be undone by it.
         if action == Action::Present {
             let others = (0..self.nodes.len()).filter(|node| !rejected.contains(node));
-            self.roll_back(others, &body).await;
+            self.roll_back(others, &change()).await;
         }
         if !rejected.is_empty() {
             return Err(error(409, &too_many_values()));
@@ -685,9 +840,9 @@ impl Api {
         outcomes
     }
 
-    /// Cleans up a value presented with `body` on the name servers
-    /// numbered `nodes`, as far as they answer in time. Failures are only
-    /// logged: the value expires there on its own.
+    /// Cleans up a value with `body` on the name servers numbered
+    /// `nodes`, as far as they answer in time. Failures are only logged:
+    /// the value expires there on its own.
     async fn roll_back(&self, nodes: impl IntoIterator<Item = usize>, body: &str) {
         for (_, outcome) in self
             .send(nodes, Action::Cleanup, body, ROLLBACK_TIMEOUT)
@@ -697,6 +852,35 @@ impl Api {
                 warn!(%problem, "acme: could not take back a value after a failed change");
             }
         }
+    }
+}
+
+/// Numbers the API's changes, so that name servers apply them in the
+/// order the API made them, whatever order they arrive in: when a present
+/// and a cleanup of the same value overlap, every name server keeps the
+/// later one.
+///
+/// Each number is above the last and at least the wall-clock time in
+/// nanoseconds, so numbers keep increasing across restarts of the API as
+/// long as its clock does not go back.
+#[derive(Default)]
+struct Sequence {
+    last: AtomicU64,
+}
+
+impl Sequence {
+    fn next(&self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        let next = |last: u64| now.max(last.saturating_add(1));
+        let last = self
+            .last
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                Some(next(last))
+            })
+            .unwrap_or_else(|last| last);
+        next(last)
     }
 }
 
@@ -875,21 +1059,21 @@ mod tests {
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
         let me = client("192.0.2.10", "192.0.2.0");
         let now = Instant::now();
-        store.present_at(n.clone(), VALUE, me, now).unwrap();
-        store.present_at(n.clone(), "b", me, now).unwrap();
+        store.present_at(n.clone(), VALUE, me, None, now).unwrap();
+        store.present_at(n.clone(), "b", me, None, now).unwrap();
         assert_eq!(store.values_at(&n, now), [VALUE, "b"]);
 
-        store.cleanup(&n, "b", me);
+        store.cleanup(&n, "b", me, None);
         assert_eq!(store.values_at(&n, now), [VALUE]);
         assert!(store.values_at(&n, now + LIFETIME).is_empty());
 
         // Presenting again extends the lifetime instead of adding a copy.
         let later = now + LIFETIME / 2;
-        store.present_at(n.clone(), VALUE, me, later).unwrap();
+        store.present_at(n.clone(), VALUE, me, None, later).unwrap();
         assert_eq!(store.values_at(&n, now + LIFETIME), [VALUE]);
         assert_eq!(store.len_at(now), 1);
 
-        store.cleanup(&n, VALUE, me);
+        store.cleanup(&n, VALUE, me, None);
         assert!(store.is_empty());
     }
 
@@ -900,7 +1084,7 @@ mod tests {
         let me = client("192.0.2.10", "192.0.2.0");
         let other = client("198.51.100.7", "198.51.100.0");
         let now = Instant::now();
-        store.present_at(n.clone(), VALUE, me, now).unwrap();
+        store.present_at(n.clone(), VALUE, me, None, now).unwrap();
 
         // A neighbour on the same network, another network, a write with
         // no owner, or one with the network as the owner removes nothing.
@@ -910,18 +1094,20 @@ mod tests {
             NOBODY,
             old_client("192.0.2.0"),
         ] {
-            store.cleanup(&n, VALUE, them);
+            store.cleanup(&n, VALUE, them, None);
         }
         assert_eq!(store.values_at(&n, now), [VALUE]);
 
         // The same value from two owners is answered once and stays until
         // both have cleaned it up.
-        store.present_at(n.clone(), VALUE, other, now).unwrap();
+        store
+            .present_at(n.clone(), VALUE, other, None, now)
+            .unwrap();
         assert_eq!(store.values_at(&n, now), [VALUE]);
         assert_eq!(store.len_at(now), 1);
-        store.cleanup(&n, VALUE, me);
+        store.cleanup(&n, VALUE, me, None);
         assert_eq!(store.values_at(&n, now), [VALUE]);
-        store.cleanup(&n, VALUE, other);
+        store.cleanup(&n, VALUE, other, None);
         assert!(store.values_at(&n, now).is_empty());
     }
 
@@ -934,17 +1120,17 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_VALUES {
             store
-                .present_at(n.clone(), &i.to_string(), NOBODY, now)
+                .present_at(n.clone(), &i.to_string(), NOBODY, None, now)
                 .unwrap();
         }
         assert_eq!(
-            store.present_at(n.clone(), "x", NOBODY, now),
+            store.present_at(n.clone(), "x", NOBODY, None, now),
             Err(Full::Name)
         );
-        store.cleanup(&n, "0", old_client("192.0.2.0"));
-        store.cleanup(&n, "0", client("192.0.2.10", "192.0.2.0"));
+        store.cleanup(&n, "0", old_client("192.0.2.0"), None);
+        store.cleanup(&n, "0", client("192.0.2.10", "192.0.2.0"), None);
         assert_eq!(store.len_at(now), MAX_VALUES);
-        store.cleanup(&n, "0", NOBODY);
+        store.cleanup(&n, "0", NOBODY, None);
         assert_eq!(store.len_at(now), MAX_VALUES - 1);
     }
 
@@ -957,29 +1143,29 @@ mod tests {
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
         let now = Instant::now();
         let old = old_client("192.0.2.0");
-        store.present_at(n.clone(), "a", old, now).unwrap();
-        store.present_at(n.clone(), "b", old, now).unwrap();
+        store.present_at(n.clone(), "a", old, None, now).unwrap();
+        store.present_at(n.clone(), "b", old, None, now).unwrap();
         assert_eq!(
-            store.present_at(n.clone(), "c", old, now),
+            store.present_at(n.clone(), "c", old, None, now),
             Err(Full::Network)
         );
         // The new API counts that client's network the same way.
         let me = client("192.0.2.10", "192.0.2.0");
         assert_eq!(
-            store.present_at(n.clone(), "c", me, now),
+            store.present_at(n.clone(), "c", me, None, now),
             Err(Full::Network)
         );
 
-        store.cleanup(&n, "a", old);
+        store.cleanup(&n, "a", old, None);
         assert_eq!(store.values_at(&n, now), ["b"]);
         // Once the API is upgraded, a client on that network can still take
         // down what it presented before: those values never had an address.
-        store.cleanup(&n, "b", client("192.0.2.99", "192.0.2.0"));
+        store.cleanup(&n, "b", client("192.0.2.99", "192.0.2.0"), None);
         assert!(store.values_at(&n, now).is_empty());
 
         // Values the new API presented are not the network's.
-        store.present_at(n.clone(), "c", me, now).unwrap();
-        store.cleanup(&n, "c", old);
+        store.present_at(n.clone(), "c", me, None, now).unwrap();
+        store.cleanup(&n, "c", old, None);
         assert_eq!(store.values_at(&n, now), ["c"]);
     }
 
@@ -989,21 +1175,21 @@ mod tests {
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
         let me = client("192.0.2.10", "192.0.2.0");
         let now = Instant::now();
-        store.present_at(n.clone(), "a", me, now).unwrap();
-        store.present_at(n.clone(), "b", me, now).unwrap();
+        store.present_at(n.clone(), "a", me, None, now).unwrap();
+        store.present_at(n.clone(), "b", me, None, now).unwrap();
         // A third value from the same network is refused, whichever
         // address on it asks...
         assert_eq!(
-            store.present_at(n.clone(), "c", me, now),
+            store.present_at(n.clone(), "c", me, None, now),
             Err(Full::Network)
         );
         let neighbour = client("192.0.2.99", "192.0.2.0");
         assert_eq!(
-            store.present_at(n.clone(), "c", neighbour, now),
+            store.present_at(n.clone(), "c", neighbour, None, now),
             Err(Full::Network)
         );
         // ...but extending one it holds is fine.
-        store.present_at(n.clone(), "a", me, now).unwrap();
+        store.present_at(n.clone(), "a", me, None, now).unwrap();
         assert_eq!(store.values_at(&n, now), ["a", "b"]);
 
         // Other networks fill the name up to its cap.
@@ -1011,19 +1197,22 @@ mod tests {
             let them = client(&format!("198.51.{i}.1"), &format!("198.51.{i}.0"));
             for v in ["a", "b"] {
                 store
-                    .present_at(n.clone(), &format!("{v}{i}"), them, now)
+                    .present_at(n.clone(), &format!("{v}{i}"), them, None, now)
                     .unwrap();
             }
         }
         assert_eq!(store.len_at(now), MAX_VALUES);
         let late = client("203.0.113.1", "203.0.113.0");
-        assert_eq!(store.present_at(n.clone(), "z", late, now), Err(Full::Name));
+        assert_eq!(
+            store.present_at(n.clone(), "z", late, None, now),
+            Err(Full::Name)
+        );
         assert_eq!(store.values_at(&n, now)[..2], ["a", "b"]);
 
         // Once the first ones expire, there is room again.
         let later = now + LIFETIME;
-        store.present_at(n.clone(), "z", late, later).unwrap();
-        store.present_at(n.clone(), "c", me, later).unwrap();
+        store.present_at(n.clone(), "z", late, None, later).unwrap();
+        store.present_at(n.clone(), "c", me, None, later).unwrap();
         assert_eq!(store.values_at(&n, later), ["z", "c"]);
     }
 
@@ -1033,16 +1222,16 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, NOBODY, now).unwrap();
+            store.present_at(n, VALUE, NOBODY, None, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
         assert_eq!(
-            store.present_at(extra.clone(), VALUE, NOBODY, now),
+            store.present_at(extra.clone(), VALUE, NOBODY, None, now),
             Err(Full::Store)
         );
         // Once the others expire there is room again.
         store
-            .present_at(extra, VALUE, NOBODY, now + LIFETIME)
+            .present_at(extra, VALUE, NOBODY, None, now + LIFETIME)
             .unwrap();
         assert_eq!(store.len_at(now + LIFETIME), 1);
     }
@@ -1053,10 +1242,10 @@ mod tests {
         let now = Instant::now();
         for i in 0..MAX_NAMES {
             let n = name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
-            store.present_at(n, VALUE, NOBODY, now).unwrap();
+            store.present_at(n, VALUE, NOBODY, None, now).unwrap();
         }
         let extra = name("_acme-challenge.10-0-2-3.ipssl.cc.");
-        let present = |at| store.present_at(extra.clone(), VALUE, NOBODY, at);
+        let present = |at| store.present_at(extra.clone(), VALUE, NOBODY, None, at);
         // Just before the others expire: a sweep finds nothing to forget.
         let swept = now + LIFETIME - Duration::from_millis(500);
         assert_eq!(present(swept), Err(Full::Store));
@@ -1073,10 +1262,183 @@ mod tests {
         let store = Challenges::new();
         let now = Instant::now();
         let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
-        store.present_at(n.clone(), VALUE, NOBODY, now).unwrap();
+        store
+            .present_at(n.clone(), VALUE, NOBODY, None, now)
+            .unwrap();
         assert_eq!(store.len_at(now), 1);
         // Gone from the count as soon as DNS stops serving it, before any purge.
         assert_eq!(store.len_at(now + LIFETIME), 0);
         assert!(store.values_at(&n, now + LIFETIME).is_empty());
+    }
+
+    #[test]
+    fn a_late_present_does_not_undo_a_later_cleanup() {
+        // The API presented (1), then cleaned up (2); this name server got
+        // the cleanup first.
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let me = client("192.0.2.10", "192.0.2.0");
+        let now = Instant::now();
+        store.cleanup_at(&n, VALUE, me, Some(2), now);
+        store
+            .present_at(n.clone(), VALUE, me, Some(1), now)
+            .unwrap();
+        assert!(store.values_at(&n, now).is_empty());
+
+        // A present after the cleanup does publish the value, and a late
+        // copy of the cleanup does not take it down again.
+        store
+            .present_at(n.clone(), VALUE, me, Some(3), now)
+            .unwrap();
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        store.cleanup_at(&n, VALUE, me, Some(2), now);
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        store.cleanup_at(&n, VALUE, me, Some(4), now);
+        assert!(store.values_at(&n, now).is_empty());
+
+        // The cleanup is remembered only as long as a present sent before
+        // it could matter.
+        let later = now + LIFETIME;
+        store
+            .present_at(n.clone(), VALUE, me, Some(1), later)
+            .unwrap();
+        assert_eq!(store.values_at(&n, later), [VALUE]);
+    }
+
+    #[test]
+    fn a_late_cleanup_does_not_undo_a_later_present() {
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let me = client("192.0.2.10", "192.0.2.0");
+        let now = Instant::now();
+        store
+            .present_at(n.clone(), VALUE, me, Some(5), now)
+            .unwrap();
+        store.cleanup_at(&n, VALUE, me, Some(4), now);
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        // An older present neither adds a copy nor moves the expiry.
+        let soon = now + Duration::from_secs(60);
+        store
+            .present_at(n.clone(), VALUE, me, Some(3), soon)
+            .unwrap();
+        assert!(store.values_at(&n, now + LIFETIME).is_empty());
+        // The same change twice is applied once.
+        store
+            .present_at(n.clone(), VALUE, me, Some(5), soon)
+            .unwrap();
+        assert!(store.values_at(&n, now + LIFETIME).is_empty());
+        assert_eq!(store.len_at(now), 1);
+        assert!(store.lock().removals.is_empty());
+    }
+
+    #[test]
+    fn changes_without_a_number_apply_as_they_come() {
+        // What an API from v0.5.0 sends: no sequence numbers, and nothing
+        // is remembered of its cleanups.
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let old = old_client("192.0.2.0");
+        let now = Instant::now();
+        store.cleanup_at(&n, VALUE, old, None, now);
+        assert!(store.lock().removals.is_empty());
+        store.present_at(n.clone(), VALUE, old, None, now).unwrap();
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+        store.cleanup_at(&n, VALUE, old, None, now);
+        assert!(store.values_at(&n, now).is_empty());
+
+        // Against numbered changes they are always the newest.
+        let me = client("192.0.2.10", "192.0.2.0");
+        store
+            .present_at(n.clone(), VALUE, me, Some(9), now)
+            .unwrap();
+        store.cleanup_at(&n, VALUE, me, None, now);
+        assert!(store.values_at(&n, now).is_empty());
+        store.cleanup_at(&n, VALUE, me, Some(10), now);
+        store.present_at(n.clone(), VALUE, me, None, now).unwrap();
+        assert_eq!(store.values_at(&n, now), [VALUE]);
+    }
+
+    #[test]
+    fn removals_count_toward_no_cap() {
+        let store = Challenges::new();
+        let n = name("_acme-challenge.10-0-2-2.ipssl.cc.");
+        let me = client("192.0.2.10", "192.0.2.0");
+        let now = Instant::now();
+        // Many cleanups of values never presented, and of two that were.
+        for i in 0..MAX_VALUES {
+            store.cleanup_at(&n, &i.to_string(), me, Some(1), now);
+        }
+        store.present_at(n.clone(), "a", me, Some(2), now).unwrap();
+        store.present_at(n.clone(), "b", me, Some(3), now).unwrap();
+        store.cleanup_at(&n, "a", me, Some(4), now);
+        store.cleanup_at(&n, "b", me, Some(5), now);
+        assert_eq!(store.len_at(now), 0);
+        assert!(store.is_empty());
+        // The network still has room for two values, and the name for all.
+        store.present_at(n.clone(), "c", me, Some(6), now).unwrap();
+        store.present_at(n.clone(), "d", me, Some(7), now).unwrap();
+        for i in 1..MAX_VALUES / MAX_VALUES_PER_NETWORK {
+            let them = client(&format!("198.51.{i}.1"), &format!("198.51.{i}.0"));
+            for v in ["a", "b"] {
+                store
+                    .present_at(n.clone(), &format!("{v}{i}"), them, Some(8), now)
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.len_at(now), MAX_VALUES);
+    }
+
+    #[test]
+    fn removals_are_bounded() {
+        let store = Challenges::new();
+        let me = client("192.0.2.10", "192.0.2.0");
+        let now = Instant::now();
+        let n = |i: usize| name(&format!("_acme-challenge.{i}.10-0-2-2.ipssl.cc."));
+        for i in 0..=MAX_REMOVALS {
+            let at = now + Duration::from_millis(i as u64);
+            store.cleanup_at(&n(i), VALUE, me, Some(1), at);
+        }
+        assert_eq!(store.lock().removals.len(), MAX_REMOVALS);
+        // The oldest was forgotten, so a late present of it gets through;
+        // the newest is still guarded.
+        let at = now + Duration::from_secs(20);
+        store.present_at(n(0), VALUE, me, Some(0), at).unwrap();
+        assert_eq!(store.values_at(&n(0), at), [VALUE]);
+        store
+            .present_at(n(MAX_REMOVALS), VALUE, me, Some(0), at)
+            .unwrap();
+        assert!(store.values_at(&n(MAX_REMOVALS), at).is_empty());
+
+        // Expired removals are swept with the values.
+        store.lock().purge(now + LIFETIME + Duration::from_secs(20));
+        assert!(store.lock().removals.is_empty());
+    }
+
+    #[test]
+    fn sequence_numbers_increase_across_restarts() {
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let seq = Sequence::default();
+        let first = seq.next();
+        assert!(u128::from(first) >= before.as_nanos());
+        let mut last = first;
+        for _ in 0..1000 {
+            let next = seq.next();
+            assert!(next > last);
+            last = next;
+        }
+        // A restarted API starts from the clock, past what it sent before
+        // unless the clock went back.
+        let restarted = Sequence::default();
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(restarted.next() > first);
+
+        // Ahead of the clock (a clock set back, say), it keeps counting up
+        // from the last number it gave.
+        let future = first + 3_600_000_000_000;
+        let ahead = Sequence {
+            last: AtomicU64::new(future),
+        };
+        assert_eq!(ahead.next(), future + 1);
+        assert_eq!(ahead.next(), future + 2);
     }
 }

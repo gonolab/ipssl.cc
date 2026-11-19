@@ -546,6 +546,44 @@ async fn name_server_takes_writes_from_old_and_new_apis() {
 }
 
 #[tokio::test]
+async fn name_server_applies_changes_in_the_api_order() {
+    // A present and a cleanup of the same value overlap, and this name
+    // server gets them the wrong way round: the later one, by the API's
+    // numbers, wins, as it does on the name servers that got them in order.
+    let ns = name_server("127.0.0.1").await;
+    let change = |seq: u64| {
+        serde_json::json!({
+            "fqdn": NAME, "value": VALUE,
+            "owner": "192.0.2.10", "network": "192.0.2.0", "seq": seq,
+        })
+        .to_string()
+    };
+    let write = |path, seq| async move { post_json(ns.write, path, &change(seq)).await.unwrap() };
+
+    assert_eq!(
+        write("/cleanup", 200).await,
+        (200, r#"{"ok":true}"#.to_owned())
+    );
+    assert_eq!(write("/present", 100).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    assert_eq!(write("/present", 300).await.0, 200);
+    assert_eq!(write("/cleanup", 250).await.0, 200);
+    assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    assert_eq!(write("/cleanup", 400).await.0, 200);
+    assert!(txt(ns.dns, NAME).await.answers.is_empty());
+
+    let bad = serde_json::json!({ "fqdn": NAME, "value": VALUE, "seq": -1 });
+    assert_eq!(
+        post_json(ns.write, "/present", &bad.to_string())
+            .await
+            .unwrap()
+            .0,
+        400
+    );
+}
+
+#[tokio::test]
 async fn punycode_names_reach_the_name_servers() {
     let ns = name_server("127.0.0.1").await;
     let api = api(&[ns.write], "").await;
