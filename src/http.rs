@@ -8,10 +8,12 @@
 
 use std::future::Future;
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -22,7 +24,8 @@ use tracing::{debug, warn};
 const MAX_CONNECTIONS: usize = 16;
 
 /// Connections answered `503` while all [`MAX_CONNECTIONS`] are busy;
-/// past that, new connections are closed right away.
+/// past that, new connections get a fixed `503` without waiting for their
+/// request, see [`turn_away`].
 const MAX_REFUSALS: usize = 16;
 
 /// Time a connection turned away with `503` has to send its request.
@@ -41,6 +44,13 @@ const MAX_RESPONSE: usize = 16 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// What [`busy`] answers, as a whole response, for [`turn_away`].
+const OVERLOADED: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Content-Length: 24\r\n\
+    Connection: close\r\n\r\n\
+    busy, try again shortly\n";
 
 pub struct Request {
     pub method: String,
@@ -181,8 +191,40 @@ impl Server {
                     let _permit = permit;
                     connection(stream, peer, REFUSAL_DEADLINE, &busy, &*observe).await;
                 });
+            } else {
+                // The refusals are all taken too: say so all the same, but
+                // right here, without a task or any waiting.
+                turn_away(&stream);
+                observe("", 503);
             }
         }
+    }
+}
+
+/// Answers `503` on a connection that found every slot of both pools
+/// taken, without waiting for anything. It reads whatever part of the
+/// request has arrived (up to [`MAX_HEAD`]), since closing a connection
+/// with unread data resets it, and a reset can make the client drop the
+/// answer before reading it; then it writes [`OVERLOADED`] into the empty
+/// send buffer. The caller closes the connection by dropping it.
+///
+/// This goes to the socket directly: tokio's `try_read` and `try_write`
+/// report `WouldBlock` until the runtime has polled a new socket, which it
+/// has not at this point.
+fn turn_away(stream: &TcpStream) {
+    let socket = SockRef::from(stream);
+    let mut buf = [MaybeUninit::<u8>::uninit(); 1024];
+    let mut read = 0;
+    while read < MAX_HEAD {
+        let want = buf.len().min(MAX_HEAD - read);
+        match socket.recv(&mut buf[..want]) {
+            Ok(n) if n > 0 => read += n,
+            // The end of what has arrived, of the stream, or an error.
+            _ => break,
+        }
+    }
+    if let Err(error) = socket.send(OVERLOADED) {
+        debug!(%error, "http: could not answer a connection turned away");
     }
 }
 
@@ -492,6 +534,51 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         assert!(served);
+    }
+
+    #[tokio::test]
+    async fn overloaded_server_still_answers_503() {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log = seen.clone();
+        let server = Server::new(listener)
+            .observe(move |path, status| log.lock().unwrap().push((path.to_owned(), status)));
+        tokio::spawn(server.serve(|_: Request| std::future::ready(Response::text(200, "-"))));
+
+        // Connections that send nothing hold every slot of both pools.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS + MAX_REFUSALS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // Connect and send the request with blocking calls, so the server,
+        // on this test's only thread, takes the connection after both.
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.write_all(b"GET /metrics HTTP/1.1\r\n\r\n").unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut stream = TcpStream::from_std(stream).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "{response:?}"
+        );
+        assert!(response.ends_with("\r\n\r\nbusy, try again shortly\n"));
+        assert_eq!(*seen.lock().unwrap(), [(String::new(), 503)]);
+    }
+
+    #[tokio::test]
+    async fn fixed_503_matches_the_busy_answer() {
+        // Written the way every other response is, the busy answer comes
+        // out the same as the fixed one.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, busy));
+        let response = request(addr, "GET / HTTP/1.1\r\n\r\n").await;
+        assert_eq!(response.as_bytes(), OVERLOADED);
     }
 
     #[tokio::test]
