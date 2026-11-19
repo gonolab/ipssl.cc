@@ -980,13 +980,15 @@ async fn send(
     signing: Option<&Signing>,
 ) -> Outcome {
     let path = action.path();
-    let (headers, mac) = match signing {
+    let (headers, signed) = match signing {
         Some(signing) => {
-            let (headers, mac) =
+            // `post` names `addr` in the Host header, as it is written here.
+            let host = addr.to_string();
+            let (headers, signed) =
                 signing
                     .key
-                    .sign_request(auth::now(), "POST", path, body.as_bytes());
-            (headers, Some(mac))
+                    .sign_request(&host, auth::now(), "POST", path, body.as_bytes());
+            (headers, Some(signed))
         }
         None => (Vec::new(), None),
     };
@@ -997,7 +999,8 @@ async fn send(
             // A refusal over a cap (the client's to sort out) also stops
             // the API from taking the value back there, so both have to
             // be genuine.
-            (200, Some(true)) | (409, Some(false)) => match trust(&reply, signing, mac) {
+            (200, Some(true)) | (409, Some(false)) => match trust(&reply, signing, signed.as_ref())
+            {
                 Ok(()) if reply.status == 200 => return Outcome::Accepted,
                 Ok(()) => return Outcome::Rejected,
                 Err(problem) => problem.to_owned(),
@@ -1014,22 +1017,26 @@ async fn send(
     Outcome::Failed(format!("{addr} ({problem})"))
 }
 
-/// Whether `reply`, the answer to a request signed with `signing` whose
-/// MAC is `mac`, is genuine: signed with the key and bound to that
-/// request. Without a key every answer counts, as it did before keys.
+/// Whether `reply`, the answer to the request `signed` with `signing`, is
+/// genuine: signed with the key and bound to that request, which names
+/// the name server it went to. Without a key every answer counts, as it
+/// did before keys.
 fn trust(
     reply: &Reply,
     signing: Option<&Signing>,
-    mac: Option<auth::Tag>,
+    signed: Option<&auth::Signed>,
 ) -> Result<(), &'static str> {
-    let (Some(signing), Some(mac)) = (signing, mac) else {
+    let (Some(signing), Some(signed)) = (signing, signed) else {
         return Ok(());
     };
     match reply.header(auth::MAC) {
         Some(signature)
-            if signing
-                .key
-                .verifies_reply(&mac, reply.status, reply.body.as_bytes(), signature) =>
+            if signing.key.verifies_reply(
+                signed,
+                reply.status,
+                reply.body.as_bytes(),
+                signature,
+            ) =>
         {
             Ok(())
         }

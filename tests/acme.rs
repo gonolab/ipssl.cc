@@ -703,20 +703,17 @@ fn mac(key: &str, message: &str) -> String {
     HEXLOWER.encode(&mac.finalize().into_bytes())
 }
 
-/// The MAC that signs a request, as the API makes it.
-fn request_mac(key: &str, time: i64, path: &str, body: &str) -> String {
-    mac(
-        key,
-        &format!("ipssl-acme-v1 request\n{time}\nPOST\n{path}\n{body}"),
-    )
+/// The MAC that signs a request to `host`, as the API makes it.
+fn request_mac(key: &str, host: SocketAddr, time: i64, path: &str, body: &str) -> String {
+    let message = format!("ipssl-acme-v1 request\n{host}\n{time}\nPOST\n{path}\n{body}");
+    mac(key, &message)
 }
 
-/// The MAC that signs a name server's answer to a request with `request`.
-fn reply_mac(key: &str, request: &str, status: u16, body: &str) -> String {
-    mac(
-        key,
-        &format!("ipssl-acme-v1 reply\n{request}\n{status}\n{body}"),
-    )
+/// The MAC that signs a name server's answer to a request to `host`
+/// with `request`.
+fn reply_mac(key: &str, host: SocketAddr, request: &str, status: u16, body: &str) -> String {
+    let message = format!("ipssl-acme-v1 reply\n{host}\n{request}\n{status}\n{body}");
+    mac(key, &message)
 }
 
 fn unix_now() -> i64 {
@@ -807,25 +804,28 @@ async fn name_server_with_a_key_takes_each_fresh_signed_write_once() {
     assert_eq!(status, 401, "{reply}");
     assert!(reply.contains("not signed"), "{reply}");
 
-    // Signed, but too long ago, too far ahead, for another path, or
-    // with another key.
+    // Signed, but too long ago, too far ahead, for another path, for
+    // another name server, or with another key.
     let now = unix_now();
-    for (time, path, key) in [
-        (now - 60, "/present", KEY),
-        (now + 60, "/present", KEY),
-        (now, "/cleanup", KEY),
-        (now, "/present", OTHER_KEY),
+    let elsewhere: SocketAddr = "198.51.100.1:8053".parse().unwrap();
+    for (time, host, path, key) in [
+        (now - 60, ns.write, "/present", KEY),
+        (now + 60, ns.write, "/present", KEY),
+        (now, ns.write, "/cleanup", KEY),
+        (now, elsewhere, "/present", KEY),
+        (now, ns.write, "/present", OTHER_KEY),
     ] {
-        let reply = signed(time, "/present", request_mac(key, time, path, &request)).await;
-        assert_eq!(reply.status, 401, "{time} {path}: {}", reply.body);
+        let mac = request_mac(key, host, time, path, &request);
+        let reply = signed(time, "/present", mac).await;
+        assert_eq!(reply.status, 401, "{time} {host} {path}: {}", reply.body);
     }
     assert!(txt(ns.dns, NAME).await.answers.is_empty());
 
     // Signed right: taken, and the answer is signed for this request.
-    let mac = request_mac(KEY, now, "/present", &request);
+    let mac = request_mac(KEY, ns.write, now, "/present", &request);
     let reply = signed(now, "/present", mac.clone()).await;
     assert_eq!((reply.status, reply.body.as_str()), (200, r#"{"ok":true}"#));
-    let expected = reply_mac(KEY, &mac, 200, &reply.body);
+    let expected = reply_mac(KEY, ns.write, &mac, 200, &reply.body);
     assert_eq!(reply.header("x-ipssl-mac"), Some(expected.as_str()));
     assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
 
@@ -838,12 +838,15 @@ async fn name_server_with_a_key_takes_each_fresh_signed_write_once() {
     let bad = body(NAME, "not a challenge digest");
     let headers = vec![
         ("X-Ipssl-Time", now.to_string()),
-        ("X-Ipssl-Mac", request_mac(KEY, now, "/present", &bad)),
+        (
+            "X-Ipssl-Mac",
+            request_mac(KEY, ns.write, now, "/present", &bad),
+        ),
     ];
     let reply = post(ns.write, "/present", &headers, &bad).await.unwrap();
     assert_eq!(reply.status, 400);
-    let mac = request_mac(KEY, now, "/present", &bad);
-    let expected = reply_mac(KEY, &mac, 400, &reply.body);
+    let mac = request_mac(KEY, ns.write, now, "/present", &bad);
+    let expected = reply_mac(KEY, ns.write, &mac, 400, &reply.body);
     assert_eq!(reply.header("x-ipssl-mac"), Some(expected.as_str()));
 }
 
@@ -890,7 +893,9 @@ async fn api_with_a_key_trusts_no_forged_answer() {
         ok,
     );
     // A genuine signature, from the answer to another request.
-    let old = reply_mac(KEY, &request_mac(KEY, 1, "/present", "{}"), 200, ok);
+    let somewhere: SocketAddr = "198.51.100.1:8053".parse().unwrap();
+    let request = request_mac(KEY, somewhere, 1, "/present", "{}");
+    let old = reply_mac(KEY, somewhere, &request, 200, ok);
     let replayed = answer("200 OK", &format!("X-Ipssl-Mac: {old}\r\n"), ok);
     let full = answer("409 Conflict", "", r#"{"ok":false,"error":"full"}"#);
 
@@ -915,5 +920,128 @@ async fn api_with_a_key_trusts_no_forged_answer() {
             .await
             .unwrap();
         assert_eq!(status, expected, "{raw:?} with {settings:?}: {reply}");
+    }
+}
+
+/// A stand-in for the network path to the name server at `target` that
+/// passes requests and answers on, and keeps a copy of each answer in
+/// `answers`.
+async fn tapped_path(
+    target: SocketAddr,
+    answers: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let answers = answers.clone();
+            tokio::spawn(async move {
+                let Some(request) = read_whole_request(&mut stream).await else {
+                    return;
+                };
+                let mut node = TcpStream::connect(target).await.unwrap();
+                node.write_all(&request).await.unwrap();
+                let mut answer = Vec::new();
+                node.read_to_end(&mut answer).await.unwrap();
+                let _ = answers.send(answer.clone());
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A stand-in for the network path to a name server that never passes a
+/// request on, and answers each with the next answer from `answers`: what
+/// someone on the path could send back.
+async fn substituting_path(answers: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let answers = Arc::new(tokio::sync::Mutex::new(answers));
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let answers = answers.clone();
+            tokio::spawn(async move {
+                if read_whole_request(&mut stream).await.is_none() {
+                    return;
+                }
+                let Some(answer) = answers.lock().await.recv().await else {
+                    return;
+                };
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// Reads one request with its body from `stream`, or `None` if it ends
+/// first.
+async fn read_whole_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !complete(&request) {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => request.extend_from_slice(&chunk[..n]),
+        }
+    }
+    Some(request)
+}
+
+/// A stand-in for a second address of the name server at `target`: it
+/// relays connections there as they are.
+async fn relay(target: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut node = TcpStream::connect(target).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut node).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn api_refuses_one_name_servers_answer_for_another() {
+    // Someone on the path to ns2 drops the change and sends back ns1's
+    // signed answer to the same change instead.
+    let ns1 = name_server_with("127.0.0.1", &key(KEY)).await;
+    let ns2 = name_server_with("127.0.0.1", &key(KEY)).await;
+    let (tap, answers) = tokio::sync::mpsc::unbounded_channel();
+    let path1 = tapped_path(ns1.write, tap).await;
+    let path2 = substituting_path(answers).await;
+    let api = api(&[path1, path2], &key(KEY)).await;
+
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 502, "{reply}");
+    for ns in [&ns1, &ns2] {
+        assert!(txt(ns.dns, NAME).await.answers.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn one_name_server_at_two_endpoints_takes_every_change() {
+    // One host that serves two NS names on two addresses, or IPv4 and IPv6
+    // listed by hand: the API writes to it twice, with and without a key.
+    for settings in [String::new(), key(KEY)] {
+        let ns = name_server_with("127.0.0.1", &settings).await;
+        let second = relay(ns.write).await;
+        let api = api(&[ns.write, second], &settings).await;
+        for path in ["/present", "/cleanup", "/present"] {
+            let (status, reply) = post_json(api, path, &body(NAME, VALUE)).await.unwrap();
+            assert_eq!(status, 200, "{path} with {settings:?}: {reply}");
+        }
+        assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
     }
 }

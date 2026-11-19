@@ -84,6 +84,13 @@ impl Request {
     pub fn header(&self, name: &str) -> Option<&str> {
         header(&self.headers, name)
     }
+
+    /// Replaces the headers called `name` (lowercase) with one `value`.
+    #[cfg(test)]
+    pub fn set_header(&mut self, name: &str, value: &str) {
+        self.headers.retain(|(n, _)| n != name);
+        self.headers.push((name.to_owned(), value.to_owned()));
+    }
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

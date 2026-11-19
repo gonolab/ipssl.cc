@@ -1,24 +1,30 @@
 //! Signatures on the writes between the API and the name servers, with
 //! the shared secret in `acme.key`.
 //!
-//! The API signs each write with HMAC-SHA256 over the time, the method,
-//! the path and the body, which holds the change's sequence number, and
-//! sends the time and the MAC in two headers:
+//! The API signs each write with HMAC-SHA256 over the name server's
+//! endpoint as the API addresses it (the `Host` header), the time, the
+//! method, the path and the body, which holds the change's sequence
+//! number, and sends the time and the MAC in two headers:
 //!
 //! ```text
+//! Host:         198.51.100.1:8053
 //! X-Ipssl-Time: 1763540000
 //! X-Ipssl-Mac:  <64 hex digits>
-//! MAC = HMAC(key, "ipssl-acme-v1 request\n" time "\n" method "\n" path "\n" body)
+//! MAC = HMAC(key, "ipssl-acme-v1 request\n" host "\n" time "\n" method "\n" path "\n" body)
 //! ```
 //!
-//! A name server with the key takes a write only if the MAC is right, the
-//! time is within [`MAX_SKEW`] of its own clock and not before it started,
-//! and it has not taken the same write before. It signs its answer, bound
-//! to the request's MAC, so the API can tell it from a forged one:
+//! The endpoint makes the same change sent to two name servers, or to one
+//! name server at two addresses, two different requests. A name server
+//! with the key takes a write only if the MAC is right, the time is within
+//! [`MAX_SKEW`] of its own clock, and it has not taken the same write
+//! before. It does not check the endpoint against its own addresses: behind
+//! NAT it does not know the one the API uses. It signs its answer, bound
+//! to the endpoint and to the request's MAC, so the API can tell it from a
+//! forged one, and from another name server's answer to the same change:
 //!
 //! ```text
 //! X-Ipssl-Mac:  <64 hex digits>
-//! MAC = HMAC(key, "ipssl-acme-v1 reply\n" request-MAC-in-hex "\n" status "\n" body)
+//! MAC = HMAC(key, "ipssl-acme-v1 reply\n" host "\n" request-MAC-in-hex "\n" status "\n" body)
 //! ```
 //!
 //! A name server without a key ignores the headers and does not sign.
@@ -49,8 +55,16 @@ const MAX_SKEW: i64 = 30;
 /// time, see [`Recent`]. Far more than the API sends in a minute.
 const MAX_RECENT: usize = 100_000;
 
-/// A request's MAC.
+/// A MAC.
 pub type Tag = [u8; 32];
+
+/// A signed request, as far as its answer is bound to it: the endpoint it
+/// went to and its MAC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signed {
+    host: String,
+    mac: Tag,
+}
 
 /// The shared secret, ready to sign and verify.
 #[derive(Clone)]
@@ -75,31 +89,33 @@ impl Key {
         mac.verify_slice(tag).is_ok()
     }
 
-    /// The headers that sign a request made at `time`, and the request's
-    /// MAC, which the answer is bound to.
+    /// The headers that sign a request made at `time` to `host`, the
+    /// endpoint the request goes to as its `Host` header names it, and
+    /// the signed request, which the answer is bound to.
     pub fn sign_request(
         &self,
+        host: &str,
         time: i64,
         method: &str,
         path: &str,
         body: &[u8],
-    ) -> (Vec<(&'static str, String)>, Tag) {
-        let mac = self.sign(&request_message(time, method, path, body));
+    ) -> (Vec<(&'static str, String)>, Signed) {
+        let mac = self.sign(&request_message(host, time, method, path, body));
         let headers = vec![(TIME, time.to_string()), (MAC, HEXLOWER.encode(&mac))];
-        (headers, mac)
+        let host = host.to_owned();
+        (headers, Signed { host, mac })
     }
 
-    /// Adds the MAC that binds `response` to the request whose MAC is
-    /// `request`.
-    pub fn sign_response(&self, request: &Tag, response: Response) -> Response {
+    /// Adds the MAC that binds `response` to the `request` it answers.
+    pub fn sign_response(&self, request: &Signed, response: Response) -> Response {
         let message = reply_message(request, response.status, response.body.as_bytes());
         let mac = HEXLOWER.encode(&self.sign(&message));
         response.with_header(MAC, mac)
     }
 
     /// Whether `mac` (hex) is this key's MAC of an answer with `status` and
-    /// `body` to the request whose MAC is `request`. In constant time.
-    pub fn verifies_reply(&self, request: &Tag, status: u16, body: &[u8], mac: &str) -> bool {
+    /// `body` to `request`. In constant time.
+    pub fn verifies_reply(&self, request: &Signed, status: u16, body: &[u8], mac: &str) -> bool {
         let Ok(mac) = HEXLOWER_PERMISSIVE.decode(mac.as_bytes()) else {
             return false;
         };
@@ -107,15 +123,16 @@ impl Key {
     }
 }
 
-fn request_message(time: i64, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
-    let mut message = format!("ipssl-acme-v1 request\n{time}\n{method}\n{path}\n").into_bytes();
+fn request_message(host: &str, time: i64, method: &str, path: &str, body: &[u8]) -> Vec<u8> {
+    let mut message =
+        format!("ipssl-acme-v1 request\n{host}\n{time}\n{method}\n{path}\n").into_bytes();
     message.extend_from_slice(body);
     message
 }
 
-fn reply_message(request: &Tag, status: u16, body: &[u8]) -> Vec<u8> {
-    let request = HEXLOWER.encode(request);
-    let mut message = format!("ipssl-acme-v1 reply\n{request}\n{status}\n").into_bytes();
+fn reply_message(request: &Signed, status: u16, body: &[u8]) -> Vec<u8> {
+    let (host, mac) = (&request.host, HEXLOWER.encode(&request.mac));
+    let mut message = format!("ipssl-acme-v1 reply\n{host}\n{mac}\n{status}\n").into_bytes();
     message.extend_from_slice(body);
     message
 }
@@ -150,23 +167,24 @@ impl Guard {
     }
 
     /// Checks that `req` is signed with the key, recently, and new; returns
-    /// its MAC, or the answer that refuses it.
-    pub fn check(&self, req: &Request) -> Result<Tag, Response> {
+    /// it as signed, or the answer that refuses it.
+    pub fn check(&self, req: &Request) -> Result<Signed, Response> {
         self.check_at(req, now())
     }
 
-    fn check_at(&self, req: &Request, now: i64) -> Result<Tag, Response> {
+    fn check_at(&self, req: &Request, now: i64) -> Result<Signed, Response> {
         let refuse = |message: &str| error(401, message);
+        let host = req.header("host");
         let time = req.header(TIME).and_then(|t| t.parse::<i64>().ok());
         let mac = req
             .header(MAC)
             .and_then(|m| HEXLOWER_PERMISSIVE.decode(m.as_bytes()).ok());
-        let (Some(time), Some(mac)) = (time, mac) else {
+        let (Some(host), Some(time), Some(mac)) = (host, time, mac) else {
             return Err(refuse(
                 "not signed: this name server has acme.key, so the API needs it too",
             ));
         };
-        let message = request_message(time, &req.method, &req.path, &req.body);
+        let message = request_message(host, time, &req.method, &req.path, &req.body);
         if !self.key.verifies(&message, &mac) {
             return Err(refuse(
                 "bad signature: acme.key differs between the API and this name server",
@@ -184,7 +202,8 @@ impl Guard {
             return Err(refuse("signed before this name server started"));
         }
         self.lock().insert(mac, time, now)?;
-        Ok(mac)
+        let host = host.to_owned();
+        Ok(Signed { host, mac })
     }
 
     fn lock(&self) -> MutexGuard<'_, Recent> {
@@ -229,15 +248,18 @@ impl Recent {
 mod tests {
     use super::*;
 
-    fn request(key: &Key, time: i64, path: &str, body: &str) -> (Request, Tag) {
-        let (headers, mac) = key.sign_request(time, "POST", path, body.as_bytes());
+    const HOST: &str = "198.51.100.1:8053";
+
+    fn request(key: &Key, time: i64, path: &str, body: &str) -> (Request, Signed) {
+        let (headers, signed) = key.sign_request(HOST, time, "POST", path, body.as_bytes());
         let headers = headers
             .into_iter()
+            .chain([("Host", HOST.to_owned())])
             .map(|(n, v)| (n.to_ascii_lowercase(), v))
             .collect();
         let peer = "127.0.0.1:1".parse().unwrap();
         let req = Request::new("POST", path, peer, headers, body.as_bytes().to_vec());
-        (req, mac)
+        (req, signed)
     }
 
     #[test]
@@ -257,18 +279,35 @@ mod tests {
         let key = Key::new(&[7; 32]);
         let guard = Guard::new(key.clone());
         let now = guard.started;
-        let (req, mac) = request(&key, now, "/present", "{}");
-        assert_eq!(guard.check_at(&req, now).unwrap(), mac);
+        let (req, signed) = request(&key, now, "/present", "{}");
+        assert_eq!(guard.check_at(&req, now).unwrap(), signed);
 
-        let answer = key.sign_response(&mac, Response::new(200, "application/json", "{}"));
+        let answer = key.sign_response(&signed, Response::new(200, "application/json", "{}"));
         let signature = answer.headers[0].1.clone();
-        assert!(key.verifies_reply(&mac, 200, b"{}", &signature));
-        // Bound to the request, the status and the body.
-        assert!(!key.verifies_reply(&[0; 32], 200, b"{}", &signature));
-        assert!(!key.verifies_reply(&mac, 409, b"{}", &signature));
-        assert!(!key.verifies_reply(&mac, 200, b"{ }", &signature));
-        assert!(!Key::new(&[8; 32]).verifies_reply(&mac, 200, b"{}", &signature));
-        assert!(!key.verifies_reply(&mac, 200, b"{}", "not hex"));
+        assert!(key.verifies_reply(&signed, 200, b"{}", &signature));
+        // Bound to the request, the endpoint, the status and the body.
+        let other = Signed {
+            mac: [0; 32],
+            ..signed.clone()
+        };
+        assert!(!key.verifies_reply(&other, 200, b"{}", &signature));
+        let elsewhere = Signed {
+            host: "198.51.100.2:8053".to_owned(),
+            ..signed.clone()
+        };
+        assert!(!key.verifies_reply(&elsewhere, 200, b"{}", &signature));
+        assert!(!key.verifies_reply(&signed, 409, b"{}", &signature));
+        assert!(!key.verifies_reply(&signed, 200, b"{ }", &signature));
+        assert!(!Key::new(&[8; 32]).verifies_reply(&signed, 200, b"{}", &signature));
+        assert!(!key.verifies_reply(&signed, 200, b"{}", "not hex"));
+    }
+
+    #[test]
+    fn the_same_change_to_two_endpoints_is_two_requests() {
+        let key = Key::new(&[7; 32]);
+        let (_, one) = key.sign_request("198.51.100.1:8053", 1, "POST", "/present", b"{}");
+        let (_, two) = key.sign_request("[2001:db8::1]:8053", 1, "POST", "/present", b"{}");
+        assert_ne!(one.mac, two.mac);
     }
 
     #[test]
@@ -285,6 +324,9 @@ mod tests {
         // Another key, another path, another body, no signature.
         let (other, _) = request(&Key::new(&[8; 32]), now, "/present", "{}");
         assert_eq!(status(&other, now), Some(401));
+        let (mut redirected, _) = request(&key, now, "/present", "{\"a\":0}");
+        redirected.set_header("host", "198.51.100.2:8053");
+        assert_eq!(status(&redirected, now), Some(401));
         let (mut moved, _) = request(&key, now, "/present", "{\"a\":1}");
         moved.path = "/cleanup".to_owned();
         assert_eq!(status(&moved, now), Some(401));
