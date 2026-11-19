@@ -3,6 +3,12 @@ Description=ipssl wildcard DNS server
 Documentation=https://ipssl.cc
 After=network-online.target
 Wants=network-online.target
+# With acme.key the challenge API signs each write with the time, and this
+# server refuses times more than 30 s off its own clock: start once the
+# clock is set. This waits for a sync only where a service such as
+# systemd-time-wait-sync or chrony-wait holds time-sync.target back.
+After=time-sync.target
+Wants=time-sync.target
 
 [Service]
 ExecStart=/usr/local/bin/ipssl-dns -c /etc/ipssl/config.toml
