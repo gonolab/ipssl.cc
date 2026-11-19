@@ -20,8 +20,11 @@
 # /etc/ipssl/config.toml and stops, so the config can be filled in before
 # anything starts. An existing config is never changed. Before anything is
 # replaced, it is checked with the new binary as an unprivileged user, the
-# way the services read it. If a service does not stay up after the
-# restart, the previous binary and units are put back.
+# way the services read it, and refused while it still holds the
+# documentation addresses of an example config outside `blocklist`
+# (IPSSL_ALLOW_DOC_ADDRESSES=1 allows them, for a lab). If a service does
+# not stay up after the restart, the previous binary and units are put
+# back.
 
 set -eu
 
@@ -68,6 +71,34 @@ flag_for() {
 # True if files $1 and $2 have the same content.
 same_file() {
     [ "$(sha256sum < "$1")" = "$(sha256sum < "$2")" ]
+}
+
+# Prints the lines of config $1 that hold a documentation address
+# (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 or 2001:db8::/32), with
+# their numbers. The example configs of every release use them, so a
+# config that still holds one has not been filled in. Comments are
+# skipped, and so is `blocklist`, which may block these networks on
+# purpose.
+doc_addresses() {
+    awk '
+        { sub(/#.*/, "") }
+        in_blocklist {
+            if (index($0, "]")) in_blocklist = 0
+            next
+        }
+        /^[ \t]*blocklist[ \t]*=/ {
+            if (!index($0, "]")) in_blocklist = 1
+            next
+        }
+        {
+            s = " " tolower($0)
+            if (s ~ /[^0-9.](192\.0\.2|198\.51\.100|203\.0\.113)\.[0-9]/ ||
+                s ~ /[^0-9a-f:]2001:0*db8:/) {
+                sub(/^[ \t]+/, "")
+                printf "  line %d: %s\n", NR, $0
+            }
+        }
+    ' "$1"
 }
 
 # Replaces $3 with a copy of $2 (mode $1) atomically: the copy is written
@@ -261,11 +292,21 @@ for svc in $SERVICES; do
 done
 
 # Check the new binary against the existing config before replacing
-# anything. The untouched example passes the check, but would serve its
-# sample records.
+# anything. The example configs of this and earlier releases pass the
+# check, but would serve their sample records, so a config that still
+# holds their documentation addresses is refused as well.
 if [ -f "$CONFIG" ]; then
     if same_file "$CONFIG" "$PKG/config.example.toml"; then
         die "$CONFIG is still the example config. Nothing was changed. Fill it in, then run: $RERUN"
+    fi
+    found=$(doc_addresses "$CONFIG")
+    if [ -n "$found" ] && [ "${IPSSL_ALLOW_DOC_ADDRESSES:-}" = 1 ]; then
+        echo "install.sh: $CONFIG holds documentation addresses, allowed by IPSSL_ALLOW_DOC_ADDRESSES=1:" >&2
+        echo "$found" >&2
+    elif [ -n "$found" ]; then
+        echo "install.sh: $CONFIG still holds documentation addresses from an example config:" >&2
+        echo "$found" >&2
+        die "replace them with this deployment's own addresses (blocklist entries may keep them). Nothing was changed. Then run: $RERUN. For a lab that uses these networks on purpose, run: sudo env IPSSL_ALLOW_DOC_ADDRESSES=1 ${RERUN#sudo }"
     fi
     for svc in $SERVICES; do
         echo "Checking $CONFIG for $svc as an unprivileged user"

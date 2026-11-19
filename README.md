@@ -174,7 +174,7 @@ curl -fsSLO https://raw.githubusercontent.com/gonolab/ipssl.cc/main/deploy/insta
 sudo sh install.sh
 ```
 
-On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then run the command it prints (`sudo sh install.sh --dns` with the version), which checks the config and starts the service. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away. It refuses to start while the config is still the unchanged example.
+On a first install it writes the example config to `/etc/ipssl/config.toml` and stops: fill it in, then run the command it prints (`sudo sh install.sh --dns` with the version), which checks the config and starts the service. If a config is already there (for example copied over with `scp` first), the script checks it and starts the service right away. It refuses to start while the config is still the unchanged example, or while any line outside comments and `blocklist` holds a documentation address (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` or `2001:db8::/32`), as the example config of every release does. For a lab that uses those networks on purpose, run it as `sudo env IPSSL_ALLOW_DOC_ADDRESSES=1 sh install.sh` with the usual arguments.
 
 Run the script again to upgrade, optionally with a version such as `v0.4.0`. It upgrades every ipssl service enabled on the host, since they share the binary:
 
