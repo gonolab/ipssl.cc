@@ -26,9 +26,10 @@ app-192-168-1-10.ipssl.cc →  192.168.1.10
 
 Rules:
 
-- When a name contains more than one address, the rightmost one (closest to the zone) wins. A label of eight decimal numbers, such as `10-0-0-1-192-168-1-1`, holds two IPv4 addresses, not one IPv6 address, so it resolves to 192.168.1.1.
+- When a name contains more than one address, the rightmost one (closest to the zone) wins. A label of eight decimal numbers, such as `10-0-0-1-192-168-1-1`, holds two IPv4 addresses, not one IPv6 address, so it resolves to 192.168.1.1. To write an IPv6 address whose groups all look like such numbers, give the first group four digits: `0001-2-3-4-5-6-7-8.ipssl.cc` is 1:2:3:4:5:6:7:8.
 - Numbers with leading zeros (such as `010`) are rejected, so nobody has to guess whether they are octal.
 - Every name under `ipssl.cc` exists. A name without an address (such as `app.ipssl.cc`), or an AAAA query for an IPv4 name and the other way round, returns NODATA, not NXDOMAIN. Only names whose address is on the operator's blocklist return NXDOMAIN.
+- NS and MX answers include the addresses of their targets inside the zone in the additional section, such as the name servers' addresses. Addresses that would make the response too big for the client's buffer are left out, without setting TC.
 - A TXT query for `ip.ipssl.cc` returns the address the query came from (usually your recursive resolver). Handy for debugging.
 
 ## HTTPS certificates
@@ -129,10 +130,12 @@ Keep in mind:
 
 - The certificate encrypts the connection, but it does not prove whose machine you reached. `10.0.2.2` exists on countless networks, and anyone can get a certificate for the same name.
 - Names with public addresses are refused: otherwise anyone could get a certificate for someone else's server. Run the ACME client on that server and use HTTP-01 or TLS-ALPN-01.
+- A name is also refused when a fixed host one label below it has a public address, such as an `app.10-0-2-2.ipssl.cc` the operator set up: a wildcard certificate for `*.10-0-2-2.ipssl.cc` would cover that host. The name and its wildcard share one challenge name, so the certificate for `10-0-2-2.ipssl.cc` itself is refused too. The server logs these names at startup and on reload.
 - Values must be real DNS-01 digests. They are dropped after 10 minutes.
 - A name holds at most 16 pending values, and at most 2 from one client network. Over either cap the API answers 409 and keeps the values it has, so clean up after each order (the hooks and plugins do).
-- Only the client network that presented a value can clean it up. A cleanup from another network also answers 200, but removes nothing, since the values are public in DNS anyway.
-- If a name server does not take a value, the API answers 502 and takes the value back from the name servers that did, so a retry starts clean.
+- Only the client that presented a value can clean it up: the same IPv4 address, or an address in the same IPv6 /64. A cleanup from anyone else, a neighbour in the same /24 included, also answers 200 but removes nothing, since the values are public in DNS anyway. The caps above still count by client network (IPv4 /24, IPv6 /56, as `[rate_limit]` groups clients).
+- If a name server does not take a value, the API answers 502 and takes the value back from every name server that did not refuse it, one whose answer was lost included, so a retry starts clean.
+- When a present and a cleanup of the same value overlap, every name server ends up with the later one, whatever order they arrive in.
 - Each client network can make 10 requests a minute, with bursts of 20, which is enough for an order of about 20 names. The certbot hook and the acme.sh plugin wait and retry when the API answers 429.
 - These certificates count toward the same Let's Encrypt limit as every other name under `ipssl.cc`. Keep a certificate until it is due for renewal, or use another CA such as ZeroSSL or Google Trust Services.
 
@@ -181,6 +184,8 @@ cargo test
 - `src/config.rs`: config parsing and which changes need a restart
 - `src/metrics.rs`, `src/http.rs`: metric counting, rendering and the `/metrics` endpoint
 - `src/acme.rs`: which addresses count as private, challenge values, the challenge store
+- `src/acme/auth.rs`: signing and checking the writes between the API and the name servers
+- `src/reload.rs`: the reload status that `systemctl reload` waits for
 - `tests/dns.rs`: starts the server on a local port and sends real queries over UDP and TCP
 - `tests/acme.rs`: runs the challenge API and name servers locally and checks values reach DNS
 
@@ -328,7 +333,7 @@ sudo ipssl-dns -c /etc/ipssl/config.toml --check
 sudo systemctl reload ipssl-dns
 ```
 
-On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. `systemctl reload` runs the same check first and fails if the config does not pass. The server itself checks the whole file too, including the sections that need a restart: if anything is wrong, it logs the error, counts a failed reload and keeps answering from the running config. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart. With `[acme]`, restart the name servers one at a time (see [step 7](#7-dns-01-challenge-api-optional)).
+On reload (SIGHUP) the server re-reads the file and switches to the new records without dropping queries. `systemctl reload` waits for the result: it checks the file the way `--check` does, signals the server, and returns once the server reports that it serves the new zone. If the check fails or the server keeps its running config, the reload fails with the reason; `journalctl -u ipssl-dns` has the details, and `/run/ipssl-dns/reload` shows the latest result. The server checks the whole file against what is running, including the sections that need a restart. A server that started with `[acme]` keeps answering challenge names from its challenge store, so a config that drops `[acme]` and adds records for such a name needs a restart instead. Changes to `listen`, `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]` only take effect after a restart. With `[acme]`, restart the name servers one at a time (see [step 7](#7-dns-01-challenge-api-optional)).
 
 ### 6. Mail for the domain
 
@@ -378,7 +383,7 @@ This step enables [certificates for private addresses](#certificates-for-private
    ipssl-dns --acme-api -c /etc/ipssl/config.toml --check
    ```
 
-   By default that is each name server's first address of the family `acme.listen` uses (IPv4 for `0.0.0.0:8053`, IPv6 for `[::]:8053`), on the `acme.listen` port. If a name server has no address of that family, for example one outside the zone, list the endpoints in `acme.nodes`: the API refuses to start without them.
+   By default that is each name server's first address of the family `acme.listen` uses (IPv4 for `0.0.0.0:8053`, IPv6 for `[::]:8053`), on the `acme.listen` port. If a name server has no address of that family, for example one outside the zone, list the endpoints in `acme.nodes`: the API refuses to start without them. Name servers that share an address count as one host and get one endpoint. A list in `acme.nodes` needs an endpoint for every host: with fewer, `--check` fails and the API does not start. When the list is shorter than `[[nameservers]]` only because some name servers share an address, `--check` just warns.
 
    When the set of name servers changes, update the API host's config too and restart `ipssl-acme-api`: it reads the config only when it starts. Keep the API writing to every name server that resolvers may still ask:
 
@@ -388,6 +393,27 @@ This step enables [certificates for private addresses](#certificates-for-private
 3. Add the two locations from [`deploy/acme/nginx.conf`](deploy/acme/nginx.conf) to the website's `server` block, so the API is reachable over HTTPS at `/acme`, and reload nginx.
 
    With a load balancer, CDN or other proxy in front of nginx, also set up the trusted client address as the comment at the top of that file shows. Otherwise the API sees the proxy's address for every client, so they all share one rate limit and can clean up each other's values.
+
+4. Sign the writes between the API and the name servers. Port 8053 speaks plain HTTP and `writers` only checks the source address, so someone on the path could forge a write, or a name server's answer. With the same `acme.key` on the API host and every name server, the API signs every write with HMAC-SHA256 for the name server it goes to, a name server takes only writes that are signed, fresh and new, and the API trusts only answers that the name server it wrote to signed.
+
+   The clocks must agree: a name server refuses a write signed more than 30 seconds off its own clock. Run NTP on every host, and let the services start only once the clock is set: both units start after `time-sync.target`, which waits for a real sync only if you enable `systemd-time-wait-sync.service` (with systemd-timesyncd) or `chrony-wait.service` (with chrony).
+
+   The config stays readable by every local account (mode 644, so the services' unprivileged user can read it), and so does the key: keep other users off these hosts.
+
+   Create the key once:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+   Roll it out in this order, so DNS-01 keeps working at every step:
+
+   1. **Upgrade the binaries first:** every name server, then the API host. Older versions refuse a config with `acme.key`, and print the line, key included, in the error.
+   2. On the API host, add `key = "..."` and `allow_unsigned_nodes = true` to `[acme]` and restart `ipssl-acme-api`. It signs every write now; name servers without the key ignore the signature, and their unsigned answers still count.
+   3. On each name server in turn, add the same `key` and restart `ipssl-dns`. From then on it takes only signed writes and signs its answers.
+   4. On the API host, remove `allow_unsigned_nodes` and restart `ipssl-acme-api`. An unsigned or wrongly signed answer now counts as a failure.
+
+   To change the key, turn `allow_unsigned_nodes` back on, take the old key off the name servers one at a time, then roll out the new one from step 2. Keep the key out of version control. Errors about the config never show it.
 
 ## Rate limiting
 
@@ -413,7 +439,7 @@ curl -s http://127.0.0.1:9153/metrics
 | `ipssl_rate_limit_tracked_networks` | Client networks the rate limiter is tracking |
 | `ipssl_config_reloads_total{result}` | Config reloads that succeeded or failed |
 | `ipssl_acme_challenges` | DNS-01 challenge values being served; an expired value drops out at once (with `[acme]` only) |
-| `ipssl_acme_writes_total{result}` | Challenge writes: `accepted`, `rejected` (wrong path or method, a body that holds no valid challenge, or a value over a cap) or `forbidden` (a connection from an address not in `writers`, closed before it is read) (with `[acme]` only) |
+| `ipssl_acme_writes_total{result}` | Challenge writes: `accepted`, `rejected` (wrong path or method, a body that holds no valid challenge, a value over a cap, or, with `acme.key`, a write that is not properly signed) or `forbidden` (a connection from an address not in `writers`, closed before it is read) (with `[acme]` only) |
 | `ipssl_zone_serial` | SOA serial being served; compare across servers to check they run the same config |
 | `ipssl_build_info{version}` | Version of the running binary |
 | `process_start_time_seconds` | When the process started |
@@ -430,16 +456,18 @@ The DNS-01 challenge API (`ipssl-dns --acme-api`) serves its own metrics at `[me
 | Metric | Meaning |
 |---|---|
 | `ipssl_acme_api_requests_total{endpoint, status}` | Responses by endpoint (`present`, `cleanup` or `other`) and status: `200`, `400`, `403` (a name with a public or blocked address), `404`, `405`, `409` (over a cap on pending values), `411`, `413`, `429` (rate limited), `502` (a name server did not take the change), `503` (every connection slot busy) or `other` |
-| `ipssl_acme_api_node_writes_total{node, result}` | Changes sent to each name server: `accepted`, `rejected` (over a cap on pending values) or `failed` (down, too slow, or an answer that is not the name server's `{"ok":true}`) |
+| `ipssl_acme_api_node_writes_total{node, result}` | Changes sent to each name server: `accepted`, `rejected` (over a cap on pending values) or `failed` (down, too slow, or an answer that is not the name server's `{"ok":true}`, or with `acme.key` one it did not sign) |
 | `ipssl_rate_limit_tracked_networks` | Client networks the API's rate limiter is tracking |
 | `ipssl_build_info{version}` | Version of the running binary |
 | `process_start_time_seconds` | When the process started |
+
+The API and each name server's write port serve 16 connections at once and answer `503` to the next 16 while those are busy. Past that, a connection still gets an immediate `503`, sent without waiting for its request, so a client or proxy always sees a status instead of a dropped connection; those answers count with endpoint `other`. If the request arrives within a second after that answer went out, the server still reads it before it closes the connection, so the client gets the `503` rather than a reset.
 
 On a host that runs both the DNS server and the API, the two cannot share a `[metrics].listen` address, so give the API a config file of its own (and point `ipssl-acme-api.service` at it). With one shared config, whichever starts second cannot listen there: the API then runs without metrics and logs a warning, but the DNS server does not start.
 
 ## Website
 
-The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. Converting a name happens in the browser. The page looks a name up, through Cloudflare's DNS-over-HTTPS API, only when asked to: with the Check button, or Enter once the box holds a name (Enter on an IP address converts it first). For a name with an address, it asks for the name with a random label in front, which resolves the same, so the answer comes from ipssl.cc and not from Cloudflare's cache.
+The landing page at https://ipssl.cc lives in [`site/`](site/): plain HTML, CSS and JavaScript with no build step. Its hostname converter (`site/assets/app.js`) is a port of `src/parse.rs`, so keep the two in step when the naming rules change. Converting a name happens in the browser. The page looks a name up, through Cloudflare's DNS-over-HTTPS API, only when asked to: with the Check button, or Enter once the box holds a name (Enter on an IP address converts it first). For a name with an address, it asks for the name's A and AAAA records and, at the same time, for the name with a random label in front, which resolves the same. The check passes only if the name has exactly the expected address and nothing of the other type, and the fresh name agrees. That fresh lookup reaches one of the name servers, not all of them, and a name too long for a random label is asked as it is, so its answer may come from Cloudflare's cache.
 
 Preview it locally:
 

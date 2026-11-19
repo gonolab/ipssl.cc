@@ -1,8 +1,9 @@
 # Example config for ipssl-dns. Copy to config.toml and adjust.
 # SIGHUP (`systemctl reload ipssl-dns`) reloads everything except `listen`,
 # `tcp_timeout_secs`, `[rate_limit]`, `[metrics]` and `[acme]`, which need
-# a restart. A reload checks the whole file the way `--check` and startup
-# do, and keeps the running config if it fails.
+# a restart. `systemctl reload` checks the whole file the way `--check` and
+# startup do and waits for the server; it fails if the server keeps the
+# running config.
 # All addresses are documentation examples (198.51.100.0/24, 2001:db8::/32);
 # replace them before going live. install.sh refuses to start a service
 # while any remain outside `blocklist`.
@@ -68,9 +69,10 @@ ipv4_prefix = 24
 ipv6_prefix = 56
 # Never limited, e.g. your monitoring
 exempt = []
-# Most client networks tracked at once (bounds memory). Approximate: the
-# table has 32 parts that fill up on their own, each holding max_tracked / 32
-# rounded up, so a few new networks may share one limit a little early.
+# Most client networks tracked at once (bounds memory). A network whose
+# limit has refilled is forgotten, and when the table is full a new network
+# takes its place; new networks share a single limit only while every
+# tracked network is still active.
 max_tracked = 100000
 
 # Prometheus metrics at http://<listen>/metrics. Remove the section to turn
@@ -97,13 +99,33 @@ listen = "127.0.0.1:9153"
 # Name server write endpoints; empty means each name server's first
 # address of the `listen` family (IPv4 for 0.0.0.0, IPv6 for [::]) on the
 # `listen` port. List them here when a name server has no such address,
-# e.g. one outside the zone: the API refuses to start without them.
+# e.g. one outside the zone: the API refuses to start without them. A
+# list here needs an endpoint for every name server host: with fewer
+# --check fails. Name servers that share an address (one host serving two
+# names) count as one host, which only logs a warning.
 #nodes = []
 # API requests per client network
 #requests_per_minute = 10
 #burst = 20
+# Shared key that signs every write between the API and the name servers,
+# and every answer (HMAC-SHA256): at least 32 random bytes as hex or
+# base64, e.g. from `openssl rand -hex 32`. Use the same key on the API
+# host and every name server. This file stays readable by every local
+# account, so keep other users off these hosts. A name server with a key
+# takes only signed writes; the API trusts only signed answers. The
+# clocks must agree within 30 seconds: run NTP, and see the README (DNS-01
+# API, step 4) for waiting for the time sync at boot. Upgrade the binaries
+# before adding a key: older versions refuse it and print it in the error.
+#key = "..."
+# API only, while the key is being rolled out: also trust unsigned answers
+# from name servers that do not have the key yet. Remove it once they all
+# do.
+#allow_unsigned_nodes = true
 
 [soa]
+# Contact address for the SOA record. Dots before the @ are fine
+# (admin.dns@example.net); that part must be 1 to 63 printable ASCII
+# characters, without spaces or backslashes.
 email = "hostmaster@ipssl.cc"
 # Bump on config changes; any scheme works, e.g. YYYYMMDDnn
 serial = 2026110501
@@ -127,6 +149,10 @@ records = 3600
 #   or `aaaa` records replace the encoded address of that type.
 # - With `[acme]` on, a host whose name can take a DNS-01 challenge (such
 #   as "_acme-challenge.10-0-2-2") is an error: the challenges would hide it.
+# - With `[acme]` on, a host with a public `a` or `aaaa` address keeps the
+#   name one label above it ("10-0-2-2" for "app.10-0-2-2") from taking
+#   DNS-01 challenges, since a wildcard certificate for that name would
+#   cover the host. The server warns about such names.
 # - txt: one record per entry. Values over 255 bytes (RSA DKIM keys) are
 #   split into 255-byte strings automatically; paste them in one piece.
 # - mx: `exchange` is always a full host name, never relative to `domain`.

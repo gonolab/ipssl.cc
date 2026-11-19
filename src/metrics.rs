@@ -257,7 +257,7 @@ impl Metrics {
                 &mut out,
                 "ipssl_acme_writes_total",
                 "counter",
-                "DNS-01 challenge writes, by result. forbidden counts connections from addresses not in acme.writers.",
+                "DNS-01 challenge writes, by result. rejected includes writes without a valid signature when acme.key is set; forbidden counts connections from addresses not in acme.writers.",
             );
             for (i, result) in ["accepted", "rejected", "forbidden"].iter().enumerate() {
                 let value = load(&self.acme_writes[i]);

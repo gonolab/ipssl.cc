@@ -33,7 +33,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
-# Only for errno constants (EAFNOSUPPORT); already pulled in by tokio.
+# For errno constants (EAFNOSUPPORT) and kill(2) for --reload; already
+# pulled in by tokio.
 libc = "0.2"
 
 [profile.release]

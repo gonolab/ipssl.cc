@@ -335,9 +335,9 @@ pub struct RateLimitConfig {
     /// Clients that are never limited, e.g. monitoring.
     #[serde(default)]
     pub exempt: Vec<IpNet>,
-    /// Most client networks tracked at once. Bounds memory; when the table
-    /// is full, new networks share a single limit. Approximate, since the
-    /// table is split into parts that fill up on their own.
+    /// Most client networks tracked at once. Bounds memory; networks whose
+    /// limit has refilled are forgotten, and new networks share a single
+    /// limit only while every tracked network is active.
     #[serde(default = "default_max_tracked")]
     pub max_tracked: usize,
 }
