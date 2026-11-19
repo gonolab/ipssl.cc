@@ -6,6 +6,7 @@ use std::time::Duration;
 use hickory_server::Server;
 use hickory_server::proto::op::{Edns, Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_server::proto::rr::{Name, RData, RecordType};
+use hickory_server::proto::serialize::binary::{BinDecodable, BinDecoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
@@ -231,6 +232,104 @@ async fn largest_rrset_still_goes_out_over_tcp() {
     assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
     assert!(!resp.metadata.truncation);
     assert_eq!(resp.answers.len(), 243);
+}
+
+/// The additional records as `name type rdata`.
+fn additionals(msg: &Message) -> Vec<String> {
+    msg.additionals
+        .iter()
+        .map(|r| format!("{} {} {}", r.name, r.record_type(), r.data))
+        .collect()
+}
+
+#[tokio::test]
+async fn ns_answers_carry_name_server_addresses() {
+    let server = start();
+    // No EDNS, so the 512-byte limit applies; they fit easily.
+    let resp = over_udp(server.udp, &query("ipssl.cc.", RecordType::NS)).await;
+    assert!(!resp.metadata.truncation);
+    assert_eq!(resp.answers.len(), 2);
+    assert_eq!(
+        additionals(&resp),
+        [
+            "ns1.ipssl.cc. A 198.51.100.1",
+            "ns1.ipssl.cc. AAAA 2001:db8::1",
+            "ns2.ipssl.cc. A 198.51.100.2",
+            "ns2.ipssl.cc. AAAA 2001:db8::2",
+        ]
+    );
+    // Over TCP too.
+    let resp = over_tcp(server.tcp, &query("ipssl.cc.", RecordType::NS)).await;
+    assert_eq!(resp.additionals.len(), 4);
+}
+
+#[tokio::test]
+async fn mx_answers_carry_target_addresses() {
+    let config = format!(
+        "{EXAMPLE_CONFIG}\n[hosts.mailer]\nmx = [{{ preference = 10, exchange = \"mx.ipssl.cc\" }}]\n\
+         [hosts.mx]\na = [\"198.51.100.25\"]\n"
+    );
+    let server = start_with(Config::parse(&config).unwrap());
+    let resp = over_udp(server.udp, &query("mailer.ipssl.cc.", RecordType::MX)).await;
+    assert_eq!(rdata(&resp), ["10 mx.ipssl.cc."]);
+    assert_eq!(additionals(&resp), ["mx.ipssl.cc. A 198.51.100.25"]);
+    // The domain's own MX is outside the zone, so it has none.
+    let resp = over_udp(server.udp, &query("ipssl.cc.", RecordType::MX)).await;
+    assert!(resp.additionals.is_empty());
+}
+
+#[tokio::test]
+async fn additionals_that_do_not_fit_are_left_out() {
+    // Ten MX targets with two addresses each: the answer fits in 512
+    // bytes, but not with every address.
+    let mut config = format!("{EXAMPLE_CONFIG}\n[hosts.mailer]\nmx = [");
+    for i in 0..10 {
+        config += &format!("{{ preference = {i}, exchange = \"mx{i}.ipssl.cc\" }}, ");
+    }
+    config += "]\n";
+    for i in 0..10 {
+        let n = i + 1;
+        config += &format!("[hosts.mx{i}]\na = [\"198.51.100.{n}\"]\naaaa = [\"2001:db8::{n}\"]\n");
+    }
+    let server = start_with(Config::parse(&config).unwrap());
+    let req = query("mailer.ipssl.cc.", RecordType::MX);
+
+    // No EDNS: no truncation and nothing left over at the end, with the
+    // whole answer and as many whole address RRsets as fit.
+    let bytes = raw_udp(server.udp, &req).await;
+    assert!(bytes.len() <= 512, "{} bytes", bytes.len());
+    let mut decoder = BinDecoder::new(&bytes);
+    let resp = Message::read(&mut decoder).unwrap();
+    assert!(decoder.is_empty(), "{} bytes left over", decoder.len());
+    assert!(!resp.metadata.truncation);
+    assert_eq!(resp.answers.len(), 10);
+    let some = resp.additionals.len();
+    assert!(0 < some && some < 20, "{some} additionals");
+    let expected: Vec<String> = (0..10)
+        .flat_map(|i| {
+            let n = i + 1;
+            [
+                format!("mx{i}.ipssl.cc. A 198.51.100.{n}"),
+                format!("mx{i}.ipssl.cc. AAAA 2001:db8::{n}"),
+            ]
+        })
+        .collect();
+    assert_eq!(additionals(&resp), expected[..some]);
+
+    // A bigger buffer takes them all, and so does TCP.
+    let mut with_edns = req.clone();
+    let mut edns = Edns::new();
+    edns.set_max_payload(1232);
+    with_edns.set_edns(edns);
+    let resp = over_udp(server.udp, &with_edns).await;
+    assert!(!resp.metadata.truncation);
+    assert_eq!(additionals(&resp), expected);
+    assert_eq!(additionals(&over_tcp(server.tcp, &req).await), expected);
+    let metrics = server.handler.render_metrics();
+    assert!(
+        metrics.contains("\nipssl_dns_truncated_total 0\n"),
+        "{metrics}"
+    );
 }
 
 #[tokio::test]

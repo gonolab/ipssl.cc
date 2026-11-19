@@ -167,21 +167,45 @@ impl RequestHandler for Handler {
         metadata.authoritative = answer.authoritative;
         metadata.response_code = answer.rcode;
 
-        // When an answer does not fit, hickory drops the records but leaves
+        // When records do not fit, hickory drops them and sets TC but leaves
         // their partly written bytes at the end of the message, which strict
-        // parsers reject. Send a clean truncated response instead (header,
-        // question and OPT only), so the client retries over TCP.
-        if request.protocol() == Protocol::Udp {
-            let limit = usize::from(response_edns.as_ref().map_or(512, Edns::max_payload));
-            let records: Vec<&Record> = answer.answers.iter().chain(&answer.soa).collect();
-            let len = encoded_len(request.queries.as_bytes(), &records, response_edns.as_ref());
-            if len.is_none_or(|len| len > limit) {
-                self.metrics.truncated();
-                metadata.truncation = true;
-                let response =
-                    MessageResponseBuilder::new(&request.queries, response_edns.as_ref())
-                        .build_no_records(metadata);
-                return send(response_handle, response, metadata, &self.metrics).await;
+        // parsers reject. So check the size before hickory writes anything.
+        let limit = match request.protocol() {
+            Protocol::Udp => usize::from(response_edns.as_ref().map_or(512, Edns::max_payload)),
+            // TCP frames each message with a 16-bit length.
+            _ => usize::from(u16::MAX),
+        };
+        let fits = |records: &[&Record]| {
+            encoded_len(request.queries.as_bytes(), records, response_edns.as_ref())
+                .is_some_and(|len| len <= limit)
+        };
+        let mut records: Vec<&Record> = answer.answers.iter().chain(&answer.soa).collect();
+        // An answer too big for UDP gets a clean truncated response instead
+        // (header, question and OPT only), so the client retries over TCP.
+        // Over TCP every answer fits; the zone makes sure of that.
+        if request.protocol() == Protocol::Udp && !fits(&records) {
+            self.metrics.truncated();
+            metadata.truncation = true;
+            let response = MessageResponseBuilder::new(&request.queries, response_edns.as_ref())
+                .build_no_records(metadata);
+            return send(response_handle, response, metadata, &self.metrics).await;
+        }
+        // Additional records only save the client a lookup, so a response
+        // goes out complete without the ones that do not fit, never
+        // truncated for them. RRsets are added whole, in order.
+        let answered = records.len();
+        records.extend(&answer.additionals);
+        if !answer.additionals.is_empty() && !fits(&records) {
+            records.truncate(answered);
+            for rrset in answer
+                .additionals
+                .chunk_by(|a, b| a.name == b.name && a.record_type() == b.record_type())
+            {
+                records.extend(rrset);
+                if !fits(&records) {
+                    records.truncate(records.len() - rrset.len());
+                    break;
+                }
             }
         }
 
@@ -190,7 +214,7 @@ impl RequestHandler for Handler {
             answer.answers.iter(),
             iter::empty(),
             answer.soa.iter(),
-            iter::empty(),
+            records[answered..].iter().copied(),
         );
 
         send(response_handle, response, metadata, &self.metrics).await
@@ -198,9 +222,10 @@ impl RequestHandler for Handler {
 }
 
 /// Size of the response hickory would send: the header, the question copied
-/// as the client sent it, the records and the OPT record. hickory copies the
-/// question verbatim, so record names only compress against each other.
-/// `None` if a record cannot be encoded at all.
+/// as the client sent it, the records (answers, authority, additionals, in
+/// that order) and the OPT record. hickory copies the question verbatim, so
+/// record names only compress against each other. `None` if a record cannot
+/// be encoded at all.
 fn encoded_len(question: &[u8], records: &[&Record], edns: Option<&Edns>) -> Option<usize> {
     const HEADER_LEN: usize = 12;
     let mut buf = Vec::with_capacity(512);

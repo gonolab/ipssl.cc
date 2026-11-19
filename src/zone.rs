@@ -35,6 +35,10 @@ pub struct Answer {
     pub answers: Vec<Record>,
     /// SOA for the authority section of negative answers.
     pub soa: Option<Record>,
+    /// Addresses of the NS or MX targets in `answers` that are in the zone,
+    /// for the additional section. Each RRset (owner and type) is in one
+    /// run. Optional: they go out only if the whole response fits.
+    pub additionals: Vec<Record>,
 }
 
 pub struct Zone {
@@ -51,6 +55,9 @@ pub struct Zone {
     /// (`10-0-2-2.<domain>` for `app.10-0-2-2.<domain>`). They take no
     /// DNS-01 challenges, see [`Self::check_challenge`].
     public_host_parents: HashSet<LowerName>,
+    /// The additional records for the NS or MX records of a fixed host, by
+    /// owner and type: the addresses of the targets in the zone.
+    additionals: HashMap<(LowerName, RecordType), Vec<Record>>,
     whoami: LowerName,
     ip_ttl: u32,
     blocklist: Vec<IpNet>,
@@ -243,18 +250,20 @@ impl Zone {
             cfg.domain.trim_end_matches('.')
         ))?;
 
-        let zone = Self {
+        let mut zone = Self {
             origin_labels: origin.iter().count(),
             origin: origin_lower,
             negative_soa,
             hosts,
             fixed_ancestors,
             public_host_parents,
+            additionals: HashMap::new(),
             whoami: LowerName::new(&whoami),
             ip_ttl: cfg.ttl.ip,
             blocklist: cfg.blocklist.clone(),
             serial: cfg.soa.serial,
         };
+        zone.additionals = zone.target_addresses();
 
         // With [acme] on, TXT queries for names that can take a challenge
         // are answered from the challenge store, so records configured for
@@ -303,7 +312,7 @@ impl Zone {
         }
 
         if let Some(records) = self.hosts.get(&lower) {
-            return self.fixed(qname, records, qtype);
+            return self.fixed(qname, &lower, records, qtype);
         }
 
         if lower == self.whoami {
@@ -468,7 +477,52 @@ impl Zone {
             .any(|net| net.contains(&ip) || net.contains(&canonical))
     }
 
-    fn fixed(&self, qname: &Name, records: &[Record], qtype: RecordType) -> Answer {
+    /// The additional records for every NS and MX RRset of the fixed hosts:
+    /// what this zone answers for A and AAAA queries for their targets,
+    /// such as the name servers' addresses. Targets outside the zone get
+    /// nothing, and neither do blocked names, which have no addresses.
+    fn target_addresses(&self) -> HashMap<(LowerName, RecordType), Vec<Record>> {
+        let mut additionals = HashMap::new();
+        for (owner, records) in &self.hosts {
+            for rtype in [RecordType::NS, RecordType::MX] {
+                let mut targets: Vec<&Name> = Vec::new();
+                for record in records {
+                    let target = match &record.data {
+                        RData::NS(ns) if rtype == RecordType::NS => &ns.0,
+                        RData::MX(mx) if rtype == RecordType::MX => &mx.exchange,
+                        _ => continue,
+                    };
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+                let mut addresses = Vec::new();
+                for target in targets {
+                    // A null MX (`.`) is outside every zone.
+                    if !self.origin.zone_of(&LowerName::new(target)) {
+                        continue;
+                    }
+                    for qtype in [RecordType::A, RecordType::AAAA] {
+                        let client = IpAddr::from([0, 0, 0, 0]);
+                        let answer = self.resolve(target, qtype, DNSClass::IN, client);
+                        addresses.extend(answer.answers.into_iter().filter(is_address));
+                    }
+                }
+                if !addresses.is_empty() {
+                    additionals.insert((owner.clone(), rtype), addresses);
+                }
+            }
+        }
+        additionals
+    }
+
+    fn fixed(
+        &self,
+        qname: &Name,
+        owner: &LowerName,
+        records: &[Record],
+        qtype: RecordType,
+    ) -> Answer {
         // RFC 8482: answer ANY with one RRset instead of everything.
         let wanted = match (qtype, records.first()) {
             (RecordType::ANY, Some(first)) => first.record_type(),
@@ -484,7 +538,13 @@ impl Zone {
             })
             .collect();
         if !matched.is_empty() {
-            return self.answer(matched);
+            let mut answer = self.answer(matched);
+            if matches!(wanted, RecordType::NS | RecordType::MX)
+                && let Some(additionals) = self.additionals.get(&(owner.clone(), wanted))
+            {
+                answer.additionals = additionals.clone();
+            }
+            return answer;
         }
         // A host with no address of the asked type (say, only a TXT record
         // for a site verification) keeps the address its name holds.
@@ -515,6 +575,7 @@ impl Zone {
             authoritative: true,
             answers,
             soa: None,
+            additionals: vec![],
         }
     }
 
@@ -524,6 +585,7 @@ impl Zone {
             authoritative: true,
             answers: vec![],
             soa: Some(self.negative_soa.clone()),
+            additionals: vec![],
         }
     }
 
@@ -533,6 +595,7 @@ impl Zone {
             authoritative: true,
             answers: vec![],
             soa: Some(self.negative_soa.clone()),
+            additionals: vec![],
         }
     }
 }
@@ -583,6 +646,7 @@ impl Answer {
             authoritative: false,
             answers: vec![],
             soa: None,
+            additionals: vec![],
         }
     }
 
@@ -1084,6 +1148,93 @@ mod tests {
         );
         // Names computed from an address have no MX.
         assert!(is_nodata(&query("10-0-0-1.ipssl.cc.", RecordType::MX)));
+    }
+
+    /// The additional records as `name type rdata`.
+    fn additionals(answer: &Answer) -> Vec<String> {
+        answer
+            .additionals
+            .iter()
+            .map(|r| format!("{} {} {}", r.name, r.record_type(), r.data))
+            .collect()
+    }
+
+    #[test]
+    fn ns_answers_carry_name_server_addresses() {
+        let ns = query("ipssl.cc.", RecordType::NS);
+        assert_eq!(
+            additionals(&ns),
+            [
+                "ns1.ipssl.cc. A 198.51.100.1",
+                "ns1.ipssl.cc. AAAA 2001:db8::53",
+                "ns2.ipssl.cc. A 198.51.100.2",
+            ]
+        );
+        // Other answers carry none, the apex's out-of-zone MX included.
+        for qtype in [
+            RecordType::A,
+            RecordType::SOA,
+            RecordType::ANY,
+            RecordType::MX,
+        ] {
+            assert!(query("ipssl.cc.", qtype).additionals.is_empty(), "{qtype}");
+        }
+        // Name servers outside the zone have no addresses here.
+        let cfg = CONFIG.replace(
+            "ns2.ipssl.cc\"\n        ipv4 = [\"198.51.100.2\"]",
+            "ns.example.net\"",
+        );
+        let zone = Zone::from_config(&Config::parse(&cfg).unwrap()).unwrap();
+        let ns = query_zone(&zone, "ipssl.cc.", RecordType::NS);
+        assert_eq!(ns.answers.len(), 2);
+        assert_eq!(additionals(&ns).len(), 2);
+    }
+
+    #[test]
+    fn mx_answers_carry_addresses_of_targets_in_the_zone() {
+        let zone = zone_with(
+            r#"
+            [hosts.mailer]
+            mx = [
+                { preference = 10, exchange = "mx1.ipssl.cc" },
+                { preference = 20, exchange = "mx-10-0-0-25.ipssl.cc" },
+                { preference = 30, exchange = "mx-203-0-113-25.ipssl.cc" },
+                { preference = 40, exchange = "mx.example.net" },
+                { preference = 50, exchange = "MX1.ipssl.cc." },
+                { preference = 60, exchange = "ip.ipssl.cc" },
+            ]
+
+            [hosts.mx1]
+            a = ["198.51.100.25"]
+            aaaa = ["2001:db8::25"]
+
+            [hosts.nomail]
+            mx = [{ preference = 0, exchange = "." }]
+            "#,
+        )
+        .unwrap();
+        let mx = query_zone(&zone, "Mailer.ipssl.cc.", RecordType::MX);
+        assert_eq!(mx.answers.len(), 6);
+        // A fixed host, and a name with an address in it, each once. The
+        // blocked name, the one outside the zone and `ip` have none.
+        assert_eq!(
+            additionals(&mx),
+            [
+                "mx1.ipssl.cc. A 198.51.100.25",
+                "mx1.ipssl.cc. AAAA 2001:db8::25",
+                "mx-10-0-0-25.ipssl.cc. A 10.0.0.25",
+            ]
+        );
+        // ANY answers with the host's first RRset, here the MX records.
+        assert_eq!(
+            additionals(&query_zone(&zone, "mailer.ipssl.cc.", RecordType::ANY)).len(),
+            3
+        );
+        assert!(
+            query_zone(&zone, "nomail.ipssl.cc.", RecordType::MX)
+                .additionals
+                .is_empty()
+        );
     }
 
     #[test]
