@@ -58,14 +58,14 @@ Every name under `ipssl.cc` shares the domain's Let's Encrypt rate limit for cer
 
 A CA cannot reach `10.0.2.2` or `192.168.1.10`, so names with private addresses prove control through DNS instead (DNS-01). Your ACME client publishes the challenge through the ipssl.cc API, and the CA finds it in DNS. This works for every name whose address is private (`10/8`, `172.16/12`, `192.168/16`), shared (`100.64/10`), loopback or link-local, IPv4 or IPv6. Wildcards such as `*.10-0-2-2.ipssl.cc` work too.
 
-The API takes `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup` with a JSON body such as `{"fqdn": "_acme-challenge.10-0-2-2.ipssl.cc", "value": "..."}`. That is the format of lego's `httpreq` provider, so lego and Traefik work as they are. With lego v5 (replace `YOUR_EMAIL`):
+The API takes `POST https://ipssl.cc/acme/present` and `POST https://ipssl.cc/acme/cleanup` with a JSON body such as `{"fqdn": "_acme-challenge.10-0-2-2.ipssl.cc", "value": "..."}`. That is the format of lego's `httpreq` provider, so lego and Traefik work as they are. With lego v5:
 
 ```bash
 HTTPREQ_ENDPOINT=https://ipssl.cc/acme lego run --dns httpreq --dns.propagation.disable-ans \
-  --email YOUR_EMAIL -d 10-0-2-2.ipssl.cc
+  -d 10-0-2-2.ipssl.cc
 ```
 
-`--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API answers only once every name server holds the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`.
+`--dns.propagation.disable-ans` skips lego's own check, which queries the authoritative name servers directly on port 53 and fails on networks that block outbound DNS; the API answers only once every name server holds the value. lego v4 (4.19 or later) takes these flags before `run` and spells this one `--dns.propagation-disable-ans`. lego before 4.30 also needs `--email you@example.com`.
 
 In Traefik, set the environment variable `HTTPREQ_ENDPOINT=https://ipssl.cc/acme` and use `httpreq` as the `dnsChallenge` provider.
 
@@ -84,6 +84,23 @@ sudo certbot certonly --manual --preferred-challenges dns \
 
 The hook takes another endpoint from `IPSSL_API`. certbot saves the hook commands for renewal but not the environment, so set the variable inside both commands, as in `--manual-auth-hook "env IPSSL_API=https://acme.example.net/acme sh /usr/local/bin/ipssl-certbot-hook.sh present"`.
 
+**Issued before v0.5.0?** Renewals keep running the hook commands saved at issue time. A relative path can fail when the renewal timer runs it, a path a user can write lets that user change what root runs, and an `IPSSL_API` set only in the original shell is gone. For each such certificate (`sudo certbot certificates` lists their names):
+
+1. Install the hook at the root-owned path above, `/usr/local/bin/ipssl-certbot-hook.sh`.
+2. Point both hooks at it in `/etc/letsencrypt/renewal/NAME.conf`, under `[renewalparams]`. For a custom endpoint, put `env IPSSL_API=https://acme.example.net/acme` in front of both commands.
+
+   ```ini
+   manual_auth_hook = sh /usr/local/bin/ipssl-certbot-hook.sh present
+   manual_cleanup_hook = sh /usr/local/bin/ipssl-certbot-hook.sh cleanup
+   ```
+
+   Or let certbot write them: `sudo certbot reconfigure --cert-name NAME` with the same `--manual-auth-hook` and `--manual-cleanup-hook` options as for a new certificate.
+3. Check that the renewal works:
+
+   ```bash
+   sudo certbot renew --dry-run --cert-name NAME
+   ```
+
 acme.sh, with [`dns_ipssl.sh`](deploy/acme/dns_ipssl.sh) in `~/.acme.sh/dnsapi/` (`--server letsencrypt`, because acme.sh defaults to ZeroSSL):
 
 ```bash
@@ -95,6 +112,18 @@ acme.sh --issue --server letsencrypt --dns dns_ipssl -d 10-0-2-2.ipssl.cc
 ```
 
 For another endpoint, set `IPSSL_API` when issuing. acme.sh saves it with that certificate, so its renewals keep using it.
+
+**Upgrading from the v0.4.0 plugin with another endpoint?** That plugin saved `IPSSL_API` account-wide, as `SAVED_IPSSL_API` in `~/.acme.sh/account.conf`. The current plugin ignores and removes that value, so each certificate's next renewal would go to the public API. Before then, note the value (`grep SAVED_IPSSL_API ~/.acme.sh/account.conf`) and add it to each such certificate's domain conf, `~/.acme.sh/NAME_ecc/NAME.conf` (`~/.acme.sh/NAME/NAME.conf` for an RSA key):
+
+```
+IPSSL_API_SAVED='https://acme.example.net/acme'
+```
+
+Or renew each of them once with the variable set, which issues a new certificate:
+
+```bash
+IPSSL_API=https://acme.example.net/acme acme.sh --renew --force -d NAME
+```
 
 Keep in mind:
 
@@ -113,7 +142,7 @@ Every name under `ipssl.cc` is open to everyone. That matters for certificates a
 
 - **Cookies.** Never set cookies with `Domain=ipssl.cc`. Browsers send such cookies to every name under the domain, other people's included, and other people's names can set them for yours. Use host-only cookies (no `Domain` attribute), preferably named with the `__Host-` prefix, which only the host itself can set.
 - **Origins.** The same name on different networks is the same origin to a browser: `https://192-168-1-10.ipssl.cc` at home and at work share cookies, storage and granted permissions, although they are different machines.
-- **Revocation.** Anyone who can validate a name can also revoke its certificates. For a name with a private address, that is anyone.
+- **Revocation.** Anyone who can validate every name in a certificate can revoke it. For a certificate whose names all have private addresses, that is anyone.
 - **Certificate Transparency.** Issued certificates appear in public Certificate Transparency logs, so the names in them, labels and addresses included, can be searched.
 - **Duplicate certificates.** Let's Encrypt allows 5 certificates per 7 days for the exact same set of names, and everyone who uses a name shares that limit. Give common private names a label of your own, such as `myname-192-168-1-10.ipssl.cc`.
 - **Changing addresses.** After a public IP address changes hands, its previous holder may still hold certificates for its name, and for a while obtain new ones, since CAs reuse recent validations.
