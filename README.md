@@ -441,6 +441,7 @@ The [release workflow](.github/workflows/release.yml) checks that the tag matche
 - [x] v0.2: Response rate limiting (RRL), config hot reload, Prometheus metrics
 - [x] v0.3: MX records and long TXT values (DKIM keys) for mail on the domain
 - [x] v0.4: DNS-01 challenges, so names with private addresses can get certificates
+- [x] v0.5: NODATA for names without an address, stricter config checks, a sturdier challenge API and safer upgrades
 - [x] Ask Let's Encrypt to raise the rate limit for `ipssl.cc`
 - [x] Landing page
 
