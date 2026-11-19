@@ -483,6 +483,9 @@ impl Api {
     pub fn from_config(cfg: &Config) -> Result<Self> {
         // Rate limiter settings and every name server's write endpoint.
         cfg.validate_acme_api()?;
+        for warning in cfg.acme_api_warnings() {
+            warn!("{warning}");
+        }
         let acme = cfg.acme.as_ref().context("the [acme] section is missing")?;
         let nodes = acme.node_addrs(&cfg.nameservers)?;
         Ok(Self {

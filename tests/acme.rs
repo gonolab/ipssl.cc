@@ -109,7 +109,11 @@ async fn api_with_metrics(nodes: &[SocketAddr], extra: &str) -> (SocketAddr, Arc
         "{EXAMPLE_CONFIG}\n[acme]\nnodes = [{}]\n{extra}\n",
         nodes.join(", ")
     );
-    let api = Arc::new(Api::from_config(&Config::parse(&text).unwrap()).unwrap());
+    let mut config = Config::parse(&text).unwrap();
+    // One name server per node: the API refuses to start when the nodes
+    // leave a name server out.
+    config.nameservers.truncate(nodes.len());
+    let api = Arc::new(Api::from_config(&config).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(api.clone().serve(listener));

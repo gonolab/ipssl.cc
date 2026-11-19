@@ -72,7 +72,9 @@ pub struct AcmeConfig {
     pub api_listen: SocketAddr,
     /// Name server write endpoints the API sends every challenge to. Empty
     /// means each name server's first address of the `listen` family on
-    /// the `listen` port, see [`AcmeConfig::node_addrs`].
+    /// the `listen` port, see [`AcmeConfig::node_addrs`]. When set, it
+    /// must list an endpoint for every name server, see
+    /// [`Config::validate_acme_api`].
     #[serde(default)]
     pub nodes: Vec<SocketAddr>,
     /// API requests per minute for each client network.
@@ -85,8 +87,8 @@ pub struct AcmeConfig {
 
 impl AcmeConfig {
     /// Write endpoints of every name server, as the API reaches them:
-    /// `nodes` when set, otherwise each name server's first address on the
-    /// `listen` port.
+    /// `nodes` when set (each endpoint once), otherwise each name server's
+    /// first address on the `listen` port.
     ///
     /// The address has to be of the family `listen` accepts: IPv6 listeners
     /// are IPv6-only (see [`crate::bind_tcp`]), so `[::]:8053` cannot be
@@ -96,7 +98,14 @@ impl AcmeConfig {
     /// report success without it while the CA may still ask it.
     pub fn node_addrs(&self, nameservers: &[NameServer]) -> Result<Vec<SocketAddr>> {
         if !self.nodes.is_empty() {
-            return Ok(self.nodes.clone());
+            // An endpoint listed twice would only get every change twice.
+            let mut nodes = Vec::with_capacity(self.nodes.len());
+            for node in &self.nodes {
+                if !nodes.contains(node) {
+                    nodes.push(*node);
+                }
+            }
+            return Ok(nodes);
         }
         let port = self.listen.port();
         nameservers
@@ -338,7 +347,42 @@ impl Config {
             !nodes.is_empty(),
             "no name server to send challenges to: set acme.nodes or give the name servers addresses"
         );
+        // A CA may ask any name server, so the API must reach all of them
+        // before it reports a value as published. Endpoints in `nodes`
+        // cannot be matched to name servers, but there must be at least as
+        // many as there are hosts; see `acme_api_warnings` for name
+        // servers that share one.
+        let hosts = name_server_hosts(&self.nameservers);
+        ensure!(
+            acme.nodes.is_empty() || nodes.len() >= hosts,
+            "acme.nodes lists {} write endpoint(s), but there are {} name servers: \
+             list every name server's endpoint, or the API would report values as \
+             published that some name servers never got",
+            nodes.len(),
+            self.nameservers.len()
+        );
         Ok(())
+    }
+
+    /// Settings `ipssl-dns --acme-api` accepts that are probably not what
+    /// was meant, as messages for the log.
+    pub fn acme_api_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Some(acme) = &self.acme else {
+            return warnings;
+        };
+        if !acme.nodes.is_empty()
+            && let Ok(nodes) = acme.node_addrs(&self.nameservers)
+            && nodes.len() < self.nameservers.len()
+        {
+            warnings.push(format!(
+                "acme.nodes lists {} write endpoint(s) for {} name servers; that is only \
+                 right if the name servers that share an address are one host",
+                nodes.len(),
+                self.nameservers.len()
+            ));
+        }
+        warnings
     }
 
     /// Fails when two of the TCP listeners the DNS server opens (every
@@ -387,6 +431,28 @@ impl Config {
         }
         changed
     }
+}
+
+/// How many hosts the name servers run on: name servers that share an
+/// address are one host serving several names, with one write endpoint.
+/// A name server without addresses (one outside the zone) is a host of
+/// its own.
+fn name_server_hosts(nameservers: &[NameServer]) -> usize {
+    let mut hosts: Vec<Vec<IpAddr>> = Vec::new();
+    for ns in nameservers {
+        let mut addrs: Vec<IpAddr> = ns.ipv4.iter().map(|&ip| IpAddr::V4(ip)).collect();
+        addrs.extend(ns.ipv6.iter().map(|&ip| IpAddr::V6(ip)));
+        // Merge every host this name server shares an address with.
+        hosts.retain(|host| {
+            let shared = host.iter().any(|ip| addrs.contains(ip));
+            if shared {
+                addrs.extend(host);
+            }
+            !shared
+        });
+        hosts.push(addrs);
+    }
+    hosts.len()
 }
 
 /// Whether TCP listeners on `a` and `b` would need the same socket: same
@@ -667,13 +733,89 @@ mod tests {
         );
         assert!(config.validate_acme_api().is_err());
 
-        // Explicit nodes are taken as they are.
+        // Explicit nodes are taken as they are, each once.
         let text = format!(
-            "{TWO_NAME_SERVERS}\n[acme]\nlisten = \"0.0.0.0:8053\"\nnodes = [\"127.0.0.1:9000\"]\n"
+            "{TWO_NAME_SERVERS}\n[acme]\nlisten = \"0.0.0.0:8053\"\n\
+             nodes = [\"127.0.0.1:9000\", \"127.0.0.1:9001\", \"127.0.0.1:9000\"]\n"
         );
         let config = Config::parse(&text).unwrap();
-        assert_eq!(nodes(&config).unwrap(), ["127.0.0.1:9000"]);
+        assert_eq!(
+            nodes(&config).unwrap(),
+            ["127.0.0.1:9000", "127.0.0.1:9001"]
+        );
         config.validate_acme_api().unwrap();
+        assert!(config.acme_api_warnings().is_empty());
+    }
+
+    #[test]
+    fn explicit_acme_nodes_cover_every_name_server() {
+        let config = |name_servers: &str, nodes: &str| {
+            let text = format!(
+                "domain = \"ipssl.cc\"\n{name_servers}\n[soa]\nemail = \"hostmaster@ipssl.cc\"\n\
+                 [acme]\nnodes = [{nodes}]\n"
+            );
+            Config::parse(&text).unwrap()
+        };
+        let ns = |name: &str, ipv4: &str| {
+            format!("[[nameservers]]\nname = \"{name}\"\nipv4 = [\"{ipv4}\"]\n")
+        };
+        let two = format!(
+            "{}{}",
+            ns("ns1.ipssl.cc", "198.51.100.1"),
+            ns("ns2.ipssl.cc", "198.51.100.2")
+        );
+
+        // One endpoint for two name servers on two hosts: the API would
+        // report success while the CA may ask the one it never wrote to.
+        let one_node = config(&two, "\"198.51.100.1:8053\"");
+        let error = err(one_node.validate_acme_api());
+        assert!(
+            error.contains("1 write endpoint(s), but there are 2 name servers"),
+            "{error}"
+        );
+        // Listing the same endpoint twice does not help.
+        let twice = config(&two, "\"198.51.100.1:8053\", \"198.51.100.1:8053\"");
+        assert!(twice.validate_acme_api().is_err());
+
+        let both = config(&two, "\"198.51.100.1:8053\", \"198.51.100.2:8053\"");
+        both.validate_acme_api().unwrap();
+        assert!(both.acme_api_warnings().is_empty());
+
+        // Two names served by one host share its endpoint: allowed, with a
+        // warning in case the shared address is a typo.
+        let shared = format!(
+            "{}{}{}",
+            ns("ns1.ipssl.cc", "198.51.100.1"),
+            ns("ns2.ipssl.cc", "198.51.100.1"),
+            ns("ns3.ipssl.cc", "198.51.100.3"),
+        );
+        let config_shared = config(&shared, "\"198.51.100.1:8053\", \"198.51.100.3:8053\"");
+        config_shared.validate_acme_api().unwrap();
+        let warnings = config_shared.acme_api_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("2 write endpoint(s) for 3 name servers"));
+        assert!(
+            config(&shared, "\"198.51.100.1:8053\"")
+                .validate_acme_api()
+                .is_err()
+        );
+
+        // Name servers outside the zone have no addresses; each is a host.
+        let outside = format!(
+            "{}[[nameservers]]\nname = \"ns.example.net\"\n[[nameservers]]\nname = \"ns.example.org\"\n",
+            ns("ns1.ipssl.cc", "198.51.100.1")
+        );
+        let two_nodes = config(&outside, "\"198.51.100.1:8053\", \"192.0.2.1:8053\"");
+        assert!(two_nodes.validate_acme_api().is_err());
+
+        // The derived list stays as it was: one endpoint per name server.
+        let derived = Config::parse(&format!(
+            "domain = \"ipssl.cc\"\n{shared}\n[soa]\nemail = \"hostmaster@ipssl.cc\"\n[acme]\n"
+        ))
+        .unwrap();
+        assert_eq!(nodes(&derived).unwrap().len(), 3);
+        derived.validate_acme_api().unwrap();
+        assert!(derived.acme_api_warnings().is_empty());
     }
 
     #[test]
