@@ -6,6 +6,7 @@
 //! chunked encoding is not supported. A server can be limited to some
 //! peers, which are then checked before anything else happens.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::mem::MaybeUninit;
@@ -17,7 +18,7 @@ use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tracing::{debug, warn};
 
 /// Connections served at once.
@@ -31,6 +32,14 @@ const MAX_REFUSALS: usize = 16;
 /// Time a connection turned away with `503` has to send its request, and
 /// then to take the answer.
 const REFUSAL_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long a connection given the fixed `503` stays open for reading,
+/// see [`Lingering`].
+const LINGER: Duration = Duration::from_secs(1);
+
+/// Most connections given the fixed `503` that stay open at once; past
+/// that the oldest is closed early.
+const MAX_LINGERING: usize = 64;
 
 /// Largest request head we read.
 const MAX_HEAD: usize = 8 * 1024;
@@ -207,8 +216,17 @@ impl Server {
         let handler = Arc::new(handler);
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let refusals = Arc::new(Semaphore::new(MAX_REFUSALS));
+        let mut lingering = Lingering::default();
         loop {
-            let (stream, peer) = match self.listener.accept().await {
+            let due = lingering.next_due();
+            let accepted = tokio::select! {
+                accepted = self.listener.accept() => accepted,
+                () = sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() => {
+                    lingering.close_due(Instant::now());
+                    continue;
+                }
+            };
+            let (stream, peer) = match accepted {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     // Usually out of file descriptors; back off instead of spinning.
@@ -241,6 +259,7 @@ impl Server {
                 // The refusals are all taken too: say so all the same, but
                 // right here, without a task or any waiting.
                 turn_away(&stream);
+                lingering.push(stream, Instant::now());
                 observe("", 503);
             }
         }
@@ -252,26 +271,74 @@ impl Server {
 /// request has arrived (up to [`MAX_HEAD`]), since closing a connection
 /// with unread data resets it, and a reset can make the client drop the
 /// answer before reading it; then it writes [`OVERLOADED`] into the empty
-/// send buffer. The caller closes the connection by dropping it.
+/// send buffer and ends its side of the connection. The caller keeps the
+/// connection open for reading for a moment, see [`Lingering`].
 ///
 /// This goes to the socket directly: tokio's `try_read` and `try_write`
 /// report `WouldBlock` until the runtime has polled a new socket, which it
 /// has not at this point.
 fn turn_away(stream: &TcpStream) {
     let socket = SockRef::from(stream);
+    drain(&socket, MAX_HEAD);
+    if let Err(error) = socket.send(OVERLOADED) {
+        debug!(%error, "http: could not answer a connection turned away");
+    }
+    let _ = socket.shutdown(std::net::Shutdown::Write);
+}
+
+/// Reads and drops what has arrived on `socket`, up to `limit` bytes,
+/// without waiting.
+fn drain(socket: &SockRef<'_>, limit: usize) {
     let mut buf = [MaybeUninit::<u8>::uninit(); 1024];
     let mut read = 0;
-    while read < MAX_HEAD {
-        let want = buf.len().min(MAX_HEAD - read);
+    while read < limit {
+        let want = buf.len().min(limit - read);
         match socket.recv(&mut buf[..want]) {
             Ok(n) if n > 0 => read += n,
             // The end of what has arrived, of the stream, or an error.
             _ => break,
         }
     }
-    if let Err(error) = socket.send(OVERLOADED) {
-        debug!(%error, "http: could not answer a connection turned away");
+}
+
+/// Connections given the fixed `503`, kept open for reading for [`LINGER`]
+/// by the accept loop itself. The request may arrive after the answer
+/// went out: closed at once, the connection would answer it with a reset,
+/// and a reset can make the client drop the answer it has not read yet.
+/// Closing it a moment later, after reading what arrived, ends it cleanly.
+#[derive(Default)]
+struct Lingering(VecDeque<(Instant, TcpStream)>);
+
+impl Lingering {
+    fn push(&mut self, stream: TcpStream, now: Instant) {
+        if self.0.len() >= MAX_LINGERING
+            && let Some((_, oldest)) = self.0.pop_front()
+        {
+            close(oldest);
+        }
+        self.0.push_back((now + LINGER, stream));
     }
+
+    /// When the next connection is due to close.
+    fn next_due(&self) -> Option<Instant> {
+        self.0.front().map(|&(due, _)| due)
+    }
+
+    fn close_due(&mut self, now: Instant) {
+        while let Some(&(due, _)) = self.0.front()
+            && due <= now
+        {
+            if let Some((_, stream)) = self.0.pop_front() {
+                close(stream);
+            }
+        }
+    }
+}
+
+/// Closes a connection given the fixed `503` after reading what arrived,
+/// so that it ends without a reset unless more is still coming.
+fn close(stream: TcpStream) {
+    drain(&SockRef::from(&stream), MAX_HEAD + MAX_BODY);
 }
 
 /// Serves one connection. `deadlines` are the time the client has to
@@ -700,6 +767,49 @@ mod tests {
         );
         assert!(response.ends_with("\r\n\r\nbusy, try again shortly\n"));
         assert_eq!(*seen.lock().unwrap(), [(String::new(), 503)]);
+    }
+
+    #[tokio::test]
+    async fn overloaded_server_answers_503_to_a_request_that_comes_late() {
+        let addr = start().await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS + MAX_REFUSALS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // The server takes the connection and answers before the request
+        // arrives, so it has nothing to read yet.
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        let mut response = Vec::new();
+        // No reset: the answer is read in full, and then the end.
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, OVERLOADED);
+    }
+
+    #[tokio::test]
+    async fn turned_away_connections_close_soon_and_are_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut clients = Vec::new();
+        let mut lingering = Lingering::default();
+        let now = Instant::now();
+        for _ in 0..=MAX_LINGERING {
+            clients.push(TcpStream::connect(addr).await.unwrap());
+            let (stream, _) = listener.accept().await.unwrap();
+            lingering.push(stream, now);
+        }
+        assert_eq!(lingering.0.len(), MAX_LINGERING);
+        assert_eq!(lingering.next_due(), Some(now + LINGER));
+        lingering.close_due(now);
+        assert_eq!(lingering.0.len(), MAX_LINGERING);
+        lingering.close_due(now + LINGER);
+        assert!(lingering.0.is_empty());
+        assert_eq!(lingering.next_due(), None);
     }
 
     #[tokio::test]
