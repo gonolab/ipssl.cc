@@ -72,8 +72,9 @@ const IPV6_OWNER_PREFIX: u32 = 64;
 const NODE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Time the API gives a name server to drop a value again after the
-/// change failed elsewhere. Short, so the answer still beats the HTTP
-/// server's deadline: the name server took the change a moment ago.
+/// change failed elsewhere. Short, so that even with a name server down
+/// ([`NODE_TIMEOUT`] and then this) the answer beats the HTTP server's
+/// 10-second deadline.
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 const JSON: &str = "application/json";
@@ -605,17 +606,16 @@ impl Api {
         .to_string();
 
         let all = 0..self.nodes.len();
-        let mut accepted = Vec::new();
+        let mut rejected = Vec::new();
         let mut failed = Vec::new();
-        let mut rejected = false;
         for (node, outcome) in self.send(all, action, &body, NODE_TIMEOUT).await {
             match outcome {
-                Outcome::Accepted => accepted.push(node),
-                Outcome::Rejected => rejected = true,
+                Outcome::Accepted => {}
+                Outcome::Rejected => rejected.push(node),
                 Outcome::Failed(problem) => failed.push(problem),
             }
         }
-        if !rejected && failed.is_empty() {
+        if rejected.is_empty() && failed.is_empty() {
             return Ok(ok());
         }
         if !failed.is_empty() {
@@ -628,13 +628,18 @@ impl Api {
                 "acme: a name server did not take the change"
             );
         }
-        // The client is told the value was not published, so the name
-        // servers that took it should not keep serving it. Waiting for
-        // this means a retry right after the error cannot be undone by it.
-        if action == Action::Present && !accepted.is_empty() {
-            self.roll_back(accepted, &body).await;
+        // The client is told the value was not published, so no name
+        // server should keep serving it: not those that took it, and not
+        // those that gave no usable answer, which may have stored it and
+        // lost the reply. Cleanup succeeds where there is nothing to
+        // remove. Only a name server that refused the value over a cap
+        // never held it for this client. Waiting for this means a retry
+        // right after the error cannot be undone by it.
+        if action == Action::Present {
+            let others = (0..self.nodes.len()).filter(|node| !rejected.contains(node));
+            self.roll_back(others, &body).await;
         }
-        if rejected {
+        if !rejected.is_empty() {
             return Err(error(409, &too_many_values()));
         }
         // Clients learn how many name servers failed, not which or why:
@@ -683,7 +688,7 @@ impl Api {
     /// Cleans up a value presented with `body` on the name servers
     /// numbered `nodes`, as far as they answer in time. Failures are only
     /// logged: the value expires there on its own.
-    async fn roll_back(&self, nodes: Vec<usize>, body: &str) {
+    async fn roll_back(&self, nodes: impl IntoIterator<Item = usize>, body: &str) {
         for (_, outcome) in self
             .send(nodes, Action::Cleanup, body, ROLLBACK_TIMEOUT)
             .await

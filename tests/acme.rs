@@ -79,6 +79,39 @@ async fn fake_node(raw: &'static str) -> SocketAddr {
     addr
 }
 
+/// A stand-in for the network path to the name server at `target`: it
+/// passes each request on and the answer back, except that it drops the
+/// answers to requests for `lost`, as a broken connection would after the
+/// name server took the change.
+async fn lossy_path(target: SocketAddr, lost: &'static str) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !complete(&request) {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let mut node = TcpStream::connect(target).await.unwrap();
+                node.write_all(&request).await.unwrap();
+                let mut answer = Vec::new();
+                node.read_to_end(&mut answer).await.unwrap();
+                if !request.starts_with(format!("POST {lost} ").as_bytes()) {
+                    let _ = stream.write_all(&answer).await;
+                }
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
 /// Whether `request` holds a whole request with a `Content-Length` body.
 fn complete(request: &[u8]) -> bool {
     let text = String::from_utf8_lossy(request);
@@ -287,7 +320,25 @@ async fn api_reports_a_name_server_that_is_down() {
 }
 
 #[tokio::test]
-async fn a_refused_value_is_taken_back_where_it_was_taken() {
+async fn a_present_whose_answer_was_lost_is_taken_back() {
+    // ns1 takes the value, but its answer never reaches the API.
+    let ns1 = name_server("127.0.0.1").await;
+    let ns2 = name_server("127.0.0.1").await;
+    let path = lossy_path(ns1.write, "/present").await;
+    let api = api(&[path, ns2.write], "").await;
+
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 502, "{reply}");
+    // Both dropped it again, the one that seemed to fail included.
+    for ns in [&ns1, &ns2] {
+        assert!(txt(ns.dns, NAME).await.answers.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_refused_value_is_taken_back_everywhere_else() {
     // One name server is at the cap for this network (another one lost
     // its values in a restart, say), so the change is refused there. The
     // values came from an API from v0.5.0, which sent the network as the
@@ -577,9 +628,9 @@ async fn api_counts_requests_and_name_server_writes() {
         metric(&metrics, &series)
     };
     // The present, taking it back after the other name server failed,
-    // and the cleanup.
+    // and the cleanup; the name server that is down misses all three.
     assert_eq!(writes(ns.write, "accepted"), 3);
-    assert_eq!(writes(down, "failed"), 2);
+    assert_eq!(writes(down, "failed"), 3);
     assert_eq!(writes(down, "accepted"), 0);
     assert_eq!(metric(&metrics, "ipssl_rate_limit_tracked_networks"), 1);
 }
