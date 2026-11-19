@@ -812,9 +812,16 @@ impl Api {
         // limiting.
         let owner = owner(client);
         let network = self.limiter.network(client);
-        // Each change, a rollback included, gets its own number, so every
-        // name server ends up with the latest one.
-        let change = || {
+        // Each change gets its own number, so every name server ends up
+        // with the latest one. A present takes the number of its rollback
+        // too, right after its own: a retry that overlaps a present that
+        // fails comes after both, so the rollback cannot take the retried
+        // value down again.
+        let seq = self.seq.take(match action {
+            Action::Present => 2,
+            Action::Cleanup => 1,
+        });
+        let change = |seq: u64| {
             // The ASCII form: `to_string` turns Punycode labels into
             // Unicode, which name servers would reject.
             serde_json::json!({
@@ -822,11 +829,11 @@ impl Api {
                 "value": value,
                 "owner": owner,
                 "network": network,
-                "seq": self.seq.next(),
+                "seq": seq,
             })
             .to_string()
         };
-        let body = change();
+        let body = change(seq);
 
         let all = 0..self.nodes.len();
         let mut rejected = Vec::new();
@@ -860,7 +867,7 @@ impl Api {
         // right after the error cannot be undone by it.
         if action == Action::Present {
             let others = (0..self.nodes.len()).filter(|node| !rejected.contains(node));
-            self.roll_back(others, &change()).await;
+            self.roll_back(others, &change(seq + 1)).await;
         }
         if !rejected.is_empty() {
             return Err(error(409, &too_many_values()));
@@ -936,18 +943,24 @@ struct Sequence {
 }
 
 impl Sequence {
+    #[cfg(test)]
     fn next(&self) -> u64 {
+        self.take(1)
+    }
+
+    /// Takes `count` consecutive numbers and returns the first.
+    fn take(&self, count: u64) -> u64 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-        let next = |last: u64| now.max(last.saturating_add(1));
+        let first = |last: u64| now.max(last.saturating_add(1));
         let last = self
             .last
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
-                Some(next(last))
+                Some(first(last).saturating_add(count.saturating_sub(1)))
             })
             .unwrap_or_else(|last| last);
-        next(last)
+        first(last)
     }
 }
 
@@ -1584,5 +1597,10 @@ mod tests {
         };
         assert_eq!(ahead.next(), future + 1);
         assert_eq!(ahead.next(), future + 2);
+
+        // A present takes its rollback's number with its own.
+        let present = ahead.take(2);
+        assert_eq!(present, future + 3);
+        assert_eq!(ahead.next(), present + 2);
     }
 }

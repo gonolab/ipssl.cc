@@ -1045,3 +1045,65 @@ async fn one_name_server_at_two_endpoints_takes_every_change() {
         assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
     }
 }
+
+/// A stand-in for the network path to the name server at `target` that
+/// holds the first request back for `delay` before it passes it on, and
+/// passes the others on at once.
+async fn slow_first(target: SocketAddr, delay: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let delay = if std::mem::take(&mut first) {
+                delay
+            } else {
+                Duration::ZERO
+            };
+            tokio::spawn(async move {
+                let Some(request) = read_whole_request(&mut stream).await else {
+                    return;
+                };
+                tokio::time::sleep(delay).await;
+                let mut node = TcpStream::connect(target).await.unwrap();
+                node.write_all(&request).await.unwrap();
+                let mut answer = Vec::new();
+                node.read_to_end(&mut answer).await.unwrap();
+                let _ = stream.write_all(&answer).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_rollback_does_not_undo_a_retry_that_overlaps_it() {
+    // The first present hangs on the way to ns2 past the API's timeout.
+    // The client retries meanwhile and succeeds; then the first present
+    // fails, its rollback goes out, and the held-back present arrives.
+    let ns1 = name_server("127.0.0.1").await;
+    let ns2 = name_server("127.0.0.1").await;
+    let path = slow_first(ns2.write, Duration::from_secs(6)).await;
+    let api = api(&[ns1.write, path], "").await;
+    let first = tokio::spawn(async move {
+        post_json(api, "/present", &body(NAME, VALUE))
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (status, reply) = post_json(api, "/present", &body(NAME, VALUE))
+        .await
+        .unwrap();
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = first.await.unwrap();
+    assert_eq!(status, 502, "{reply}");
+    // Let the held-back present arrive.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The retry came after both, so the value stays everywhere.
+    for ns in [&ns1, &ns2] {
+        assert_eq!(values(&txt(ns.dns, NAME).await), [VALUE]);
+    }
+}
