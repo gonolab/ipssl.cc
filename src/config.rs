@@ -485,9 +485,10 @@ impl Config {
         let hosts = name_server_hosts(&self.nameservers);
         ensure!(
             acme.nodes.is_empty() || nodes.len() >= hosts,
-            "acme.nodes lists {} write endpoint(s), but there are {} name servers: \
-             list every name server's endpoint, or the API would report values as \
-             published that some name servers never got",
+            "acme.nodes lists {} write endpoint(s), but the {} name servers run on {hosts} \
+             host(s) (name servers that share an address are one host): list every \
+             name server's endpoint, or the API would report values as published that \
+             some name servers never got",
             nodes.len(),
             self.nameservers.len()
         );
@@ -923,7 +924,7 @@ mod tests {
         let one_node = config(&two, "\"198.51.100.1:8053\"");
         let error = err(one_node.validate_acme_api());
         assert!(
-            error.contains("1 write endpoint(s), but there are 2 name servers"),
+            error.contains("1 write endpoint(s), but the 2 name servers run on 2 host(s)"),
             "{error}"
         );
         // Listing the same endpoint twice does not help.
