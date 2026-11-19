@@ -17,7 +17,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The runtime directory when systemd does not name one.
 pub const DEFAULT_DIR: &str = "/run/ipssl-dns";
@@ -125,28 +125,43 @@ impl Status {
     }
 }
 
-/// Keeps the server's status file up to date. Without a runtime directory
-/// (when run by hand, say) it does nothing, and the server works as
-/// before; only `--reload` cannot be used then.
+/// Keeps the server's status file up to date. Every report tries to write
+/// it, so a write that failed once (a full `/run`, the directory removed
+/// and made again) does not stop later reports. Without a runtime
+/// directory (when run by hand, say) the server works as before; only
+/// `--reload` cannot be used then.
 pub struct Reporter {
     pid: u32,
-    /// The runtime directory and the generation written last; no
-    /// directory once writing has failed.
-    state: Mutex<(Option<PathBuf>, u64)>,
+    dir: PathBuf,
+    /// Whether `dir` existed at the start. If not, failed writes are
+    /// expected and only logged at debug level.
+    expected: bool,
+    state: Mutex<Progress>,
+}
+
+struct Progress {
+    /// The generation written last.
+    generation: u64,
+    /// Whether the last write failed, so a failure is logged once until
+    /// a write works again.
+    failing: bool,
 }
 
 impl Reporter {
-    /// Reports to `dir` if it exists.
+    /// Reports to the status file in `dir`.
     pub fn new(dir: PathBuf) -> Self {
-        let dir = if dir.is_dir() {
-            Some(dir)
-        } else {
+        let expected = dir.is_dir();
+        if !expected {
             debug!(dir = %dir.display(), "no runtime directory, so reloads are not reported");
-            None
-        };
+        }
         Self {
             pid: std::process::id(),
-            state: Mutex::new((dir, 0)),
+            dir,
+            expected,
+            state: Mutex::new(Progress {
+                generation: 0,
+                failing: false,
+            }),
         }
     }
 
@@ -171,23 +186,30 @@ impl Reporter {
     }
 
     fn report(&self, next: impl FnOnce(u64) -> (u64, State)) {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (dir, generation) = &mut *guard;
-        let (new_generation, state) = next(*generation);
-        *generation = new_generation;
-        let Some(path) = dir else {
-            return;
-        };
+        let mut progress = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (generation, state) = next(progress.generation);
+        progress.generation = generation;
         let status = Status {
             pid: self.pid,
-            generation: new_generation,
+            generation,
             state,
         };
-        if let Err(error) = status.write(path) {
-            // Once is enough: the next write would most likely fail the
-            // same way.
-            warn!(dir = %path.display(), %error, "cannot write the reload status, so `ipssl-dns --reload` cannot confirm reloads");
-            *dir = None;
+        let dir = self.dir.display();
+        match status.write(&self.dir) {
+            Ok(()) => {
+                if progress.failing && self.expected {
+                    info!(%dir, "writing the reload status again");
+                }
+                progress.failing = false;
+            }
+            Err(error) if self.expected && !progress.failing => {
+                warn!(%dir, %error, "cannot write the reload status, so `ipssl-dns --reload` cannot confirm reloads until a later write works");
+                progress.failing = true;
+            }
+            Err(error) => {
+                debug!(%dir, %error, "cannot write the reload status");
+                progress.failing = true;
+            }
         }
     }
 }

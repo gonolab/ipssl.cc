@@ -604,6 +604,8 @@ mod reload_helper {
     use std::time::Instant;
     use std::{fs, thread};
 
+    use ipssl::reload::{Reporter, State, Status};
+
     use super::*;
 
     /// A port free on 127.0.0.1 for both UDP and TCP, for a server run as its
@@ -633,6 +635,31 @@ mod reload_helper {
             RData::SOA(soa) => soa.serial,
             other => panic!("not an SOA record: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reports_resume_after_a_failed_write() {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("reload-reporter");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let read = || Status::read(&dir).unwrap().unwrap();
+        let reporter = Reporter::new(dir.clone());
+        reporter.started(1);
+        assert_eq!(read().state, State::Serving(1));
+
+        // The directory goes away for a reload, then comes back.
+        fs::remove_dir_all(&dir).unwrap();
+        reporter.reloading();
+        reporter.finished(Ok(2));
+        assert!(Status::read(&dir).is_ok_and(|s| s.is_none()));
+        fs::create_dir_all(&dir).unwrap();
+        reporter.reloading();
+        assert_eq!(read().state, State::Reloading);
+        reporter.finished(Err("bad".into()));
+        let status = read();
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!(status.generation, 2);
+        assert_eq!(status.state, State::Failed("bad".into()));
     }
 
     #[tokio::test]
